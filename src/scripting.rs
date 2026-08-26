@@ -35,6 +35,9 @@ fn build_engine() -> Engine {
     eng.register_fn("focus_prev", || { crate::focus::focus_prev(); });
     eng.register_fn("focus_direction", |dir: &str| { crate::focus::focus_direction(dir); });
     eng.register_fn("focus_window", |substr: &str| { crate::focus::focus_window_by_title_substr(substr); });
+    eng.register_fn("toggle_floating", || { crate::focus::toggle_floating_focused(); });
+    eng.register_fn("move_to_next_monitor", || { crate::focus::move_focused_to_monitor("next"); });
+    eng.register_fn("move_to_prev_monitor", || { crate::focus::move_focused_to_monitor("prev"); });
     eng.register_fn("shell", |cmd: &str| {
         let _ = std::process::Command::new("cmd").args(["/C", cmd]).spawn();
     });
@@ -76,18 +79,21 @@ pub fn dispatch_action(action: &str) {
         }
         return;
     }
-    if act.contains("launch(") || act.contains("log(") || act.contains("set_layout") || act.contains("focus_") || act.contains("retile") {
+    if act.contains("launch(") || act.contains("log(") || act.contains("set_layout") || act.contains("focus_") || act.contains("toggle_floating") || act.contains("move_to_") || act.contains("retile") {
         if eval_action(act).is_ok() { return; }
         // fall through to direct handling on error
     }
     match act {
         "retile" => crate::request_retile(),
         "toggle_tiling" => crate::toggle_tiling(),
-        "quit" => unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0); },
+        "quit" => crate::request_quit(),
         "reload_config" => {
             println!("[scripting] reload_config");
             crate::reload_config_async();
         },
+        "toggle_floating" => crate::focus::toggle_floating_focused(),
+        "move_to_next_monitor" => crate::focus::move_focused_to_monitor("next"),
+        "move_to_prev_monitor" => crate::focus::move_focused_to_monitor("prev"),
         _ if act.starts_with("set_layout") => {
             if let Some(start) = act.find('"').or(act.find('\'')) {
                 let end = act.rfind('"').or(act.rfind('\'')).unwrap_or(act.len()-1);
@@ -96,7 +102,7 @@ pub fn dispatch_action(action: &str) {
                     crate::set_layout_by_name(name);
                 }
             }
-        },
+        }
         _ if act.starts_with("launch") => {
             if let Some(p1) = act.find('\'').or(act.find('"')) {
                 let p2 = act.rfind('\'').or(act.rfind('"')).unwrap_or(act.len());

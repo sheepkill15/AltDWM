@@ -40,8 +40,8 @@ impl Widget for ClockWidget {
     fn interval_ms(&self) -> Option<u32> { Some(self.cfg.interval.unwrap_or(1000)) }
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         unsafe {
-            let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
-            let font = crate::theme::create_font(&theme);
+            let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
+            let font = crate::theme::get_cached_font(&theme);
             let old_font = windows::Win32::Graphics::Gdi::SelectObject(hdc, font.into());
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, theme.text_color());
@@ -59,8 +59,7 @@ impl Widget for ClockWidget {
             let y = rect.top + (rect.bottom - rect.top - 16) / 2;
             let _ = TextOutW(hdc, x, y, &wide);
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_font);
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
-        }
+                    }
     }
     fn on_click(&self, _x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> { self.cfg.action.clone() }
 }
@@ -78,8 +77,8 @@ impl Widget for WindowTitleWidget {
     fn width(&self, _ctx: &PanelCtx) -> i32 { 0 } // flex
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         unsafe {
-            let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
-            let font = crate::theme::create_font(&theme);
+            let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
+            let font = crate::theme::get_cached_font(&theme);
             let old_font = windows::Win32::Graphics::Gdi::SelectObject(hdc, font.into());
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, theme.text_color());
@@ -91,8 +90,7 @@ impl Widget for WindowTitleWidget {
             let wide: Vec<u16> = title.encode_utf16().collect();
             let _ = TextOutW(hdc, rect.left + 6, rect.top + 10, &wide);
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_font);
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
-        }
+                    }
     }
 }
 
@@ -102,7 +100,7 @@ impl Widget for TrayWidget {
     fn width(&self, _ctx: &PanelCtx) -> i32 { self.cfg.width.unwrap_or(220) }
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         unsafe {
-            let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
+            let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
             let icon_sz = 16;
             let gap = 6;
             let mut x = rect.left + 8;
@@ -132,14 +130,13 @@ impl Widget for TrayWidget {
             x += 8;
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, theme.text_dim_color());
-            let font = crate::theme::create_font(&theme);
+            let font = crate::theme::get_cached_font(&theme);
             let old = windows::Win32::Graphics::Gdi::SelectObject(hdc, font.into());
             let txt = "tray";
             let wide: Vec<u16> = txt.encode_utf16().collect();
             let _ = TextOutW(hdc, x, rect.top + 12, &wide);
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old);
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
-        }
+                    }
     }
 }
 
@@ -149,8 +146,8 @@ impl Widget for WorkspacesWidget {
     fn width(&self, _ctx: &PanelCtx) -> i32 { self.cfg.width.unwrap_or(140) }
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         unsafe {
-            let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
-            let font = crate::theme::create_font(&theme);
+            let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
+            let font = crate::theme::get_cached_font(&theme);
             let old = windows::Win32::Graphics::Gdi::SelectObject(hdc, font.into());
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, theme.text_color());
@@ -158,8 +155,7 @@ impl Widget for WorkspacesWidget {
             let wide: Vec<u16> = txt.encode_utf16().collect();
             let _ = TextOutW(hdc, rect.left + 6, rect.top + 12, &wide);
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old);
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
-        }
+                    }
     }
     fn on_click(&self, x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> {
         let idx = (x - 6) / 28 + 1;
@@ -173,8 +169,8 @@ impl Widget for WindowListWidget {
     fn width(&self, _ctx: &PanelCtx) -> i32 { 0 } // flex
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         unsafe {
-            let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
-            let font = crate::theme::create_font(&theme);
+            let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
+            let font = crate::theme::get_cached_font(&theme);
             let old_font = windows::Win32::Graphics::Gdi::SelectObject(hdc, font.into());
             SetBkMode(hdc, TRANSPARENT);
             let wins = {
@@ -225,8 +221,7 @@ impl Widget for WindowListWidget {
                 let _ = TextOutW(hdc, x, y+2, &wide);
             }
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_font);
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
-        }
+                    }
     }
     fn on_click(&self, x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> {
         let wins = {
@@ -251,8 +246,8 @@ impl Widget for LauncherWidget {
     fn width(&self, _ctx: &PanelCtx) -> i32 { self.cfg.width.unwrap_or(40) }
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         unsafe {
-            let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
-            let font = crate::theme::create_font(&theme);
+            let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
+            let font = crate::theme::get_cached_font(&theme);
             let old = windows::Win32::Graphics::Gdi::SelectObject(hdc, font.into());
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, theme.text_color());
@@ -260,8 +255,7 @@ impl Widget for LauncherWidget {
             let wide: Vec<u16> = label.encode_utf16().collect();
             let _ = TextOutW(hdc, rect.left + 10, rect.top + 12, &wide);
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old);
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
-        }
+                    }
     }
     fn on_click(&self, _x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> {
         Some(self.cfg.action.clone().or_else(|| self.cfg.command.clone()).unwrap_or_else(|| "launch('explorer.exe')".into()))
@@ -295,16 +289,15 @@ impl Widget for CustomWidget {
             self.cfg.label.clone().unwrap_or_else(|| "custom".into())
         };
         unsafe {
-            let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
-            let font = crate::theme::create_font(&theme);
+            let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
+            let font = crate::theme::get_cached_font(&theme);
             let old = windows::Win32::Graphics::Gdi::SelectObject(hdc, font.into());
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, theme.text_color());
             let wide: Vec<u16> = txt.encode_utf16().collect();
             let _ = TextOutW(hdc, rect.left + 6, rect.top + 12, &wide);
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old);
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
-        }
+                    }
     }
     fn on_click(&self, _x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> { self.cfg.action.clone() }
 }

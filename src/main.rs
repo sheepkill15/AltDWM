@@ -45,9 +45,21 @@ pub static CURRENT_GAP: LazyLock<Mutex<i32>> = LazyLock::new(|| Mutex::new(8));
 pub static CONFIG_PATH: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
 pub static CURRENT_CONFIG: LazyLock<Mutex<config::Config>> = LazyLock::new(|| Mutex::new(config::Config::default()));
 pub static HOTKEY_ACTIONS: LazyLock<Mutex<HashMap<i32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static MAIN_TID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
 // helpers for scripting / manager
 pub fn request_retile() { RETILE_PENDING.store(true, Ordering::SeqCst); }
+pub fn request_quit() {
+    let v = HOST_HWND.load(Ordering::SeqCst);
+    if v != 0 {
+        let hwnd = HWND(v as *mut std::ffi::c_void);
+        unsafe { let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(hwnd), windows::Win32::UI::WindowsAndMessaging::WM_CLOSE, WPARAM(0), LPARAM(0)); }
+    } else if let Some(tid) = MAIN_TID.get().copied() {
+        unsafe { let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(tid, windows::Win32::UI::WindowsAndMessaging::WM_QUIT, WPARAM(0), LPARAM(0)); }
+    } else {
+        unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0); }
+    }
+}
 pub fn toggle_tiling() {
     let enabled = !TILING_ENABLED.load(Ordering::SeqCst);
     TILING_ENABLED.store(enabled, Ordering::SeqCst);
@@ -61,9 +73,9 @@ pub fn set_layout_by_name(name: &str) {
         "floating" => Layout::Floating,
         _ => Layout::MasterStack,
     };
-    *CURRENT_LAYOUT.lock().unwrap() = layout;
+    *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = layout;
     {
-        let mut cfg = CURRENT_CONFIG.lock().unwrap();
+        let mut cfg = CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
         cfg.set_layout(layout);
     }
     println!("[main] Layout -> {}", layout.name());
@@ -71,11 +83,11 @@ pub fn set_layout_by_name(name: &str) {
 }
 pub fn reload_config_async() { request_retile(); /* actual reload on next tick */ }
 pub fn is_ignored_class(class: &str) -> bool {
-    let cfg = CURRENT_CONFIG.lock().unwrap();
+    let cfg = CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     cfg.ignore.classes.iter().any(|c| c == class)
 }
 pub fn is_ignored_title(title: &str) -> bool {
-    let cfg = CURRENT_CONFIG.lock().unwrap();
+    let cfg = CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     cfg.ignore.titles.iter().any(|t| title.contains(t))
 }
 
@@ -85,6 +97,21 @@ fn vk_from_name(name: &str) -> Option<u32> {
         let c = s.chars().next().unwrap();
         if c.is_ascii_alphabetic() { return Some((c as u8).to_ascii_uppercase() as u32); }
         if c.is_ascii_digit() { return Some(c as u32); }
+        // single symbols: , . ; / [ ] \ ` - = '
+        return match c {
+            ',' => Some(0xBC),
+            '.' => Some(0xBE),
+            ';' => Some(0xBA),
+            '/' => Some(0xBF),
+            '[' => Some(0xDB),
+            ']' => Some(0xDD),
+            '\\' => Some(0xDC),
+            '`' | '~' => Some(0xC0),
+            '-' | '_' => Some(0xBD),
+            '=' | '+' => Some(0xBB),
+            '\'' | '"' => Some(0xDE),
+            _ => None,
+        };
     }
     match s.as_str() {
         "space" => Some(0x20),
@@ -102,7 +129,9 @@ fn vk_from_name(name: &str) -> Option<u32> {
         "up" => Some(0x26),
         "right" => Some(0x27),
         "down" => Some(0x28),
-        _ if s.starts_with('f') => {
+        "pause" => Some(0x13),
+        "print" | "printscreen" => Some(0x2C),
+        _ if s.len() > 1 && s.starts_with('f') => {
             if let Ok(n) = s[1..].parse::<u32>() {
                 if (1..=24).contains(&n) { return Some(0x70 + n - 1); }
             }
@@ -140,7 +169,7 @@ fn parse_hotkey(keys: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
 
 fn register_keybinds(cfg: &config::Config) {
     // clear old
-    let mut map = HOTKEY_ACTIONS.lock().unwrap();
+    let mut map = HOTKEY_ACTIONS.lock().unwrap_or_else(|e| e.into_inner());
     // unregister previous ids
     for id in map.keys().copied().collect::<Vec<_>>() {
         unsafe { let _ = UnregisterHotKey(None, id); }
@@ -156,7 +185,7 @@ fn register_keybinds(cfg: &config::Config) {
                 match RegisterHotKey(None, id, mods, vk) {
                     Ok(_) => {
                         println!("[hotkey] {} -> '{}' id={}", kb.keys, kb.action, id);
-                        HOTKEY_ACTIONS.lock().unwrap().insert(id, kb.action.clone());
+                        HOTKEY_ACTIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(id, kb.action.clone());
                     }
                     Err(e) => eprintln!("[hotkey] failed {} -> '{}': {:?}", kb.keys, kb.action, e),
                 }
@@ -165,13 +194,13 @@ fn register_keybinds(cfg: &config::Config) {
             eprintln!("[hotkey] skip invalid '{}'", kb.keys);
         }
     }
-    if HOTKEY_ACTIONS.lock().unwrap().is_empty() {
+    if HOTKEY_ACTIONS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
         eprintln!("[hotkey] no keybinds registered! check config.toml");
     }
 }
 
 fn unregister_all_hotkeys() {
-    let map = HOTKEY_ACTIONS.lock().unwrap();
+    let map = HOTKEY_ACTIONS.lock().unwrap_or_else(|e| e.into_inner());
     for id in map.keys().copied().collect::<Vec<_>>() {
         unsafe { let _ = UnregisterHotKey(None, id); }
     }
@@ -189,7 +218,7 @@ const HK_RELOAD: i32 = 8;
 
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     hwnd: HWND,
     id_object: i32,
     _id_child: i32,
@@ -198,14 +227,17 @@ unsafe extern "system" fn win_event_proc(
 ) {
     if id_object != 0 { return; }
     if hwnd.0.is_null() { return; }
+    // on_create rules — run even if tiling disabled, but only for CREATE/SHOW
+    if event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW {
+        crate::rules::maybe_run_on_create(hwnd);
+    }
     if !TILING_ENABLED.load(Ordering::SeqCst) { return; }
-    // respect auto_tile from config
-    let auto = { CURRENT_CONFIG.lock().unwrap().general.auto_tile };
+    let auto = { CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).general.auto_tile };
     if !auto { return; }
     RETILE_PENDING.store(true, Ordering::SeqCst);
 }
 
-static mut HOST_HWND: HWND = HWND(std::ptr::null_mut());
+static HOST_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
@@ -219,7 +251,7 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 if RETILE_PENDING.load(Ordering::SeqCst) && TILING_ENABLED.load(Ordering::SeqCst) {
                     RETILE_PENDING.store(false, Ordering::SeqCst);
                     // compute panel/taskbar reservation — now top+bottom aware
-                    let cfg = CURRENT_CONFIG.lock().unwrap().clone();
+                    let cfg = CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let gap = cfg.general.gap;
                     let layout = cfg.layout_enum();
                     let (top_reserve, bottom_reserve) = if !cfg.panels.is_empty() {
@@ -270,7 +302,7 @@ fn create_host_window() -> Result<HWND, String> {
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
             Some(HWND_MESSAGE), Some(HMENU(std::ptr::null_mut())), Some(hinstance), None,
         ).map_err(|e| format!("Host CreateWindowExW failed: {:?}", e))?;
-        HOST_HWND = hwnd;
+        HOST_HWND.store(hwnd.0 as usize, Ordering::SeqCst);
         println!("[host] message-only window hwnd={:?}", hwnd.0);
         Ok(hwnd)
     }
@@ -334,6 +366,7 @@ fn do_check_config(explicit: Option<&std::path::Path>) {
 }
 
 fn main() {
+    let _ = MAIN_TID.set(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
     print_banner();
     virtual_desktop::init();
 
@@ -371,7 +404,7 @@ fn main() {
 
     // --- load config
     let (mut cfg, cfg_path) = config::load_or_default(explicit_cfg.as_deref());
-    *CONFIG_PATH.lock().unwrap() = cfg_path.clone();
+    *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = cfg_path.clone();
     // apply CLI overrides (they win over file)
     for (k,v) in &cli_overrides {
         match k.as_str() {
@@ -385,9 +418,9 @@ fn main() {
     for w in cfg.validate() { eprintln!("[config] warn: {}", w); }
 
     // push to globals
-    *CURRENT_CONFIG.lock().unwrap() = cfg.clone();
-    *CURRENT_GAP.lock().unwrap() = cfg.general.gap;
-    *CURRENT_LAYOUT.lock().unwrap() = cfg.layout_enum();
+    *CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
+    *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()) = cfg.general.gap;
+    *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = cfg.layout_enum();
     TASKBAR_ENABLED.store(cfg.general.taskbar && cfg.panels.is_empty(), Ordering::SeqCst);
     TILING_ENABLED.store(true, Ordering::SeqCst);
 
@@ -462,20 +495,20 @@ fn main() {
             if ret.0 == -1 { eprintln!("[main] GetMessageW {:?}", windows::Win32::Foundation::GetLastError()); break; }
             if msg.message == WM_HOTKEY {
                 let id = msg.wParam.0 as i32;
-                let action = { HOTKEY_ACTIONS.lock().unwrap().get(&id).cloned() };
+                let action = { HOTKEY_ACTIONS.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned() };
                 if let Some(act) = action {
                     println!("[hotkey] id={} -> '{}'", id, act);
                     if act == "quit" {
                         break;
                     } else if act == "reload_config" {
                         println!("[hotkey] reload config");
-                        let explicit = CONFIG_PATH.lock().unwrap().clone();
+                        let explicit = CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let (new_cfg, new_path) = config::load_or_default(explicit.as_deref());
                         for w in new_cfg.validate() { eprintln!("[config] warn: {}", w); }
-                        *CURRENT_GAP.lock().unwrap() = new_cfg.general.gap;
-                        *CURRENT_LAYOUT.lock().unwrap() = new_cfg.layout_enum();
-                        *CURRENT_CONFIG.lock().unwrap() = new_cfg.clone();
-                        *CONFIG_PATH.lock().unwrap() = new_path;
+                        *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.general.gap;
+                        *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.layout_enum();
+                        *CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
+                        *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = new_path;
                         // re-register hotkeys (config may have changed keybinds)
                         register_keybinds(&new_cfg);
                         panel::destroy_panels();
@@ -485,7 +518,7 @@ fn main() {
                         // if panels cleared, recreate legacy taskbar if needed — for MVP just retile
                         request_retile();
                     } else if act == "retile" {
-                        let l=*CURRENT_LAYOUT.lock().unwrap(); let g=*CURRENT_GAP.lock().unwrap(); let cfg=CURRENT_CONFIG.lock().unwrap().clone();
+                        let l=*CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()); let g=*CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()); let cfg=CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let (top,bottom)= if !cfg.panels.is_empty(){
                             let t: i32 = cfg.panels.iter().filter(|p| p.position=="top").map(|p| p.height).sum();
                             let b: i32 = cfg.panels.iter().filter(|p| p.position=="bottom").map(|p| p.height).sum();
@@ -506,13 +539,13 @@ fn main() {
             // auto-reload from file watcher (debounced, checks atomic flag)
             if watcher::should_reload() {
                 println!("[watcher] config changed -> reloading");
-                let explicit = CONFIG_PATH.lock().unwrap().clone();
+                let explicit = CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let (new_cfg, new_path) = config::load_or_default(explicit.as_deref());
                 for w in new_cfg.validate() { eprintln!("[config] warn: {}", w); }
-                *CURRENT_GAP.lock().unwrap() = new_cfg.general.gap;
-                *CURRENT_LAYOUT.lock().unwrap() = new_cfg.layout_enum();
-                *CURRENT_CONFIG.lock().unwrap() = new_cfg.clone();
-                *CONFIG_PATH.lock().unwrap() = new_path.clone();
+                *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.general.gap;
+                *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.layout_enum();
+                *CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
+                *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = new_path.clone();
                 register_keybinds(&new_cfg);
                 panel::destroy_panels();
                 if !new_cfg.panels.is_empty() {

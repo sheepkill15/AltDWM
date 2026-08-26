@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::layout::Layout;
 use crate::theme::Theme;
+use regex::Regex;
 
 // ------------------------------------------------------------------
 // Top-level Config — DSL root (see docs/EXTENSIBILITY.md)
@@ -132,6 +133,12 @@ pub struct RuleConfig {
     pub match_class_regex: Option<String>,
     #[serde(default)]
     pub match_title_regex: Option<String>,
+    #[serde(skip)]
+    #[serde(default)]
+    pub compiled_class_regex: Option<Regex>,
+    #[serde(skip)]
+    #[serde(default)]
+    pub compiled_title_regex: Option<Regex>,
     #[serde(default)]
     pub monitor: Option<String>,
     #[serde(default)]
@@ -244,6 +251,9 @@ impl Default for Config {
                 KeybindConfig { keys: "Alt+Shift+K".into(), action: "focus_prev()".into(), description: Some("Focus prev window".into()) },
                 KeybindConfig { keys: "Alt+Shift+H".into(), action: "focus_prev()".into(), description: Some("Focus prev (left)".into()) },
                 KeybindConfig { keys: "Alt+Shift+L".into(), action: "focus_next()".into(), description: Some("Focus next (right)".into()) },
+                KeybindConfig { keys: "Alt+Shift+Y".into(), action: "toggle_floating()".into(), description: Some("Toggle floating for focused".into()) },
+                KeybindConfig { keys: "Alt+Shift+N".into(), action: "move_to_next_monitor()".into(), description: Some("Move window to next monitor".into()) },
+                KeybindConfig { keys: "Alt+Shift+P".into(), action: "move_to_prev_monitor()".into(), description: Some("Move window to prev monitor".into()) },
             ],
             layouts: HashMap::new(),
             theme: Theme::default(),
@@ -255,7 +265,28 @@ impl Default for Config {
 // Config helpers
 // ------------------------------------------------------------------
 
+impl RuleConfig {
+    pub fn compile_regexes(&mut self) {
+        if let Some(rx) = &self.match_class_regex {
+            match Regex::new(rx) {
+                Ok(re) => self.compiled_class_regex = Some(re),
+                Err(e) => eprintln!("[config] invalid match_class_regex '{}': {}", rx, e),
+            }
+        }
+        if let Some(rx) = &self.match_title_regex {
+            match Regex::new(rx) {
+                Ok(re) => self.compiled_title_regex = Some(re),
+                Err(e) => eprintln!("[config] invalid match_title_regex '{}': {}", rx, e),
+            }
+        }
+    }
+}
+
 impl Config {
+    pub fn compile_regexes(&mut self) {
+        for r in &mut self.rules { r.compile_regexes(); }
+    }
+
     pub fn layout_enum(&self) -> Layout {
         match self.general.layout.to_lowercase().as_str() {
             "grid" => Layout::Grid,
@@ -340,7 +371,9 @@ pub fn default_config_path() -> PathBuf {
 
 pub fn load_from_path(path: &Path) -> Result<Config, String> {
     let data = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    toml::from_str::<Config>(&data).map_err(|e| format!("parse {}: {}", path.display(), e))
+    let mut cfg = toml::from_str::<Config>(&data).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    cfg.compile_regexes();
+    Ok(cfg)
 }
 
 pub fn load_or_default(explicit: Option<&Path>) -> (Config, Option<PathBuf>) {
@@ -420,7 +453,7 @@ pub fn example_config_with_panels() -> Config {
         WidgetConfig { widget_type: "custom".into(), name: "cpu".into(), format: None, interval: Some(2000), script: Some("scripts/cpu.rhai".into()), action: None, command: None, label: None, icon: None, width: Some(120), tooltip: None, extra: HashMap::new() },
     ];
     cfg.rules = vec![
-        RuleConfig { match_class: Some("Spotify".into()), match_title: None, match_process: None, match_class_regex: None, match_title_regex: None, monitor: None, floating: Some(true), opacity: None, layout: None, on_create: None, extra: HashMap::new() },
+        RuleConfig { match_class: Some("Spotify".into()), match_title: None, match_process: None, match_class_regex: None, match_title_regex: None, compiled_class_regex: None, compiled_title_regex: None, monitor: None, floating: Some(true), opacity: None, layout: None, on_create: None, extra: HashMap::new() },
     ];
     cfg.layouts.insert("spiral".into(), LayoutConfig { script: Some("scripts/spiral.rhai".into()), gap: None, extra: HashMap::new() });
     // To use custom layout: set general.layout = "spiral"

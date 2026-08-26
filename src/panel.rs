@@ -18,7 +18,7 @@ use crate::config::{PanelConfig, Config};
 use crate::theme;
 use crate::widgets::{self, Widget, PanelCtx};
 
-static mut PANELS: Option<Arc<Mutex<Vec<Panel>>>> = None;
+static PANELS: std::sync::LazyLock<Mutex<Option<Arc<Mutex<Vec<Panel>>>>>> = std::sync::LazyLock::new(|| Mutex::new(None));
 
 pub struct Panel {
     pub cfg: PanelConfig,
@@ -26,6 +26,8 @@ pub struct Panel {
     pub widgets: Vec<Box<dyn Widget>>,
     pub background: COLORREF,
 }
+unsafe impl Send for Panel {}
+unsafe impl Sync for Panel {}
 
 fn parse_color(s: &str) -> COLORREF {
     // fallback simple parser (theme::parse_hex handles #AARRGGBB correctly)
@@ -72,7 +74,8 @@ unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         }
         WM_PAINT => {
             // find panel
-            let panels = unsafe { PANELS.as_ref().unwrap().lock().unwrap() };
+            let panels_guard = PANELS.lock().unwrap_or_else(|e| e.into_inner());
+            let panels = panels_guard.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
             let panel = panels.iter().find(|p| p.hwnd == hwnd);
             if let Some(p) = panel {
                 let mut ps = PAINTSTRUCT::default();
@@ -114,7 +117,8 @@ unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             // route to widget
-            let panels = unsafe { PANELS.as_ref().unwrap().lock().unwrap() };
+            let panels_guard = PANELS.lock().unwrap_or_else(|e| e.into_inner());
+            let panels = panels_guard.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
@@ -187,7 +191,7 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
     let widget_map: HashMap<String, crate::config::WidgetConfig> = cfg.widgets.iter().map(|w| (w.name.clone(), w.clone())).collect();
 
     let panels_arc = Arc::new(Mutex::new(Vec::<Panel>::new()));
-    unsafe { PANELS = Some(panels_arc.clone()); }
+    *PANELS.lock().unwrap_or_else(|e| e.into_inner()) = Some(panels_arc.clone());
 
     for pc in &cfg.panels {
         // build widget instances in order
@@ -221,7 +225,7 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
             _ => (0, screen_h - pc.height, screen_w, pc.height),
         };
 
-        let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
+        let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
         let bg = pc.background.as_deref().map(|s| theme.color(s)).unwrap_or_else(|| theme.panel_bg(&pc.position));
         let hwnd = unsafe {
             let hinstance = HINSTANCE(std::ptr::null_mut());
@@ -245,22 +249,20 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
         println!("[panel] '{}' @ {},{} {}x{} monitor={} widgets={}", pc.name, x, y, w, h, pc.monitor, pc.widgets.join(","));
 
         handles.push(hwnd);
-        panels_arc.lock().unwrap().push(Panel { cfg: pc.clone(), hwnd, widgets, background: bg });
+        panels_arc.lock().unwrap_or_else(|e| e.into_inner()).push(Panel { cfg: pc.clone(), hwnd, widgets, background: bg });
     }
 
     Ok(handles)
 }
 
 pub fn destroy_panels() {
-    unsafe {
-        if let Some(arc) = PANELS.take() {
-            for p in arc.lock().unwrap().iter() {
-                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(p.hwnd);
-            }
+    if let Some(arc) = PANELS.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        for p in arc.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            unsafe { let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(p.hwnd); }
         }
     }
 }
 
 pub fn get_panels() -> Option<Arc<Mutex<Vec<Panel>>>> {
-    unsafe { PANELS.clone() }
+    PANELS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }

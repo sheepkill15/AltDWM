@@ -1,20 +1,75 @@
 //! Focus navigation — cycle through tilable windows
 //! Exposed to keybinds via `focus_next()` / `focus_prev()` etc and Rhai `focus_next()`
-use windows::Win32::Foundation::HWND;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SetWindowPos, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER, SWP_FRAMECHANGED};
 
 use crate::manager::collect_windows;
 use crate::taskbar;
+
+static RUNTIME_FLOATING: LazyLock<Mutex<HashSet<isize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+pub fn is_runtime_floating(hwnd: HWND) -> bool {
+    RUNTIME_FLOATING.lock().unwrap_or_else(|e| e.into_inner()).contains(&(hwnd.0 as isize))
+}
+pub fn toggle_floating_focused() {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() { return; }
+    let key = hwnd.0 as isize;
+    let mut set = RUNTIME_FLOATING.lock().unwrap_or_else(|e| e.into_inner());
+    if set.contains(&key) {
+        set.remove(&key);
+        println!("[focus] untiled (floating off) {:?}", hwnd.0);
+    } else {
+        set.insert(key);
+        println!("[focus] floated {:?}", hwnd.0);
+    }
+    crate::request_retile();
+}
+pub fn move_focused_to_monitor(dir: &str) {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() { return; }
+    // get all monitors
+    let mons = crate::manager::get_all_monitors();
+    if mons.len() <= 1 { return; }
+    let cur = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let idx = mons.iter().position(|&h| h.0 == cur.0).unwrap_or(0);
+    let target_idx = match dir.to_lowercase().as_str() {
+        "next" | "right" | "down" | "l" | "j" => (idx + 1) % mons.len(),
+        "prev" | "left" | "up" | "h" | "k" => (idx + mons.len() - 1) % mons.len(),
+        _ => (idx + 1) % mons.len(),
+    };
+    let target = mons[target_idx];
+    // center on target monitor work area
+    unsafe {
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(target, &mut mi as *mut _ as *mut _).as_bool() {
+            let work = mi.rcWork;
+            let mut rect = RECT::default();
+            if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).is_ok() {
+                let w = rect.right - rect.left;
+                let h = rect.bottom - rect.top;
+                let x = work.left + (work.right - work.left - w) / 2;
+                let y = work.top + (work.bottom - work.top - h) / 2;
+                let _ = SetWindowPos(hwnd, Some(HWND_TOP), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                // also set foreground
+                set_foreground(hwnd);
+                crate::request_retile();
+                println!("[focus] move {:?} to monitor {} (0x{:x})", hwnd.0, target_idx+1, target.0 as usize);
+            }
+        }
+    }
+}
 
 /// Get tilable windows in tiling order (same as manager)
 fn tilable_windows() -> Vec<HWND> {
     let tb = taskbar::get_taskbar_hwnd();
     let mut wins = collect_windows(tb);
-    // filter floating as manager does (so focus doesn't jump to floating? but allow floating focus via config)
-    wins.retain(|hwnd| !crate::rules::is_floating(*hwnd));
-    // filter virtual desktop if enabled
+    wins.retain(|hwnd| !crate::rules::is_floating(*hwnd) && !is_runtime_floating(*hwnd));
     wins.retain(|hwnd| crate::virtual_desktop::is_on_current_desktop(*hwnd));
     wins
 }

@@ -4,7 +4,7 @@ fn main() {
     println!("cargo:rerun-if-changed=alt-dwm.manifest");
     println!("cargo:rerun-if-changed=build.rs");
     // Embed manifest via MSVC linker (works for x86_64-pc-windows-msvc)
-    // Use absolute path to avoid cwd issues
+    // Quote path to handle spaces (e.g., C:\Users\John Doe\...)
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest_path);
+    println!("cargo:rustc-link-arg=\"/MANIFESTINPUT:{}\"", manifest_path);
 }

@@ -5,11 +5,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub static CONFIG_DIRTY: AtomicBool = AtomicBool::new(false);
-static mut WATCHER: Option<notify::RecommendedWatcher> = None;
+static WATCHER: std::sync::LazyLock<std::sync::Mutex<Option<notify::RecommendedWatcher>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static WATCHED_DIR: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 /// Spawn watcher for config file. Watches parent directory, debounces 500ms.
 pub fn spawn_watcher(path: PathBuf) {
     let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    {
+        let mut watched = WATCHED_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        if watched.as_ref() == Some(&dir) {
+            return;
+        }
+        *watched = Some(dir.clone());
+    }
     let file_name = path.file_name().map(|n| n.to_owned());
 
     std::thread::spawn(move || {
@@ -27,8 +35,8 @@ pub fn spawn_watcher(path: PathBuf) {
             eprintln!("[watcher] watch failed {:?}: {:?}", dir, e);
             return;
         }
-        // keep watcher alive
-        unsafe { WATCHER = Some(watcher); }
+        // keep watcher alive (store in global)
+        *WATCHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
 
         println!("[watcher] watching {:?} for {:?}", dir, file_name);
         let mut last_emit = Instant::now() - Duration::from_secs(1);

@@ -94,7 +94,7 @@ fn parse_hex(s: &str) -> COLORREF {
     }
 }
 
-/// Helper to create a GDI font handle for Segoe UI with theme size
+/// Helper to create a GDI font handle for Segoe UI with theme size (uncached, caller must DeleteObject)
 pub fn create_font(theme: &Theme) -> windows::Win32::Graphics::Gdi::HFONT {
     use windows::Win32::Graphics::Gdi::{CreateFontW, FW_NORMAL, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, VARIABLE_PITCH, FF_DONTCARE};
     let name_wide: Vec<u16> = theme.font_name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -112,4 +112,22 @@ pub fn create_font(theme: &Theme) -> windows::Win32::Graphics::Gdi::HFONT {
             windows::core::PCWSTR(name_wide.as_ptr()),
         )
     }
+}
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use windows::Win32::Graphics::Gdi::HFONT;
+
+static FONT_CACHE: LazyLock<Mutex<HashMap<String, isize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Cached version — reuses HFONT per (font_name, size), leaked until exit to avoid GDI churn
+pub fn get_cached_font(theme: &Theme) -> HFONT {
+    let key = format!("{}:{}", theme.font_name, theme.font_size);
+    let mut cache = FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&v) = cache.get(&key) {
+        return HFONT(v as *mut std::ffi::c_void);
+    }
+    let h = create_font(theme);
+    cache.insert(key, h.0 as isize);
+    h
 }

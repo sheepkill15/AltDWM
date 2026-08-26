@@ -6,17 +6,19 @@ use windows::Win32::Foundation::HWND;
 use crate::config::RuleConfig;
 use crate::util::{get_class_name, get_window_title};
 
-fn matches_pattern(text: &str, pattern: &str, regex_pattern: Option<&String>) -> bool {
+fn matches_pattern(text: &str, pattern: &str, compiled: Option<&Regex>, regex_pattern: Option<&String>) -> bool {
+    if let Some(re) = compiled {
+        return re.is_match(text);
+    }
     if let Some(rx) = regex_pattern {
+        // fallback compile (should have been cached, but handle if called before compile)
         if let Ok(re) = Regex::new(rx) {
             return re.is_match(text);
         } else {
             eprintln!("[rules] invalid regex '{}'", rx);
         }
     }
-    // fallback: substring contains (case-insensitive for class? keep exact)
     if pattern.is_empty() { return false; }
-    // for match_class / match_title, treat pattern as substring
     text.to_lowercase().contains(&pattern.to_lowercase())
 }
 
@@ -34,30 +36,34 @@ pub fn rule_matches(hwnd: HWND, rule: &RuleConfig) -> bool {
 
     if let Some(pat) = &rule.match_class {
         has_condition = true;
-        // allow exact or contains? use exact if equal, else contains
-        let ok = matches_exact(&class, pat) || matches_pattern(&class, pat, rule.match_class_regex.as_ref());
+        let ok = matches_exact(&class, pat) || matches_pattern(&class, pat, rule.compiled_class_regex.as_ref(), rule.match_class_regex.as_ref());
         matched &= ok;
-    } else if let Some(rx) = &rule.match_class_regex {
+    } else if rule.compiled_class_regex.is_some() || rule.match_class_regex.is_some() {
         has_condition = true;
-        if let Ok(re) = Regex::new(rx) {
+        if let Some(re) = rule.compiled_class_regex.as_ref() {
             matched &= re.is_match(&class);
-        } else { matched = false; }
+        } else if let Some(rx) = &rule.match_class_regex {
+            if let Ok(re) = Regex::new(rx) { matched &= re.is_match(&class); } else { matched = false; }
+        }
     }
 
     if let Some(pat) = &rule.match_title {
         has_condition = true;
-        let ok = matches_pattern(&title, pat, rule.match_title_regex.as_ref());
+        let ok = matches_pattern(&title, pat, rule.compiled_title_regex.as_ref(), rule.match_title_regex.as_ref());
         matched &= ok;
-    } else if let Some(rx) = &rule.match_title_regex {
+    } else if rule.compiled_title_regex.is_some() || rule.match_title_regex.is_some() {
         has_condition = true;
-        if let Ok(re) = Regex::new(rx) { matched &= re.is_match(&title); } else { matched = false; }
+        if let Some(re) = rule.compiled_title_regex.as_ref() { matched &= re.is_match(&title); }
+        else if let Some(rx) = &rule.match_title_regex {
+            if let Ok(re) = Regex::new(rx) { matched &= re.is_match(&title); } else { matched = false; }
+        }
     }
 
     if let Some(pat) = &rule.match_process {
         has_condition = true;
         // process name: try GetWindowThreadProcessId + OpenProcess + GetModuleBaseName
         let proc_name = get_process_name(hwnd);
-        let ok = matches_pattern(&proc_name, pat, None);
+        let ok = matches_pattern(&proc_name, pat, None, None);
         matched &= ok;
     }
 
@@ -94,7 +100,7 @@ fn get_process_name(hwnd: HWND) -> String {
 
 /// Returns true if window should float (not tiled) per rules
 pub fn is_floating(hwnd: HWND) -> bool {
-    let cfg = crate::CURRENT_CONFIG.lock().unwrap();
+    let cfg = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     for rule in &cfg.rules {
         if rule_matches(hwnd, rule) && rule.floating == Some(true) {
             return true;
@@ -105,7 +111,7 @@ pub fn is_floating(hwnd: HWND) -> bool {
 
 /// Get monitor target from rule, if any (e.g. rule monitor=2)
 pub fn rule_monitor(_hwnd: HWND) -> Option<String> {
-    let cfg = crate::CURRENT_CONFIG.lock().unwrap();
+    let cfg = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     for rule in &cfg.rules {
         if rule_matches(_hwnd, rule) {
             if let Some(m) = &rule.monitor { return Some(m.clone()); }
@@ -116,7 +122,7 @@ pub fn rule_monitor(_hwnd: HWND) -> Option<String> {
 
 /// Get opacity from rule, if any (0.0-1.0)
 pub fn rule_opacity(hwnd: HWND) -> Option<f32> {
-    let cfg = crate::CURRENT_CONFIG.lock().unwrap();
+    let cfg = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     for rule in &cfg.rules {
         if rule_matches(hwnd, rule) {
             if let Some(o) = rule.opacity { return Some(o.clamp(0.0, 1.0)); }
@@ -140,7 +146,7 @@ pub fn apply_opacity(hwnd: HWND, opacity: f32) {
 /// Execute on_create action if rule matches (rhai)
 pub fn maybe_run_on_create(hwnd: HWND) {
     let actions: Vec<String> = {
-        let cfg = crate::CURRENT_CONFIG.lock().unwrap();
+        let cfg = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
         cfg.rules.iter()
             .filter(|r| rule_matches(hwnd, r))
             .filter_map(|r| r.on_create.clone())

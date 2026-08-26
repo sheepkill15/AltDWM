@@ -18,23 +18,34 @@ pub fn init() {
     let _ = get_vdm();
 }
 
+thread_local! {
+    static VDM_CACHE: std::cell::RefCell<Option<Option<IVirtualDesktopManager>>> = std::cell::RefCell::new(None);
+}
+
 fn get_vdm() -> Option<IVirtualDesktopManager> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let res: windows::core::Result<IVirtualDesktopManager> =
-            CoCreateInstance(&CLSID_VirtualDesktopManager, None, CLSCTX_ALL);
-        match res {
+    VDM_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some(cached) = &*cache {
+            return cached.clone();
+        }
+        // not yet cached — create
+        let res = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            CoCreateInstance::<_, IVirtualDesktopManager>(&CLSID_VirtualDesktopManager, None, CLSCTX_ALL)
+        };
+        let opt = match res {
             Ok(m) => Some(m),
             Err(e) => {
-                // log only once per process to avoid spam — use static flag
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     eprintln!("[vdesktop] CoCreateInstance failed: {:?} — virtual desktop filtering disabled", e);
                 });
                 None
             }
-        }
-    }
+        };
+        *cache = Some(opt.clone());
+        opt
+    })
 }
 
 /// Returns true if window is on current virtual desktop, or if COM unavailable / filter disabled.

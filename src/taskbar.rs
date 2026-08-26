@@ -15,12 +15,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub const TASKBAR_HEIGHT: i32 = 40;
 
-static mut TASKBAR_HWND: HWND = HWND(std::ptr::null_mut());
+static TASKBAR_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn get_taskbar_hwnd() -> Option<HWND> {
-    unsafe {
-        if TASKBAR_HWND.0.is_null() { None } else { Some(TASKBAR_HWND) }
-    }
+    let v = TASKBAR_HWND.load(std::sync::atomic::Ordering::SeqCst);
+    if v == 0 { None } else { Some(HWND(v as *mut std::ffi::c_void)) }
 }
 
 unsafe extern "system" fn taskbar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -38,7 +37,7 @@ unsafe extern "system" fn taskbar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
             let hdc = BeginPaint(hwnd, &mut ps);
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
-            let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
+            let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
             let bg = theme.panel_bg("bottom");
             let brush = CreateSolidBrush(bg);
             FillRect(hdc, &rect, brush);
@@ -121,7 +120,7 @@ pub fn create_taskbar() -> Result<HWND, String> {
 
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, y_final, screen_w, TASKBAR_HEIGHT, SWP_NOACTIVATE | SWP_NOZORDER);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        TASKBAR_HWND = hwnd;
+        TASKBAR_HWND.store(hwnd.0 as usize, std::sync::atomic::Ordering::SeqCst);
         println!("[taskbar] created hwnd={:?} {}x{} @ 0,{} (screen {}x{})", hwnd.0, screen_w, TASKBAR_HEIGHT, y_final, screen_w, screen_h);
         Ok(hwnd)
     }

@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 use windows::Win32::Foundation::RECT;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,6 +41,8 @@ pub fn compute_layout(n: usize, area: RECT, gap: i32, layout: Layout) -> Vec<REC
     }
 }
 
+static LAYOUT_CACHE: LazyLock<Mutex<HashMap<String, (SystemTime, rhai::AST, PathBuf)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Try to compute via custom Rhai layout script if `general.layout` names a key in `layouts`
 /// Script must define `fn layout(n, left, top, right, bottom, gap)` returning array of maps with left/top/right/bottom
 pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::Config) -> Option<Vec<RECT>> {
@@ -46,33 +51,77 @@ pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::C
     let script_path = lc.script.as_deref()?;
     // resolve script path: try as given, then relative to config dir, then exe dir, then cwd
     let candidate_paths = {
-        let mut v = vec![std::path::PathBuf::from(script_path)];
-        if let Some(cfg_path) = crate::CONFIG_PATH.lock().unwrap().as_ref().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+        let mut v = vec![PathBuf::from(script_path)];
+        if let Some(cfg_path) = crate::CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
             v.push(cfg_path.join(script_path));
         }
         if let Ok(exe) = std::env::current_exe().and_then(|p| Ok(p.parent().map(|p| p.to_path_buf()).unwrap_or_default())) {
             v.push(exe.join(script_path));
         }
-        v.push(std::path::PathBuf::from("scripts").join(script_path));
+        v.push(PathBuf::from("scripts").join(script_path));
         v
     };
-    let script_code = candidate_paths.iter().find_map(|p| std::fs::read_to_string(p).ok());
-    let code = match script_code {
-        Some(c) => c,
-        None => {
-            eprintln!("[layout] custom '{}' script not found: {} (tried {:?})", name, script_path, candidate_paths);
-            return None;
+    let (code_path, code_mtime, code) = {
+        let mut found: Option<(PathBuf, SystemTime, String)> = None;
+        for p in &candidate_paths {
+            if let Ok(meta) = std::fs::metadata(p) {
+                if let Ok(mtime) = meta.modified() {
+                    if let Ok(c) = std::fs::read_to_string(p) {
+                        found = Some((p.clone(), mtime, c));
+                        break;
+                    }
+                }
+            }
+        }
+        // fallback to old find_map (for non-existent but readable)
+        if found.is_none() {
+            if let Some(c) = candidate_paths.iter().find_map(|p| std::fs::read_to_string(p).ok()) {
+                // use first candidate as path with dummy mtime
+                found = Some((candidate_paths[0].clone(), SystemTime::UNIX_EPOCH, c));
+            }
+        }
+        match found {
+            Some((p, t, c)) => (p, t, c),
+            None => {
+                eprintln!("[layout] custom '{}' script not found: {} (tried {:?})", name, script_path, candidate_paths);
+                return None;
+            }
+        }
+    };
+    // check cache
+    let ast = {
+        let mut cache = LAYOUT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_mtime, cached_ast, cached_path)) = cache.get(name) {
+            if *cached_path == code_path && *cached_mtime == code_mtime {
+                cached_ast.clone()
+            } else {
+                // recompile
+                let engine = crate::scripting::engine().lock().ok()?;
+                let new_ast = match engine.compile(&code) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("[layout] custom '{}' compile error: {}", name, e);
+                        return None;
+                    }
+                };
+                cache.insert(name.to_string(), (code_mtime, new_ast.clone(), code_path.clone()));
+                new_ast
+            }
+        } else {
+            let engine = crate::scripting::engine().lock().ok()?;
+            let new_ast = match engine.compile(&code) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("[layout] custom '{}' compile error: {}", name, e);
+                    return None;
+                }
+            };
+            cache.insert(name.to_string(), (code_mtime, new_ast.clone(), code_path.clone()));
+            new_ast
         }
     };
     let engine = crate::scripting::engine().lock().ok()?;
     let mut scope = rhai::Scope::new();
-    let ast = match engine.compile(&code) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("[layout] custom '{}' compile error: {}", name, e);
-            return None;
-        }
-    };
     if let Err(e) = engine.eval_ast_with_scope::<()>(&mut scope, &ast) {
         eprintln!("[layout] custom '{}' eval error: {}", name, e);
         return None;
