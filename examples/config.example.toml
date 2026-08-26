@@ -88,39 +88,39 @@ match_class = "Spotify"
 floating = true
 
 [[keybinds]]
-keys = "Win+Shift+R"
+keys = "Alt+Shift+R"
 action = "retile"
 description = "Retile windows"
 
 [[keybinds]]
-keys = "Win+Shift+T"
+keys = "Alt+Shift+T"
 action = "toggle_tiling"
 description = "Toggle tiling"
 
 [[keybinds]]
-keys = "Win+Shift+Q"
+keys = "Alt+Shift+Q"
 action = "quit"
 description = "Quit AltDWM"
 
 [[keybinds]]
-keys = "Win+Shift+G"
+keys = "Alt+Shift+G"
 action = 'set_layout("Grid")'
 description = "Grid layout"
 
 [[keybinds]]
-keys = "Win+Shift+M"
+keys = "Alt+Shift+M"
 action = 'set_layout("Monocle")'
 
 [[keybinds]]
-keys = "Win+Shift+F"
+keys = "Alt+Shift+F"
 action = 'set_layout("Floating")'
 
 [[keybinds]]
-keys = "Win+Shift+S"
+keys = "Alt+Shift+S"
 action = 'set_layout("MasterStack")'
 
 [[keybinds]]
-keys = "Win+Shift+C"
+keys = "Alt+Shift+C"
 action = "reload_config"
 description = "Hot-reload config"
 

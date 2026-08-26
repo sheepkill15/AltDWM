@@ -222,14 +222,16 @@ impl Default for Config {
             widgets: vec![],
             rules: vec![],
             keybinds: vec![
-                KeybindConfig { keys: "Win+Shift+R".into(), action: "retile".into(), description: Some("Retile windows".into()) },
-                KeybindConfig { keys: "Win+Shift+T".into(), action: "toggle_tiling".into(), description: Some("Toggle tiling".into()) },
-                KeybindConfig { keys: "Win+Shift+Q".into(), action: "quit".into(), description: Some("Quit AltDWM".into()) },
-                KeybindConfig { keys: "Win+Shift+G".into(), action: "set_layout(\"Grid\")".into(), description: Some("Grid layout".into()) },
-                KeybindConfig { keys: "Win+Shift+M".into(), action: "set_layout(\"Monocle\")".into(), description: None },
-                KeybindConfig { keys: "Win+Shift+F".into(), action: "set_layout(\"Floating\")".into(), description: None },
-                KeybindConfig { keys: "Win+Shift+S".into(), action: "set_layout(\"MasterStack\")".into(), description: None },
-                KeybindConfig { keys: "Win+Shift+C".into(), action: "reload_config".into(), description: Some("Hot-reload config".into()) },
+                // Alt+Shift chosen because Win+Shift collides with system (Win+Shift+S = Snipping Tool, etc.)
+                // Users can set keys = "Win+Shift+R" etc in config.toml if they prefer — parser supports Win/Ctrl/Alt/Shift combos
+                KeybindConfig { keys: "Alt+Shift+R".into(), action: "retile".into(), description: Some("Retile windows".into()) },
+                KeybindConfig { keys: "Alt+Shift+T".into(), action: "toggle_tiling".into(), description: Some("Toggle tiling".into()) },
+                KeybindConfig { keys: "Alt+Shift+Q".into(), action: "quit".into(), description: Some("Quit AltDWM".into()) },
+                KeybindConfig { keys: "Alt+Shift+G".into(), action: "set_layout(\"Grid\")".into(), description: Some("Grid layout".into()) },
+                KeybindConfig { keys: "Alt+Shift+M".into(), action: "set_layout(\"Monocle\")".into(), description: None },
+                KeybindConfig { keys: "Alt+Shift+F".into(), action: "set_layout(\"Floating\")".into(), description: None },
+                KeybindConfig { keys: "Alt+Shift+S".into(), action: "set_layout(\"MasterStack\")".into(), description: None },
+                KeybindConfig { keys: "Alt+Shift+C".into(), action: "reload_config".into(), description: Some("Hot-reload config".into()) },
             ],
             layouts: HashMap::new(),
         }

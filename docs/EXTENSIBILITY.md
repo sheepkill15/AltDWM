@@ -4,7 +4,7 @@ Goal: let users configure **and change anything** without forking Rust code — 
 
 ## Design principles
 
-1. **No recompilation for most changes** — edit `config.toml` + optional `*.rhai` scripts and hit `Win+Shift+C` to hot-reload.
+1. **No recompilation for most changes** — edit `config.toml` + optional `*.rhai` scripts and hit `Alt+Shift+C` (default, `Win+Shift` collides with Snipping Tool) to hot-reload.
 2. **Progressive disclosure** — simple TOML for 80% of users, full scripting for power users. Same file format powers both.
 3. **Stable Rust core, pluggable edges** — `Panel`, `Widget`, `Layout`, `Rule`, `Keybind` are traits. New types can be added as Rust `cdylib` plugins or as Rhai scripts without touching core.
 4. **Fail-safe** — bad config never crashes WM; falls back to defaults and logs. Shell replacement must not brick login.
@@ -98,11 +98,11 @@ Rhai `layout` receives `windows.len()` + `area` rect and returns rect array — 
 
 ```toml
 [[keybinds]]
-keys = "Win+Shift+R"
+keys = "Alt+Shift+R"
 action = "retile"
 
 [[keybinds]]
-keys = "Win+1"
+keys = "Alt+Shift+1"
 action = "rhai: focus_workspace(1)"
 ```
 
@@ -154,7 +154,7 @@ plugins/
 
 ## Hot reload & safety
 
-- `Win+Shift+C` or `FileSystemWatcher` on `config.toml` → `Config::load_or_default` → diff → recreate panels without killing WM.
+- `Alt+Shift+C` (default) or `FileSystemWatcher` on `config.toml` → `Config::load_or_default` → diff → recreate panels without killing WM.
 - Parse errors → log + `MessageBoxW` (if not headless) + keep last good config. Never leave user without a shell.
 - `alt-dwm --check-config` validates without applying.
 
@@ -198,7 +198,7 @@ match_class = "Spotify"
 floating = true
 
 [[keybinds]]
-keys = "Win+Return"
+keys = "Alt+Shift+Return"
 action = "launch('wt.exe')"
 ```
 

@@ -7,13 +7,16 @@ mod taskbar;
 mod util;
 mod widgets;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, LazyLock};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage, RegisterClassExW,
     TranslateMessage, HMENU, HWND_MESSAGE, MSG, WM_HOTKEY, WM_CREATE, WM_DESTROY, WM_TIMER, WNDCLASSEXW, CS_HREDRAW, CS_VREDRAW,
@@ -36,6 +39,7 @@ pub static CURRENT_LAYOUT: LazyLock<Mutex<Layout>> = LazyLock::new(|| Mutex::new
 pub static CURRENT_GAP: LazyLock<Mutex<i32>> = LazyLock::new(|| Mutex::new(8));
 pub static CONFIG_PATH: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
 pub static CURRENT_CONFIG: LazyLock<Mutex<config::Config>> = LazyLock::new(|| Mutex::new(config::Config::default()));
+pub static HOTKEY_ACTIONS: LazyLock<Mutex<HashMap<i32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // helpers for scripting / manager
 pub fn request_retile() { RETILE_PENDING.store(true, Ordering::SeqCst); }
@@ -70,7 +74,105 @@ pub fn is_ignored_title(title: &str) -> bool {
     cfg.ignore.titles.iter().any(|t| title.contains(t))
 }
 
-// Hotkey IDs
+fn vk_from_name(name: &str) -> Option<u32> {
+    let s = name.trim().to_lowercase();
+    if s.len() == 1 {
+        let c = s.chars().next().unwrap();
+        if c.is_ascii_alphabetic() { return Some((c as u8).to_ascii_uppercase() as u32); }
+        if c.is_ascii_digit() { return Some(c as u32); }
+    }
+    match s.as_str() {
+        "space" => Some(0x20),
+        "enter" | "return" => Some(0x0D),
+        "tab" => Some(0x09),
+        "esc" | "escape" => Some(0x1B),
+        "backspace" => Some(0x08),
+        "delete" | "del" => Some(0x2E),
+        "insert" | "ins" => Some(0x2D),
+        "home" => Some(0x24),
+        "end" => Some(0x23),
+        "pageup" | "pgup" => Some(0x21),
+        "pagedown" | "pgdn" => Some(0x22),
+        "left" => Some(0x25),
+        "up" => Some(0x26),
+        "right" => Some(0x27),
+        "down" => Some(0x28),
+        _ if s.starts_with('f') => {
+            if let Ok(n) = s[1..].parse::<u32>() {
+                if (1..=24).contains(&n) { return Some(0x70 + n - 1); }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn parse_hotkey(keys: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
+    let mut mods = HOT_KEY_MODIFIERS(0);
+    let mut vk: Option<u32> = None;
+    for part in keys.split('+') {
+        let p = part.trim();
+        let lp = p.to_lowercase();
+        match lp.as_str() {
+            "win" | "windows" | "super" | "mod4" | "os" => mods |= MOD_WIN,
+            "shift" => mods |= MOD_SHIFT,
+            "ctrl" | "control" | "ctl" => mods |= MOD_CONTROL,
+            "alt" | "mod1" => mods |= MOD_ALT,
+            _ => {
+                if vk.is_none() {
+                    vk = vk_from_name(p);
+                    if vk.is_none() { eprintln!("[hotkey] unknown key '{}' in '{}'", p, keys); return None; }
+                } else {
+                    eprintln!("[hotkey] extra key '{}' in '{}'", p, keys); return None;
+                }
+            }
+        }
+    }
+    let vk = vk?;
+    mods |= MOD_NOREPEAT;
+    Some((mods, vk))
+}
+
+fn register_keybinds(cfg: &config::Config) {
+    // clear old
+    let mut map = HOTKEY_ACTIONS.lock().unwrap();
+    // unregister previous ids
+    for id in map.keys().copied().collect::<Vec<_>>() {
+        unsafe { let _ = UnregisterHotKey(None, id); }
+    }
+    map.clear();
+    drop(map);
+
+    let mut next_id = 1;
+    for kb in &cfg.keybinds {
+        if let Some((mods, vk)) = parse_hotkey(&kb.keys) {
+            let id = next_id; next_id += 1;
+            unsafe {
+                match RegisterHotKey(None, id, mods, vk) {
+                    Ok(_) => {
+                        println!("[hotkey] {} -> '{}' id={}", kb.keys, kb.action, id);
+                        HOTKEY_ACTIONS.lock().unwrap().insert(id, kb.action.clone());
+                    }
+                    Err(e) => eprintln!("[hotkey] failed {} -> '{}': {:?}", kb.keys, kb.action, e),
+                }
+            }
+        } else {
+            eprintln!("[hotkey] skip invalid '{}'", kb.keys);
+        }
+    }
+    if HOTKEY_ACTIONS.lock().unwrap().is_empty() {
+        eprintln!("[hotkey] no keybinds registered! check config.toml");
+    }
+}
+
+fn unregister_all_hotkeys() {
+    let map = HOTKEY_ACTIONS.lock().unwrap();
+    for id in map.keys().copied().collect::<Vec<_>>() {
+        unsafe { let _ = UnregisterHotKey(None, id); }
+    }
+}
+
+// Hotkey IDs (legacy fallback, now dynamic)
 const HK_RETILE: i32 = 1;
 const HK_TOGGLE: i32 = 2;
 const HK_QUIT: i32 = 3;
@@ -176,7 +278,8 @@ fn print_banner() {
 | |_| || | | | |) | | | | |  AltDWM 0.2.0 - Experimental Windows Shell
  \___/ |_|_| |___/|_|_|_|_|  Rust + Win32 + DWM (declarative panels + Rhai)
 "#);
-    println!("  Hotkeys (Win+Shift+): R=retile T=toggle Q=quit G=grid M=monocle F=float S=master C=reload");
+    // defaults are Alt+Shift to avoid Win+Shift system collisions (Win+Shift+S = Snipping Tool)
+    println!("  Hotkeys (Alt+Shift+): R=retile T=toggle Q=quit G=grid M=monocle F=float S=master C=reload  (configurable in config.toml)");
     println!("  ---");
 }
 
@@ -309,21 +412,8 @@ fn main() {
         }
     } else { taskbar_hwnd };
 
-    // hotkeys — register built-ins + config keybinds (for now static set, future parse cfg.keybinds)
-    unsafe {
-        let mods = MOD_WIN | MOD_SHIFT | MOD_NOREPEAT;
-        let ok = |id, vk| RegisterHotKey(None, id, mods, vk as u32);
-        let _ = ok(HK_RETILE, 0x52);
-        let _ = ok(HK_TOGGLE, 0x54);
-        let _ = ok(HK_QUIT, 0x51);
-        let _ = ok(HK_GRID, 0x47);
-        let _ = ok(HK_MONOCLE, 0x4D);
-        let _ = ok(HK_FLOAT, 0x46);
-        let _ = ok(HK_MASTERSTACK, 0x53);
-        let _ = ok(HK_RELOAD, 0x43); // C
-        println!("[hotkey] Win+Shift+R/T/Q/G/M/F/S/C (reload)");
-        // TODO: register cfg.keybinds dynamically via ParseKeys
-    }
+    // hotkeys — dynamic from config.toml [[keybinds]]
+    register_keybinds(&cfg);
 
     let mut hooks: Vec<HWINEVENTHOOK> = Vec::new();
     unsafe {
@@ -359,8 +449,29 @@ fn main() {
             if ret.0 == -1 { eprintln!("[main] GetMessageW {:?}", windows::Win32::Foundation::GetLastError()); break; }
             if msg.message == WM_HOTKEY {
                 let id = msg.wParam.0 as i32;
-                match id {
-                    HK_RETILE => {
+                let action = { HOTKEY_ACTIONS.lock().unwrap().get(&id).cloned() };
+                if let Some(act) = action {
+                    println!("[hotkey] id={} -> '{}'", id, act);
+                    if act == "quit" {
+                        break;
+                    } else if act == "reload_config" {
+                        println!("[hotkey] reload config");
+                        let explicit = CONFIG_PATH.lock().unwrap().clone();
+                        let (new_cfg, new_path) = config::load_or_default(explicit.as_deref());
+                        for w in new_cfg.validate() { eprintln!("[config] warn: {}", w); }
+                        *CURRENT_GAP.lock().unwrap() = new_cfg.general.gap;
+                        *CURRENT_LAYOUT.lock().unwrap() = new_cfg.layout_enum();
+                        *CURRENT_CONFIG.lock().unwrap() = new_cfg.clone();
+                        *CONFIG_PATH.lock().unwrap() = new_path;
+                        // re-register hotkeys (config may have changed keybinds)
+                        register_keybinds(&new_cfg);
+                        panel::destroy_panels();
+                        if !new_cfg.panels.is_empty() {
+                            if let Ok(hs)=panel::create_panels(&new_cfg){ panel_handles=hs; }
+                        }
+                        // if panels cleared, recreate legacy taskbar if needed — for MVP just retile
+                        request_retile();
+                    } else if act == "retile" {
                         let l=*CURRENT_LAYOUT.lock().unwrap(); let g=*CURRENT_GAP.lock().unwrap(); let cfg=CURRENT_CONFIG.lock().unwrap().clone();
                         let (top,bottom)= if !cfg.panels.is_empty(){
                             let t: i32 = cfg.panels.iter().filter(|p| p.position=="top").map(|p| p.height).sum();
@@ -368,38 +479,19 @@ fn main() {
                             (t,b)
                         } else if TASKBAR_ENABLED.load(Ordering::SeqCst){ (0, taskbar::TASKBAR_HEIGHT)} else { (0,0)};
                         manager::tile_windows_reserved(taskbar_hwnd, top, bottom, l, g);
+                    } else {
+                        // delegate to scripting engine (handles toggle_tiling, set_layout, launch, rhai: ...)
+                        scripting::dispatch_action(&act);
                     }
-                    HK_TOGGLE => toggle_tiling(),
-                    HK_QUIT => break,
-                    HK_GRID => set_layout_by_name("Grid"),
-                    HK_MONOCLE => set_layout_by_name("Monocle"),
-                    HK_FLOAT => set_layout_by_name("Floating"),
-                    HK_MASTERSTACK => set_layout_by_name("MasterStack"),
-                    HK_RELOAD => {
-                        println!("[hotkey] reload config");
-                        let explicit = CONFIG_PATH.lock().unwrap().clone();
-                        let (new_cfg, new_path) = config::load_or_default(explicit.as_deref());
-                        for w in new_cfg.validate() { eprintln!("[config] warn: {}", w); }
-                        let gap = new_cfg.general.gap;
-                        *CURRENT_GAP.lock().unwrap() = gap;
-                        *CURRENT_LAYOUT.lock().unwrap() = new_cfg.layout_enum();
-                        *CURRENT_CONFIG.lock().unwrap() = new_cfg.clone();
-                        *CONFIG_PATH.lock().unwrap() = new_path;
-                        // recreate panels if they changed
-                        panel::destroy_panels();
-                        if !new_cfg.panels.is_empty() {
-                            if let Ok(hs)=panel::create_panels(&new_cfg){ panel_handles=hs; }
-                        }
-                        request_retile();
-                    }
-                    _ => {}
+                } else {
+                    eprintln!("[hotkey] unknown id {}", id);
                 }
                 continue;
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        for id in [HK_RETILE,HK_TOGGLE,HK_QUIT,HK_GRID,HK_MONOCLE,HK_FLOAT,HK_MASTERSTACK,HK_RELOAD] { let _=UnregisterHotKey(None,id); }
+        unregister_all_hotkeys();
         for h in hooks { let _=UnhookWinEvent(h); }
         panel::destroy_panels();
         let _=host_hwnd; let _=panel_handles;

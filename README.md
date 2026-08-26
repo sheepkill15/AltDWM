@@ -17,8 +17,8 @@ Tested on Windows 11, 2 monitors, Rust 1.98 + `windows` 0.61.
 - **Widgets** (`src/widgets.rs:14` trait): `clock` (strftime `%H:%M:%S`), `workspaces`, `window_title` (foreground), `tray` (stub `Shell_NotifyIcon` sink), `spacer` (flex), `launcher`, `custom` (Rhai script returns text). `create_widget` factory + `extra` flattened map for forward-compat.
 - **Panels** (`src/panel.rs:47`): Each `[[panels]]` is a `WS_POPUP|WS_EX_TOPMOST` window (`AltDWM_Panel` class), flex layout for widgets, 1s + 250ms timers, click → `scripting::dispatch_action`.
 - **Scripting** (`src/scripting.rs:8`): Embedded `rhai` 1.26 engine. Exposes `launch(cmd)`, `log(msg)`, `get_cpu_usage()`, `focused_title()`, `retile()`, `set_layout(name)`. Any `action = "rhai: ..."` or `script = "scripts/cpu.rhai"` evaluated sandboxed.
-- **Config** (`src/config.rs:109`): Search `exe_dir/config.toml` → `%APPDATA%/AltDWM/config.toml` → `./config.toml`. `general`+`ignore` + `panels/widgets/rules/keybinds/layouts` with `flatten` extras for easy extend. `--config`, `--generate-config`, `--check-config`, `Win+Shift+C` hot-reload. `validate()` warns on bad panels.
-- **Hotkeys** (`src/main.rs:273`): Thread `RegisterHotKey` (`Win+Shift+`): `R` retile, `T` toggle, `Q` quit, `G` grid, `M` monocle, `F` floating, `S` masterStack, `C` reload config.
+- **Config** (`src/config.rs:109`): Search `exe_dir/config.toml` → `%APPDATA%/AltDWM/config.toml` → `./config.toml`. `general`+`ignore` + `panels/widgets/rules/keybinds/layouts` with `flatten` extras for easy extend. `--config`, `--generate-config`, `--check-config`, `Alt+Shift+C` hot-reload (configurable, `Win+Shift` collides with system e.g. `Win+Shift+S` = Snipping Tool). `validate()` warns on bad panels.
+- **Hotkeys** (`src/main.rs:273`): Dynamic `RegisterHotKey` from `[[keybinds]]` (default `Alt+Shift+` `R` retile, `T` toggle, `Q` quit, `G` grid, `M` monocle, `F` floating, `S` masterStack, `C` reload, all dispatch via `scripting::dispatch_action`).
 
 ## Quick start
 
@@ -31,7 +31,7 @@ cargo run -- --config ./examples/config.example.toml  # panels DSL demo
 cargo run -- --generate-config   # writes %APPDATA%/AltDWM/config.toml
 cargo run -- --check-config      # validate
 
-# hotkeys: Win+Shift+R/T/Q/G/M/F/S/C (reload)
+# hotkeys: Alt+Shift+R/T/Q/G/M/F/S/C (reload) — change in config.toml [[keybinds]]
 ```
 
 ## Verify shell-replacement capability (no registry touched automatically)
@@ -79,7 +79,7 @@ match_class = "Spotify"
 floating = true
 
 [[keybinds]]
-keys = "Win+Return"
+keys = "Alt+Shift+Return"
 action = "launch('wt.exe')"
 ```
 
