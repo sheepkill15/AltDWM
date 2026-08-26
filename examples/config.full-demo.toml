@@ -1,0 +1,184 @@
+# RustRover full-demo configuration. This exercises the complete panel/widget,
+# scripting, layout, rule, hotkey, multi-monitor, and virtual-desktop paths.
+[general]
+gap = 10
+outer_gap = 6
+layout = "spiral"
+taskbar = true
+taskbar_height = 40
+auto_tile = true
+filter_virtual_desktop = true
+
+[ignore]
+classes = [
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "AltDWM_Taskbar",
+    "AltDWM_Host",
+    "AltDWM_Panel",
+]
+titles = []
+processes = ["rustrover64.exe", "idea64.exe"]
+
+[theme]
+panel_bg = "#17191f"
+panel_bg_top = "#20242d"
+text = "#f4f6fb"
+text_dim = "#9aa4b5"
+accent = "#8b5cf6"
+accent_active = "#a78bfa"
+border = "#4c3f73"
+tray_bg = "#272b35"
+font_name = "Segoe UI"
+font_size = 13
+rounding = 8
+gap = 10
+
+# One bottom panel per display demonstrates multi-monitor panel placement.
+[[panels]]
+name = "bottom"
+position = "bottom"
+height = 42
+monitor = "all"
+margin = [0, 6, 6, 6]
+widgets = [
+    "workspaces",
+    "window_list",
+    "spacer",
+    "window_title",
+    "tray",
+    "clock",
+]
+
+# The primary top panel exercises launcher and custom Rhai widgets.
+[[panels]]
+name = "top"
+position = "top"
+height = 32
+monitor = "primary"
+margin = [6, 6, 0, 6]
+widgets = ["launcher", "spacer", "cpu"]
+
+[[widgets]]
+type = "workspaces"
+name = "workspaces"
+width = 150
+
+[[widgets]]
+type = "window_list"
+name = "window_list"
+width = 360
+
+[[widgets]]
+type = "window_title"
+name = "window_title"
+width = 320
+
+[[widgets]]
+type = "tray"
+name = "tray"
+width = 180
+
+[[widgets]]
+type = "clock"
+name = "clock"
+format = "%H:%M:%S"
+interval = 500
+action = 'rhai: launch("explorer.exe")'
+width = 150
+
+[[widgets]]
+type = "spacer"
+name = "spacer"
+
+[[widgets]]
+type = "launcher"
+name = "launcher"
+action = "launch('wt.exe')"
+label = "Terminal"
+width = 96
+
+[[widgets]]
+type = "custom"
+name = "cpu"
+interval = 1000
+script = "scripts/cpu.rhai"
+width = 230
+
+# Demonstrates class matching, floating rules, opacity, and on-create Rhai.
+[[rules]]
+match_class_regex = "(?i)spotify"
+floating = true
+opacity = 0.94
+on_create = 'rhai: log("Spotify matched the full-demo rule")'
+
+[[keybinds]]
+keys = "Alt+Shift+R"
+action = "retile"
+description = "Retile windows"
+
+[[keybinds]]
+keys = "Alt+Shift+T"
+action = "toggle_tiling"
+description = "Toggle tiling"
+
+[[keybinds]]
+keys = "Alt+Shift+Q"
+action = "quit"
+description = "Quit AltDWM"
+
+[[keybinds]]
+keys = "Alt+Shift+G"
+action = 'set_layout("Grid")'
+description = "Grid layout"
+
+[[keybinds]]
+keys = "Alt+Shift+M"
+action = 'set_layout("Monocle")'
+description = "Monocle layout"
+
+[[keybinds]]
+keys = "Alt+Shift+F"
+action = 'set_layout("Floating")'
+description = "Floating layout"
+
+[[keybinds]]
+keys = "Alt+Shift+S"
+action = 'set_layout("spiral")'
+description = "Rhai custom layout"
+
+[[keybinds]]
+keys = "Alt+Shift+C"
+action = "reload_config"
+description = "Hot-reload this config"
+
+[[keybinds]]
+keys = "Alt+Shift+J"
+action = "focus_next()"
+description = "Focus next window"
+
+[[keybinds]]
+keys = "Alt+Shift+K"
+action = "focus_prev()"
+description = "Focus previous window"
+
+[[keybinds]]
+keys = "Alt+Shift+Y"
+action = "toggle_floating()"
+description = "Toggle focused window floating"
+
+[[keybinds]]
+keys = "Alt+Shift+N"
+action = "move_to_next_monitor()"
+description = "Move focused window to next monitor"
+
+[[keybinds]]
+keys = "Alt+Shift+P"
+action = "move_to_prev_monitor()"
+description = "Move focused window to previous monitor"
+
+[layouts.spiral]
+script = "scripts/spiral.rhai"
+gap = 10
