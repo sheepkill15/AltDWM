@@ -60,7 +60,7 @@ unsafe extern "system" fn taskbar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
         }
         WM_DESTROY => {
             let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 1);
-            PostQuitMessage(0);
+            // don't PostQuitMessage — only host posts quit (taskbar is not main)
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
