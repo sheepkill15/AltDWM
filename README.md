@@ -36,6 +36,8 @@ cargo run -- --check-config      # validate
 
 ## Verify shell-replacement capability (no registry touched automatically)
 
+See `docs/INSTALL.md` for `install.ps1` / `uninstall.ps1` (per-user or per-machine, `uiAccess`, DPI).
+
 ```powershell
 cargo build --release  # -> target\release\alt-dwm.exe
 .\target\release\alt-dwm.exe --replace-shell  # prints reg commands only
@@ -44,9 +46,10 @@ cargo build --release  # -> target\release\alt-dwm.exe
 taskkill /f /im explorer.exe
 # AltDWM keeps tiling (dwm.exe alive) -> explorer.exe to restore
 
-# real (requires admin, logoff):
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d "C:\AltDWM\alt-dwm.exe" /f
-reg add "HKLM\..." /v Shell /d "explorer.exe" /f   # restore
+# install as shell (admin):
+.\install.ps1                 # HKLM, copies to C:\Program Files\AltDWM
+.\install.ps1 -PerUser        # HKCU, no admin
+.\uninstall.ps1; .\uninstall.ps1 -PerUser  # restore explorer.exe
 ```
 
 ## Extensibility DSL
