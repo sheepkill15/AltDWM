@@ -85,6 +85,22 @@ fn hmonitor_for_target(target: &str) -> Option<HMONITOR> {
     None
 }
 
+fn apply_window_chrome(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE};
+    const DWMWCP_ROUND: u32 = 2;
+    const DWMWCP_DONOTROUND: u32 = 1;
+    unsafe {
+        // rounded corners for tiled windows (Win11)
+        let corner = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, std::mem::size_of_val(&corner) as u32);
+        // subtle border using theme accent if available
+        if let Ok(cfg) = crate::CURRENT_CONFIG.try_lock() {
+            let border = cfg.theme.border_color();
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border.0 as *const _ as _, std::mem::size_of_val(&border) as u32);
+        }
+    }
+}
+
 fn get_work_area_for_hmonitor(hmon: HMONITOR, top_reserve: i32, bottom_reserve: i32, taskbar_hwnd: Option<HWND>) -> RECT {
     unsafe {
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -301,6 +317,7 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
             if w <= 0 || h <= 0 {
                 continue;
             }
+            apply_window_chrome(*hwnd);
             println!("[manager] -> {:?} => {}x{} @ {},{}", hwnd.0, w, h, r.left, r.top);
             unsafe {
                 match DeferWindowPos(

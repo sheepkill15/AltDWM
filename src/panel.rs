@@ -15,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{PanelConfig, Config};
+use crate::theme;
 use crate::widgets::{self, Widget, PanelCtx};
 
 static mut PANELS: Option<Arc<Mutex<Vec<Panel>>>> = None;
@@ -27,13 +28,31 @@ pub struct Panel {
 }
 
 fn parse_color(s: &str) -> COLORREF {
-    let s = s.trim().trim_start_matches('#');
-    if let Ok(v) = u32::from_str_radix(s, 16) {
-        // TOML "#RRGGBB" -> COLORREF 0x00BBGGRR ? GDI uses 0x00BBGGRR, but we store as 0x00RRGGBB for CreateSolidBrush which expects RGB
-        // CreateSolidBrush expects 0x00BBGGRR? Actually RGB macro = (r | g<<8 | b<<16). "#202020" -> 0x202020 is fineEither way.
-        COLORREF(v)
-    } else {
-        COLORREF(0x00202020)
+    // fallback simple parser (theme::parse_hex handles #AARRGGBB correctly)
+    crate::theme::Theme::default().color(s)
+}
+
+fn apply_panel_chrome(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE};
+    // DWMWA constants that may not be in windows 0.61 as typed enums — use raw values
+    const DWMWA_WINDOW_CORNER_PREFERENCE_RAW: u32 = 33;
+    const DWMWA_SYSTEMBACKDROP_TYPE_RAW: u32 = 38;
+    const DWMWCP_ROUND: u32 = 2;
+    const DWMSBT_MAINWINDOW: u32 = 2; // Mica
+    unsafe {
+        // rounded corners
+        let corner: u32 = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_WINDOW_CORNER_PREFERENCE_RAW as i32), &corner as *const _ as _, std::mem::size_of_val(&corner) as u32);
+        // Mica backdrop (Win11 22621+)
+        let backdrop: u32 = DWMSBT_MAINWINDOW;
+        let _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_SYSTEMBACKDROP_TYPE_RAW as i32), &backdrop as *const _ as _, std::mem::size_of_val(&backdrop) as u32);
+        // subtle border color from theme if available
+        if let Ok(cfg) = crate::CURRENT_CONFIG.try_lock() {
+            let border = cfg.theme.border_color();
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border.0 as *const _ as _, std::mem::size_of_val(&border) as u32);
+            let caption = cfg.theme.panel_bg("bottom");
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption.0 as *const _ as _, std::mem::size_of_val(&caption) as u32);
+        }
     }
 }
 
@@ -202,7 +221,8 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
             _ => (0, screen_h - pc.height, screen_w, pc.height),
         };
 
-        let bg = pc.background.as_deref().map(parse_color).unwrap_or(COLORREF(0x00202020));
+        let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
+        let bg = pc.background.as_deref().map(|s| theme.color(s)).unwrap_or_else(|| theme.panel_bg(&pc.position));
         let hwnd = unsafe {
             let hinstance = HINSTANCE(std::ptr::null_mut());
             CreateWindowExW(
@@ -220,6 +240,7 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
         unsafe {
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
             let _ = ShowWindow(hwnd, SW_SHOW);
+            apply_panel_chrome(hwnd);
         }
         println!("[panel] '{}' @ {},{} {}x{} monitor={} widgets={}", pc.name, x, y, w, h, pc.monitor, pc.widgets.join(","));
 

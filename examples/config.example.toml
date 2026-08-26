@@ -18,6 +18,20 @@ classes = [
 titles = []
 processes = []
 
+[theme]
+panel_bg = "#1e1e1e"
+panel_bg_top = "#252526"
+text = "#ffffff"
+text_dim = "#aaaaaa"
+accent = "#3a6ea5"
+accent_active = "#007acc"
+border = "#404040"
+tray_bg = "#2d2d30"
+font_name = "Segoe UI"
+font_size = 13
+rounding = 6
+gap = 8
+
 [[panels]]
 name = "bottom"
 position = "bottom"

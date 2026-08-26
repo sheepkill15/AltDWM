@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::layout::Layout;
+use crate::theme::Theme;
 
 // ------------------------------------------------------------------
 // Top-level Config — DSL root (see docs/EXTENSIBILITY.md)
@@ -14,6 +15,8 @@ pub struct Config {
     pub general: General,
     #[serde(default)]
     pub ignore: Ignore,
+    #[serde(default)]
+    pub theme: Theme,
 
     // v0.2 DSL — all optional, ignored if empty (backward compat with [general] only)
     #[serde(default)]
@@ -243,6 +246,7 @@ impl Default for Config {
                 KeybindConfig { keys: "Alt+Shift+L".into(), action: "focus_next()".into(), description: Some("Focus next (right)".into()) },
             ],
             layouts: HashMap::new(),
+            theme: Theme::default(),
         }
     }
 }

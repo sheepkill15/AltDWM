@@ -38,19 +38,24 @@ unsafe extern "system" fn taskbar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
             let hdc = BeginPaint(hwnd, &mut ps);
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
-            let brush = CreateSolidBrush(COLORREF(0x00202020));
+            let theme = crate::CURRENT_CONFIG.lock().unwrap().theme.clone();
+            let bg = theme.panel_bg("bottom");
+            let brush = CreateSolidBrush(bg);
             FillRect(hdc, &rect, brush);
             let _ = DeleteObject(brush.into());
-
+            let font = crate::theme::create_font(&theme);
+            let old_font = windows::Win32::Graphics::Gdi::SelectObject(hdc, font.into());
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(0x00FFFFFF));
+            SetTextColor(hdc, theme.text_color());
             let st: SYSTEMTIME = GetLocalTime();
             let time_str = format!(
-                "AltDWM | {:02}:{:02}:{:02} | Win+Shift+R: retile | T:toggle Q:quit G:grid M:monocle F:float S:master",
+                "AltDWM | {:02}:{:02}:{:02} | Alt+Shift+R: retile | T:toggle Q:quit G:grid M:monocle F:float S:master J/K:focus",
                 st.wHour, st.wMinute, st.wSecond
             );
             let wide: Vec<u16> = time_str.encode_utf16().collect();
             TextOutW(hdc, 10, 12, &wide);
+            let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_font);
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }

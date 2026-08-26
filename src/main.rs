@@ -6,6 +6,7 @@ mod panel;
 mod rules;
 mod scripting;
 mod taskbar;
+mod theme;
 mod util;
 mod virtual_desktop;
 mod watcher;
