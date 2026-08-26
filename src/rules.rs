@@ -114,6 +114,29 @@ pub fn rule_monitor(_hwnd: HWND) -> Option<String> {
     None
 }
 
+/// Get opacity from rule, if any (0.0-1.0)
+pub fn rule_opacity(hwnd: HWND) -> Option<f32> {
+    let cfg = crate::CURRENT_CONFIG.lock().unwrap();
+    for rule in &cfg.rules {
+        if rule_matches(hwnd, rule) {
+            if let Some(o) = rule.opacity { return Some(o.clamp(0.0, 1.0)); }
+        }
+    }
+    None
+}
+
+pub fn apply_opacity(hwnd: HWND, opacity: f32) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, SetLayeredWindowAttributes, GWL_EXSTYLE, WS_EX_LAYERED, LWA_ALPHA};
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if (ex & WS_EX_LAYERED.0) == 0 {
+            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex | WS_EX_LAYERED.0) as isize);
+        }
+        let alpha = (opacity.clamp(0.0, 1.0) * 255.0) as u8;
+        let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), alpha, LWA_ALPHA);
+    }
+}
+
 /// Execute on_create action if rule matches (rhai)
 pub fn maybe_run_on_create(hwnd: HWND) {
     let actions: Vec<String> = {

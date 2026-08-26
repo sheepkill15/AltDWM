@@ -198,7 +198,22 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
     }
     if windows.is_empty() {
         println!("[manager] no tilable windows (all floating)");
+        // still apply opacity to floating windows
+        for hwnd in &floating {
+            if let Some(op) = crate::rules::rule_opacity(*hwnd) {
+                println!("[manager] opacity {} for {:?}", op, hwnd.0);
+                crate::rules::apply_opacity(*hwnd, op);
+            }
+        }
         return;
+    }
+
+    // apply opacity per rules (both tilable and floating)
+    for hwnd in windows.iter().chain(floating.iter()) {
+        if let Some(op) = crate::rules::rule_opacity(*hwnd) {
+            println!("[manager] opacity {} for {:?}", op, hwnd.0);
+            crate::rules::apply_opacity(*hwnd, op);
+        }
     }
 
     let layout_name = crate::CURRENT_CONFIG.lock().unwrap().general.layout.clone();
