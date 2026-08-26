@@ -24,7 +24,7 @@ explorer.exe   # restore
 ```powershell
 # per-machine (requires admin, logoff):
 .\install.ps1
-# per-user (no admin):
+# per-user (no admin; defaults to %LOCALAPPDATA%\Programs\AltDWM):
 .\install.ps1 -PerUser
 # custom dir / skip build:
 .\install.ps1 -InstallDir C:\AltDWM -NoBuild
@@ -40,11 +40,11 @@ explorer.exe   # restore
 ### What install.ps1 does
 
 1. `cargo build --release` → `target\release\alt-dwm.exe`
-2. Copies `alt-dwm.exe` + `scripts/` + `config.example.toml` → `C:\Program Files\AltDWM\`
+2. Copies `alt-dwm.exe` + `scripts/` + `config.example.toml` to `C:\Program Files\AltDWM\` (machine) or `%LOCALAPPDATA%\Programs\AltDWM\` (per-user)
 3. Generates `%APPDATA%\AltDWM\config.toml` (or `$InstallDir\config.toml` if per-machine) via `--generate-config` if missing
-4. Sets `HKLM` or `HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell = "C:\Program Files\AltDWM\alt-dwm.exe"`
+4. Saves the existing shell value under `HKLM/HKCU\SOFTWARE\AltDWM`, then sets the corresponding Winlogon `Shell` value to AltDWM
 
-Restore:
+`uninstall.ps1` restores the exact saved value and only changes the registry when the current shell exactly matches its AltDWM installation path. Manual Explorer fallback:
 
 ```powershell
 Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name Shell -Value "explorer.exe"

@@ -6,18 +6,24 @@ use std::sync::{Arc, Mutex};
 
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, HBRUSH, BeginPaint, EndPaint, PAINTSTRUCT, GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, HBRUSH,
+    HMONITOR, MONITORINFO, MONITORINFOEXW, PAINTSTRUCT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, RegisterClassExW, ShowWindow,
-    WNDCLASSEXW, CS_HREDRAW, CS_VREDRAW, HMENU, SW_SHOW, WM_CREATE, WM_DESTROY, WM_PAINT, WM_TIMER, WM_LBUTTONDOWN,
-    WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, HWND_TOPMOST,
+    CreateWindowExW, DefWindowProcW, GetClientRect, RegisterClassExW, SetWindowPos, ShowWindow,
+    CS_HREDRAW, CS_VREDRAW, HMENU, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE,
+    WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE,
 };
 
-use crate::config::{PanelConfig, Config};
-use crate::widgets::{self, Widget, PanelCtx};
+use crate::config::{Config, PanelConfig};
+use crate::widgets::{self, PanelCtx, Widget};
 
-static PANELS: std::sync::LazyLock<Mutex<Option<Arc<Mutex<Vec<Panel>>>>>> = std::sync::LazyLock::new(|| Mutex::new(None));
+type PanelCollection = Arc<Mutex<Vec<Panel>>>;
+
+static PANELS: std::sync::LazyLock<Mutex<Option<PanelCollection>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 pub struct Panel {
     pub cfg: PanelConfig,
@@ -29,7 +35,9 @@ unsafe impl Send for Panel {}
 unsafe impl Sync for Panel {}
 
 fn apply_panel_chrome(hwnd: HWND) {
-    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR};
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
+    };
     // DWMWA constants that may not be in windows 0.61 as typed enums — use raw values
     const DWMWA_WINDOW_CORNER_PREFERENCE_RAW: u32 = 33;
     const DWMWA_SYSTEMBACKDROP_TYPE_RAW: u32 = 38;
@@ -38,21 +46,48 @@ fn apply_panel_chrome(hwnd: HWND) {
     unsafe {
         // rounded corners
         let corner: u32 = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_WINDOW_CORNER_PREFERENCE_RAW as i32), &corner as *const _ as _, std::mem::size_of_val(&corner) as u32);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(
+                DWMWA_WINDOW_CORNER_PREFERENCE_RAW as i32,
+            ),
+            &corner as *const _ as _,
+            std::mem::size_of_val(&corner) as u32,
+        );
         // Mica backdrop (Win11 22621+)
         let backdrop: u32 = DWMSBT_MAINWINDOW;
-        let _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_SYSTEMBACKDROP_TYPE_RAW as i32), &backdrop as *const _ as _, std::mem::size_of_val(&backdrop) as u32);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_SYSTEMBACKDROP_TYPE_RAW as i32),
+            &backdrop as *const _ as _,
+            std::mem::size_of_val(&backdrop) as u32,
+        );
         // subtle border color from theme if available
         if let Ok(cfg) = crate::CURRENT_CONFIG.try_lock() {
             let border = cfg.theme.border_color();
-            let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border.0 as *const _ as _, std::mem::size_of_val(&border) as u32);
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &border.0 as *const _ as _,
+                std::mem::size_of_val(&border) as u32,
+            );
             let caption = cfg.theme.panel_bg("bottom");
-            let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption.0 as *const _ as _, std::mem::size_of_val(&caption) as u32);
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_COLOR,
+                &caption.0 as *const _ as _,
+                std::mem::size_of_val(&caption) as u32,
+            );
         }
     }
 }
 
-unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn panel_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_CREATE => {
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 1000, None);
@@ -72,39 +107,67 @@ unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             if let Some(panel_arc) = panel_arc {
                 let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
-                let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                let mut rect = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rect);
-                let brush = CreateSolidBrush(p.background);
-                FillRect(hdc, &rect, brush);
-                let _ = DeleteObject(brush.into());
+                    let mut ps = PAINTSTRUCT::default();
+                    let hdc = BeginPaint(hwnd, &mut ps);
+                    let mut rect = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rect);
+                    let brush = CreateSolidBrush(p.background);
+                    FillRect(hdc, &rect, brush);
+                    let _ = DeleteObject(brush.into());
 
-                // Layout along the panel's long axis: horizontal bars and vertical docks.
-                let vertical = matches!(p.cfg.position.as_str(), "left" | "right");
-                let total_w = if vertical { rect.bottom - rect.top } else { rect.right - rect.left };
-                let mut fixed: i32 = 0;
-                let mut flex_count = 0;
-                let mut widths: Vec<i32> = Vec::new();
-                let ctx = PanelCtx { panel_name: p.cfg.name.clone(), monitor: p.cfg.monitor.clone(), width: total_w, height: p.cfg.height, hwnd };
-                for w in &p.widgets {
-                    let wd = w.width(&ctx);
-                    widths.push(wd);
-                    if wd == 0 { flex_count += 1; } else { fixed += wd; }
-                }
-                let flex_w = if flex_count > 0 { (total_w - fixed).max(0) / flex_count } else { 0 };
-                let mut x = if vertical { rect.top } else { rect.left };
-                for (i, w) in p.widgets.iter().enumerate() {
-                    let wd = if widths[i]==0 { flex_w } else { widths[i] };
-                    let r = if vertical {
-                        RECT { left: rect.left, top: x, right: rect.right, bottom: x + wd }
+                    // Layout along the panel's long axis: horizontal bars and vertical docks.
+                    let vertical = matches!(p.cfg.position.as_str(), "left" | "right");
+                    let total_w = if vertical {
+                        rect.bottom - rect.top
                     } else {
-                        RECT { left: x, top: rect.top, right: x + wd, bottom: rect.bottom }
+                        rect.right - rect.left
                     };
-                    w.draw(hdc, r, &ctx);
-                    x += wd;
-                }
-                let _ = EndPaint(hwnd, &ps);
+                    let mut fixed: i32 = 0;
+                    let mut flex_count = 0;
+                    let mut widths: Vec<i32> = Vec::new();
+                    let ctx = PanelCtx {
+                        panel_name: p.cfg.name.clone(),
+                        monitor: p.cfg.monitor.clone(),
+                        width: total_w,
+                        height: p.cfg.height,
+                        hwnd,
+                    };
+                    for w in &p.widgets {
+                        let wd = w.width(&ctx);
+                        widths.push(wd);
+                        if wd == 0 {
+                            flex_count += 1;
+                        } else {
+                            fixed += wd;
+                        }
+                    }
+                    let flex_w = if flex_count > 0 {
+                        (total_w - fixed).max(0) / flex_count
+                    } else {
+                        0
+                    };
+                    let mut x = if vertical { rect.top } else { rect.left };
+                    for (i, w) in p.widgets.iter().enumerate() {
+                        let wd = if widths[i] == 0 { flex_w } else { widths[i] };
+                        let r = if vertical {
+                            RECT {
+                                left: rect.left,
+                                top: x,
+                                right: rect.right,
+                                bottom: x + wd,
+                            }
+                        } else {
+                            RECT {
+                                left: x,
+                                top: rect.top,
+                                right: x + wd,
+                                bottom: rect.bottom,
+                            }
+                        };
+                        w.draw(hdc, r, &ctx);
+                        x += wd;
+                    }
+                    let _ = EndPaint(hwnd, &ps);
                     return LRESULT(0);
                 }
             }
@@ -123,29 +186,58 @@ unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             if let Some(panel_arc) = panel_arc {
                 let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
-                let mut rect = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rect);
-                let vertical = matches!(p.cfg.position.as_str(), "left" | "right");
-                let total_w = if vertical { rect.bottom - rect.top } else { rect.right - rect.left };
-                let ctx = PanelCtx { panel_name: p.cfg.name.clone(), monitor: p.cfg.monitor.clone(), width: total_w, height: p.cfg.height, hwnd };
-                let mut fixed: i32 = 0;
-                let mut flex_count = 0;
-                let mut widths: Vec<i32> = Vec::new();
-                for w in &p.widgets { let wd=w.width(&ctx); widths.push(wd); if wd==0{flex_count+=1;} else{fixed+=wd;} }
-                let flex_w = if flex_count>0 { (total_w-fixed).max(0)/flex_count } else {0};
-                let mut cur=0;
-                let click_main = if vertical { y } else { x };
-                for (i,w) in p.widgets.iter().enumerate(){
-                    let wd = if widths[i]==0{flex_w}else{widths[i]};
-                    if click_main >= cur && click_main < cur+wd {
-                        if let Some(action) = w.on_click(click_main-cur, if vertical { x } else { y }, &ctx) {
-                            println!("[panel {}] widget '{}' click -> {}", p.cfg.name, w.name(), action);
-                            crate::scripting::dispatch_action(&action);
+                    let mut rect = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rect);
+                    let vertical = matches!(p.cfg.position.as_str(), "left" | "right");
+                    let total_w = if vertical {
+                        rect.bottom - rect.top
+                    } else {
+                        rect.right - rect.left
+                    };
+                    let ctx = PanelCtx {
+                        panel_name: p.cfg.name.clone(),
+                        monitor: p.cfg.monitor.clone(),
+                        width: total_w,
+                        height: p.cfg.height,
+                        hwnd,
+                    };
+                    let mut fixed: i32 = 0;
+                    let mut flex_count = 0;
+                    let mut widths: Vec<i32> = Vec::new();
+                    for w in &p.widgets {
+                        let wd = w.width(&ctx);
+                        widths.push(wd);
+                        if wd == 0 {
+                            flex_count += 1;
+                        } else {
+                            fixed += wd;
                         }
-                        break;
                     }
-                    cur+=wd;
-                }
+                    let flex_w = if flex_count > 0 {
+                        (total_w - fixed).max(0) / flex_count
+                    } else {
+                        0
+                    };
+                    let mut cur = 0;
+                    let click_main = if vertical { y } else { x };
+                    for (i, w) in p.widgets.iter().enumerate() {
+                        let wd = if widths[i] == 0 { flex_w } else { widths[i] };
+                        if click_main >= cur && click_main < cur + wd {
+                            if let Some(action) =
+                                w.on_click(click_main - cur, if vertical { x } else { y }, &ctx)
+                            {
+                                println!(
+                                    "[panel {}] widget '{}' click -> {}",
+                                    p.cfg.name,
+                                    w.name(),
+                                    action
+                                );
+                                crate::scripting::dispatch_action(&action);
+                            }
+                            break;
+                        }
+                        cur += wd;
+                    }
                 }
             }
             LRESULT(0)
@@ -170,9 +262,13 @@ fn ensure_class() -> Result<(), String> {
             lpfnWndProc: Some(panel_wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
-            hInstance: hinstance.into(),
+            hInstance: hinstance,
             hIcon: Default::default(),
-            hCursor: windows::Win32::UI::WindowsAndMessaging::LoadCursorW(Some(hinstance), windows::Win32::UI::WindowsAndMessaging::IDC_ARROW).unwrap_or_default(),
+            hCursor: windows::Win32::UI::WindowsAndMessaging::LoadCursorW(
+                Some(hinstance),
+                windows::Win32::UI::WindowsAndMessaging::IDC_ARROW,
+            )
+            .unwrap_or_default(),
             hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszMenuName: windows::core::PCWSTR::null(),
             lpszClassName: class_name,
@@ -181,7 +277,9 @@ fn ensure_class() -> Result<(), String> {
         let atom = RegisterClassExW(&wc);
         if atom == 0 {
             let err = windows::Win32::Foundation::GetLastError();
-            if err.0 != 1410 { return Err(format!("Panel RegisterClassExW: {:?}", err)); }
+            if err.0 != 1410 {
+                return Err(format!("Panel RegisterClassExW: {:?}", err));
+            }
         }
         Ok(())
     }
@@ -197,7 +295,10 @@ fn resolve_panel_monitors(target: &str) -> Vec<(HMONITOR, RECT)> {
         let mut out = Vec::new();
         for &h in &mons {
             unsafe {
-                let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
                 if GetMonitorInfoW(h, &mut mi as *mut _ as *mut _).as_bool() {
                     out.push((h, mi.rcMonitor));
                 }
@@ -210,24 +311,45 @@ fn resolve_panel_monitors(target: &str) -> Vec<(HMONITOR, RECT)> {
         let mut prim = None;
         for &h in &mons {
             unsafe {
-                let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-                if GetMonitorInfoW(h, &mut mi as *mut _ as *mut _).as_bool() && (mi.dwFlags & 1) != 0 {
-                    prim = Some(h); break;
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetMonitorInfoW(h, &mut mi as *mut _ as *mut _).as_bool()
+                    && (mi.dwFlags & 1) != 0
+                {
+                    prim = Some(h);
+                    break;
                 }
             }
         }
         prim.or(Some(mons[0]))
     } else if let Ok(idx) = lower.parse::<usize>() {
-        if idx >= 1 && idx <= mons.len() { Some(mons[idx-1]) } else { None }
+        if idx >= 1 && idx <= mons.len() {
+            Some(mons[idx - 1])
+        } else {
+            None
+        }
     } else {
         // device name substring
         let mut found = None;
         for &h in &mons {
             unsafe {
-                let mut ex = MONITORINFOEXW { monitorInfo: MONITORINFO { cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32, ..Default::default() }, szDevice: [0; 32] };
+                let mut ex = MONITORINFOEXW {
+                    monitorInfo: MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                        ..Default::default()
+                    },
+                    szDevice: [0; 32],
+                };
                 if GetMonitorInfoW(h, &mut ex as *mut _ as *mut _ as *mut MONITORINFO).as_bool() {
-                    let dev = String::from_utf16_lossy(&ex.szDevice).trim_matches(char::from(0)).to_string();
-                    if dev.to_lowercase().contains(&lower) { found = Some(h); break; }
+                    let dev = String::from_utf16_lossy(&ex.szDevice)
+                        .trim_matches(char::from(0))
+                        .to_string();
+                    if dev.to_lowercase().contains(&lower) {
+                        found = Some(h);
+                        break;
+                    }
                 }
             }
         }
@@ -235,7 +357,10 @@ fn resolve_panel_monitors(target: &str) -> Vec<(HMONITOR, RECT)> {
     };
     if let Some(h) = single {
         unsafe {
-            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
             if GetMonitorInfoW(h, &mut mi as *mut _ as *mut _).as_bool() {
                 return vec![(h, mi.rcMonitor)];
             }
@@ -243,7 +368,10 @@ fn resolve_panel_monitors(target: &str) -> Vec<(HMONITOR, RECT)> {
     }
     // fallback: primary
     unsafe {
-        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
         if GetMonitorInfoW(mons[0], &mut mi as *mut _ as *mut _).as_bool() {
             return vec![(mons[0], mi.rcMonitor)];
         }
@@ -251,36 +379,101 @@ fn resolve_panel_monitors(target: &str) -> Vec<(HMONITOR, RECT)> {
     Vec::new()
 }
 
+fn panel_rect(config: &PanelConfig, monitor: RECT, edge_offset: i32) -> RECT {
+    let [margin_top, margin_right, margin_bottom, margin_left] = config.margins();
+    let monitor_width = monitor.right - monitor.left;
+    let monitor_height = monitor.bottom - monitor.top;
+    match config.position.as_str() {
+        "top" => RECT {
+            left: monitor.left + margin_left,
+            top: monitor.top + edge_offset + margin_top,
+            right: monitor.right - margin_right,
+            bottom: monitor.top + edge_offset + margin_top + config.height,
+        },
+        "bottom" => RECT {
+            left: monitor.left + margin_left,
+            top: monitor.bottom - edge_offset - margin_bottom - config.height,
+            right: monitor.right - margin_right,
+            bottom: monitor.bottom - edge_offset - margin_bottom,
+        },
+        "left" => RECT {
+            left: monitor.left + edge_offset + margin_left,
+            top: monitor.top + margin_top,
+            right: monitor.left + edge_offset + margin_left + config.height,
+            bottom: monitor.bottom - margin_bottom,
+        },
+        "right" => RECT {
+            left: monitor.right - edge_offset - margin_right - config.height,
+            top: monitor.top + margin_top,
+            right: monitor.right - edge_offset - margin_right,
+            bottom: monitor.bottom - margin_bottom,
+        },
+        _ => RECT {
+            left: monitor.left,
+            top: monitor.top,
+            right: monitor.left + monitor_width.max(1),
+            bottom: monitor.top + monitor_height.max(1),
+        },
+    }
+}
+
 pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
-    if cfg.panels.is_empty() { return Ok(vec![]); }
+    if cfg.panels.is_empty() {
+        return Ok(vec![]);
+    }
 
     ensure_class()?;
     let mut handles = Vec::new();
 
     // Map widget names to configs for lookup
-    let widget_map: HashMap<String, crate::config::WidgetConfig> = cfg.widgets.iter().map(|w| (w.name.clone(), w.clone())).collect();
+    let widget_map: HashMap<String, crate::config::WidgetConfig> = cfg
+        .widgets
+        .iter()
+        .map(|w| (w.name.clone(), w.clone()))
+        .collect();
 
     let panels_arc = Arc::new(Mutex::new(Vec::<Panel>::new()));
     *PANELS.lock().unwrap_or_else(|e| e.into_inner()) = Some(panels_arc.clone());
+    let mut edge_offsets: HashMap<(isize, String), i32> = HashMap::new();
 
     for pc in &cfg.panels {
         // position — per-monitor aware (fixes SM_CXSCREEN single-monitor bug)
         let targets = resolve_panel_monitors(&pc.monitor);
         if targets.is_empty() {
-            eprintln!("[panel] no monitor resolved for '{}' monitor='{}' — skipped", pc.name, pc.monitor);
+            eprintln!(
+                "[panel] no monitor resolved for '{}' monitor='{}' — skipped",
+                pc.name, pc.monitor
+            );
             continue;
         }
-        let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
-        let bg = pc.background.as_deref().map(|s| theme.color(s)).unwrap_or_else(|| theme.panel_bg(&pc.position));
+        let theme = crate::CURRENT_CONFIG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .theme
+            .clone();
+        let bg = pc
+            .background
+            .as_deref()
+            .map(|s| theme.color(s))
+            .unwrap_or_else(|| theme.panel_bg(&pc.position));
 
-        for (mon_idx, (_, mon_rect)) in targets.iter().enumerate() {
-            let (x, y, w, h) = match pc.position.as_str() {
-                "top" => (mon_rect.left, mon_rect.top, mon_rect.right - mon_rect.left, pc.height),
-                "bottom" => (mon_rect.left, mon_rect.bottom - pc.height, mon_rect.right - mon_rect.left, pc.height),
-                "left" => (mon_rect.left, mon_rect.top, pc.height, mon_rect.bottom - mon_rect.top),
-                "right" => (mon_rect.right - pc.height, mon_rect.top, pc.height, mon_rect.bottom - mon_rect.top),
-                _ => (mon_rect.left, mon_rect.bottom - pc.height, mon_rect.right - mon_rect.left, pc.height),
-            };
+        for (mon_idx, (hmon, mon_rect)) in targets.iter().enumerate() {
+            let offset = edge_offsets
+                .entry((hmon.0 as isize, pc.position.clone()))
+                .or_default();
+            if !["top", "right", "bottom", "left"].contains(&pc.position.as_str()) {
+                eprintln!(
+                    "[panel] invalid position '{}' for '{}' — skipped",
+                    pc.position, pc.name
+                );
+                continue;
+            }
+            let rect = panel_rect(pc, *mon_rect, *offset);
+            let x = rect.left;
+            let y = rect.top;
+            let w = (rect.right - rect.left).max(1);
+            let h = (rect.bottom - rect.top).max(1);
+            *offset += pc.edge_consumption();
             let mut widgets_inst: Vec<Box<dyn Widget>> = Vec::new();
             for wname in &pc.widgets {
                 if let Some(wcfg) = widget_map.get(wname) {
@@ -288,47 +481,164 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
                 } else if let Some(wcfg) = crate::config::builtin_widget_config(wname) {
                     widgets_inst.push(widgets::create_widget(&wcfg));
                 } else {
-                    eprintln!("[panel] unknown widget '{}' for panel '{}' — custom fallback", wname, pc.name);
-                    let wcfg = crate::config::WidgetConfig { widget_type: "custom".into(), name: wname.clone(), format: None, interval: None, script: None, action: None, command: None, label: Some(wname.clone()), icon: None, width: Some(80), tooltip: None, extra: HashMap::new() };
+                    eprintln!(
+                        "[panel] unknown widget '{}' for panel '{}' — custom fallback",
+                        wname, pc.name
+                    );
+                    let wcfg = crate::config::WidgetConfig {
+                        widget_type: "custom".into(),
+                        name: wname.clone(),
+                        format: None,
+                        interval: None,
+                        script: None,
+                        action: None,
+                        command: None,
+                        label: Some(wname.clone()),
+                        icon: None,
+                        width: Some(80),
+                        extra: HashMap::new(),
+                    };
                     widgets_inst.push(widgets::create_widget(&wcfg));
                 }
             }
             let hwnd = unsafe {
                 let hinstance = HINSTANCE(std::ptr::null_mut());
                 CreateWindowExW(
-                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_APPWINDOW,
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                     w!("AltDWM_Panel"),
                     w!("AltDWM Panel"),
                     WS_POPUP | WS_VISIBLE,
-                    x, y, w, h,
+                    x,
+                    y,
+                    w,
+                    h,
                     None,
                     Some(HMENU(std::ptr::null_mut())),
                     Some(hinstance),
                     None,
-                ).map_err(|e| format!("Panel {} CreateWindowExW: {:?}", pc.name, e))?
+                )
+                .map_err(|e| format!("Panel {} CreateWindowExW: {:?}", pc.name, e))?
             };
             unsafe {
-                let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 apply_panel_chrome(hwnd);
                 // Keep sub-second widgets responsive without polling every panel at 250 ms.
-                if let Some(interval) = widgets_inst.iter().filter_map(|widget| widget.interval_ms()).min().filter(|interval| *interval < 1000) {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, interval, None);
+                if let Some(interval) = widgets_inst
+                    .iter()
+                    .filter_map(|widget| widget.interval_ms())
+                    .min()
+                    .filter(|interval| *interval < 1000)
+                {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                        Some(hwnd),
+                        2,
+                        interval,
+                        None,
+                    );
                 }
             }
-            println!("[panel] '{}' @ {},{} {}x{} monitor={} (target {}/{}) widgets={}", pc.name, x, y, w, h, pc.monitor, mon_idx+1, targets.len(), pc.widgets.join(","));
+            println!(
+                "[panel] '{}' @ {},{} {}x{} monitor={} (target {}/{}) widgets={}",
+                pc.name,
+                x,
+                y,
+                w,
+                h,
+                pc.monitor,
+                mon_idx + 1,
+                targets.len(),
+                pc.widgets.join(",")
+            );
             handles.push(hwnd);
-            panels_arc.lock().unwrap_or_else(|e| e.into_inner()).push(Panel { cfg: pc.clone(), hwnd, widgets: widgets_inst, background: bg });
+            panels_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Panel {
+                    cfg: pc.clone(),
+                    hwnd,
+                    widgets: widgets_inst,
+                    background: bg,
+                });
         }
     }
 
-    Ok(handles)
+    if handles.is_empty() {
+        *PANELS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Err("configuration did not produce any panel windows".to_string())
+    } else {
+        Ok(handles)
+    }
 }
 
 pub fn destroy_panels() {
     if let Some(arc) = PANELS.lock().unwrap_or_else(|e| e.into_inner()).take() {
         for p in arc.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            unsafe { let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(p.hwnd); }
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(p.hwnd);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panel_rect;
+    use crate::config::PanelConfig;
+    use windows::Win32::Foundation::RECT;
+
+    #[test]
+    fn same_edge_panels_stack_instead_of_overlap() {
+        let panel = PanelConfig {
+            position: "top".into(),
+            height: 30,
+            margin: Some([2, 4, 3, 5]),
+            ..PanelConfig::default()
+        };
+        let monitor = RECT {
+            left: 100,
+            top: 50,
+            right: 1100,
+            bottom: 850,
+        };
+        let first = panel_rect(&panel, monitor, 0);
+        let second = panel_rect(&panel, monitor, panel.edge_consumption());
+        assert_eq!(
+            (first.left, first.top, first.right, first.bottom),
+            (105, 52, 1096, 82)
+        );
+        assert_eq!(second.top, 87);
+    }
+
+    #[test]
+    fn vertical_panels_use_height_as_thickness() {
+        let panel = PanelConfig {
+            position: "left".into(),
+            height: 42,
+            margin: Some([3, 4, 5, 6]),
+            ..PanelConfig::default()
+        };
+        let rect = panel_rect(
+            &panel,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            0,
+        );
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (6, 3, 48, 1075)
+        );
     }
 }

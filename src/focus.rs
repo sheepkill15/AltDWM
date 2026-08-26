@@ -3,18 +3,27 @@
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SetWindowPos, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SetWindowPos, HWND_TOP,
+    SWP_NOSIZE, SWP_NOZORDER,
+};
 
 use crate::manager::collect_windows;
 use crate::taskbar;
 
-static RUNTIME_FLOATING: LazyLock<Mutex<HashSet<isize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static RUNTIME_FLOATING: LazyLock<Mutex<HashSet<isize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub fn is_runtime_floating(hwnd: HWND) -> bool {
-    RUNTIME_FLOATING.lock().unwrap_or_else(|e| e.into_inner()).contains(&(hwnd.0 as isize))
+    RUNTIME_FLOATING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&(hwnd.0 as isize))
 }
 
 fn prune_stale_floating() {
@@ -24,17 +33,25 @@ fn prune_stale_floating() {
         let set = RUNTIME_FLOATING.lock().unwrap_or_else(|e| e.into_inner());
         for k in set.iter() {
             let hwnd = HWND(*k as *mut std::ffi::c_void);
-            unsafe { if !windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)).as_bool() { to_remove.push(*k); } }
+            unsafe {
+                if !windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)).as_bool() {
+                    to_remove.push(*k);
+                }
+            }
         }
     }
     if !to_remove.is_empty() {
         let mut set = RUNTIME_FLOATING.lock().unwrap_or_else(|e| e.into_inner());
-        for k in to_remove { set.remove(&k); }
+        for k in to_remove {
+            set.remove(&k);
+        }
     }
 }
 pub fn toggle_floating_focused() {
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0.is_null() { return; }
+    if hwnd.0.is_null() {
+        return;
+    }
     let key = hwnd.0 as isize;
     let mut set = RUNTIME_FLOATING.lock().unwrap_or_else(|e| e.into_inner());
     if set.contains(&key) {
@@ -48,10 +65,14 @@ pub fn toggle_floating_focused() {
 }
 pub fn move_focused_to_monitor(dir: &str) {
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0.is_null() { return; }
+    if hwnd.0.is_null() {
+        return;
+    }
     // get all monitors
     let mons = crate::manager::get_all_monitors();
-    if mons.len() <= 1 { return; }
+    if mons.len() <= 1 {
+        return;
+    }
     let cur = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     let idx = mons.iter().position(|&h| h.0 == cur.0).unwrap_or(0);
     let target_idx = match dir.to_lowercase().as_str() {
@@ -62,7 +83,10 @@ pub fn move_focused_to_monitor(dir: &str) {
     let target = mons[target_idx];
     // center on target monitor work area
     unsafe {
-        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
         if GetMonitorInfoW(target, &mut mi as *mut _ as *mut _).as_bool() {
             let work = mi.rcWork;
             let mut rect = RECT::default();
@@ -75,7 +99,12 @@ pub fn move_focused_to_monitor(dir: &str) {
                 // also set foreground
                 set_foreground(hwnd);
                 crate::request_retile();
-                println!("[focus] move {:?} to monitor {} (0x{:x})", hwnd.0, target_idx+1, target.0 as usize);
+                println!(
+                    "[focus] move {:?} to monitor {} (0x{:x})",
+                    hwnd.0,
+                    target_idx + 1,
+                    target.0 as usize
+                );
             }
         }
     }
@@ -103,29 +132,43 @@ fn set_foreground(hwnd: HWND) {
         // try attach
         let attached = if fg_tid != cur_tid && fg_tid != 0 {
             AttachThreadInput(fg_tid, cur_thread, true).as_bool()
-        } else { false };
+        } else {
+            false
+        };
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(Some(hwnd));
         if attached {
             let _ = AttachThreadInput(fg_tid, cur_thread, false);
         }
-        println!("[focus] -> {:?} {}", hwnd.0, crate::util::get_window_title(hwnd));
+        println!(
+            "[focus] -> {:?} {}",
+            hwnd.0,
+            crate::util::get_window_title(hwnd)
+        );
     }
 }
 
 pub fn focus_next() {
     let wins = tilable_windows();
-    if wins.is_empty() { return; }
+    if wins.is_empty() {
+        return;
+    }
     let fg = unsafe { GetForegroundWindow() };
     // find current index
     let idx = wins.iter().position(|w| w.0 == fg.0).unwrap_or(usize::MAX);
-    let next = if idx == usize::MAX || idx + 1 >= wins.len() { 0 } else { idx + 1 };
+    let next = if idx == usize::MAX || idx + 1 >= wins.len() {
+        0
+    } else {
+        idx + 1
+    };
     set_foreground(wins[next]);
 }
 
 pub fn focus_prev() {
     let wins = tilable_windows();
-    if wins.is_empty() { return; }
+    if wins.is_empty() {
+        return;
+    }
     let fg = unsafe { GetForegroundWindow() };
     let idx = wins.iter().position(|w| w.0 == fg.0).unwrap_or(0);
     let prev = if idx == 0 { wins.len() - 1 } else { idx - 1 };

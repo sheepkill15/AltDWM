@@ -1,5 +1,6 @@
 [general]
 gap = 8
+outer_gap = 0
 layout = "MasterStack"
 taskbar = true
 taskbar_height = 40
@@ -38,6 +39,7 @@ position = "bottom"
 height = 40
 monitor = "all"
 background = "#202020"
+margin = [0, 0, 0, 0]
 widgets = [
     "workspaces",
     "window_list",
@@ -93,7 +95,6 @@ name = "launcher"
 action = "launch('explorer.exe')"
 label = "Menu"
 width = 40
-tooltip = "Launcher"
 
 [[widgets]]
 type = "custom"
@@ -165,3 +166,4 @@ description = "Focus next (right)"
 
 [layouts.spiral]
 script = "scripts/spiral.rhai"
+gap = 8

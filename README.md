@@ -16,7 +16,7 @@ Tested on Windows 11, 2 monitors, Rust 1.98 + `windows` 0.61.
 - **Declarative panels DSL** (`src/config.rs:16`, `docs/EXTENSIBILITY.md`): TOML `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`. Multiple bars: `position=top|bottom|left|right`, `monitor=all|primary`, `widgets=[...]`. Example `examples/config.example.toml` has `bottom` (40px, `workspaces/title/spacer/tray/clock`) + `top` (28px, `launcher/spacer/cpu`).
 - **Widgets** (`src/widgets.rs:14` trait): `clock`, live `workspaces` status, `window_list`, `window_title` (foreground), `tray` placeholder, `spacer` (flex), `launcher`, `custom` (Rhai script returns text). `create_widget` factory + `extra` flattened map for forward-compat.
 - **Panels** (`src/panel.rs:47`): Each `[[panels]]` is a `WS_POPUP|WS_EX_TOPMOST` window (`AltDWM_Panel` class), flex layout for widgets, 1s + 250ms timers, click → `scripting::dispatch_action`.
-- **Scripting** (`src/scripting.rs:8`): Embedded `rhai` 1.26 engine. Exposes `launch(cmd)`, `log(msg)`, live `get_cpu_usage()`/`get_mem_usage()`, `window_count()`, `focused_title()`, `retile()`, `set_layout(name)`, focus and monitor movement. Any `action = "rhai: ..."` or `script = "scripts/cpu.rhai"` is evaluated sandboxed.
+- **Scripting** (`src/scripting.rs:8`): Embedded, resource-limited `rhai` 1.26 engine. Exposes `launch(cmd)`, `log(msg)`, live `get_cpu_usage()`/`get_mem_usage()`, `window_count()`, `focused_title()`, `retile()`, `set_layout(name)`, focus and monitor movement. Scripts are trusted local configuration—not a security boundary—because command execution is intentionally exposed.
 - **Config** (`src/config.rs:109`): Search `exe_dir/config.toml` → `%APPDATA%/AltDWM/config.toml` → `./config.toml`. `general`+`ignore` + `panels/widgets/rules/keybinds/layouts` with `flatten` extras for easy extend. `--config`, `--generate-config`, `--check-config`, `Alt+Shift+C` hot-reload (configurable, `Win+Shift` collides with system e.g. `Win+Shift+S` = Snipping Tool). `validate()` warns on bad panels.
 - **Hotkeys** (`src/main.rs:170`): Dynamic `RegisterHotKey` from `[[keybinds]]` (default `Alt+Shift+` `R` retile, `T` toggle, `Q` quit, `G` grid, `M` monocle, `F` floating, `S` masterStack, `C` reload, `J/K` focus, `Y` toggle focused floating, `N/P` move monitor).
 
@@ -49,7 +49,7 @@ taskkill /f /im explorer.exe
 # install as shell (admin):
 .\install.ps1                 # HKLM, copies to C:\Program Files\AltDWM
 .\install.ps1 -PerUser        # HKCU, no admin
-.\uninstall.ps1; .\uninstall.ps1 -PerUser  # restore explorer.exe
+.\uninstall.ps1; .\uninstall.ps1 -PerUser  # restore the previously configured shell
 ```
 
 ## Extensibility DSL

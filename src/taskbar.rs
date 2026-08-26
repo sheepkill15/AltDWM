@@ -1,15 +1,16 @@
 use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM, RECT, SYSTEMTIME};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, SYSTEMTIME, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, SetBkMode, SetTextColor, TextOutW, HBRUSH,
-    PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, SetBkMode, SetTextColor,
+    TextOutW, HBRUSH, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetSystemMetrics, RegisterClassExW, ShowWindow,
-    CS_HREDRAW, CS_VREDRAW, HMENU, SW_SHOW, WM_CREATE, WM_DESTROY, WM_PAINT, WM_TIMER, WM_LBUTTONDOWN, WNDCLASSEXW,
-    WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE, SM_CXSCREEN, SM_CYSCREEN,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, HWND_TOPMOST,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetSystemMetrics, RegisterClassExW,
+    SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, HMENU, HWND_TOPMOST, SM_CXSCREEN,
+    SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN,
+    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE,
 };
 
 pub const TASKBAR_HEIGHT: i32 = 40;
@@ -18,10 +19,19 @@ static TASKBAR_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 
 pub fn get_taskbar_hwnd() -> Option<HWND> {
     let v = TASKBAR_HWND.load(std::sync::atomic::Ordering::SeqCst);
-    if v == 0 { None } else { Some(HWND(v as *mut std::ffi::c_void)) }
+    if v == 0 {
+        None
+    } else {
+        Some(HWND(v as *mut std::ffi::c_void))
+    }
 }
 
-unsafe extern "system" fn taskbar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn taskbar_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_CREATE => {
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 1000, None);
@@ -36,7 +46,11 @@ unsafe extern "system" fn taskbar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
             let hdc = BeginPaint(hwnd, &mut ps);
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
-            let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
+            let theme = crate::CURRENT_CONFIG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .theme
+                .clone();
             let bg = theme.panel_bg("bottom");
             let brush = CreateSolidBrush(bg);
             FillRect(hdc, &rect, brush);
@@ -82,9 +96,13 @@ pub fn create_taskbar() -> Result<HWND, String> {
             lpfnWndProc: Some(taskbar_wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
-            hInstance: hinstance.into(),
+            hInstance: hinstance,
             hIcon: Default::default(),
-            hCursor: windows::Win32::UI::WindowsAndMessaging::LoadCursorW(Some(hinstance), windows::Win32::UI::WindowsAndMessaging::IDC_ARROW).unwrap_or_default(),
+            hCursor: windows::Win32::UI::WindowsAndMessaging::LoadCursorW(
+                Some(hinstance),
+                windows::Win32::UI::WindowsAndMessaging::IDC_ARROW,
+            )
+            .unwrap_or_default(),
             hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszMenuName: windows::core::PCWSTR::null(),
             lpszClassName: class_name,
@@ -116,12 +134,24 @@ pub fn create_taskbar() -> Result<HWND, String> {
             Some(HMENU(std::ptr::null_mut())),
             Some(hinstance),
             None,
-        ).map_err(|e| format!("CreateWindowExW failed: {:?}", e))?;
+        )
+        .map_err(|e| format!("CreateWindowExW failed: {:?}", e))?;
 
-        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, y_final, screen_w, TASKBAR_HEIGHT, SWP_NOACTIVATE | SWP_NOZORDER);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            y_final,
+            screen_w,
+            TASKBAR_HEIGHT,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
         let _ = ShowWindow(hwnd, SW_SHOW);
         TASKBAR_HWND.store(hwnd.0 as usize, std::sync::atomic::Ordering::SeqCst);
-        println!("[taskbar] created hwnd={:?} {}x{} @ 0,{} (screen {}x{})", hwnd.0, screen_w, TASKBAR_HEIGHT, y_final, screen_w, screen_h);
+        println!(
+            "[taskbar] created hwnd={:?} {}x{} @ 0,{} (screen {}x{})",
+            hwnd.0, screen_w, TASKBAR_HEIGHT, y_final, screen_w, screen_h
+        );
         Ok(hwnd)
     }
 }

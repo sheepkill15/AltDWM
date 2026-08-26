@@ -1,10 +1,12 @@
 //! Virtual desktop awareness — filter tiling to current desktop only.
 //! Uses documented IVirtualDesktopManager (Win10+). Gracefully degrades if COM unavailable.
 //! Toggle via config.toml `general.filter_virtual_desktop = true`
-use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, COINIT_APARTMENTTHREADED, CLSCTX_ALL};
-use windows::Win32::UI::Shell::IVirtualDesktopManager;
 use windows::core::GUID;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+};
+use windows::Win32::UI::Shell::IVirtualDesktopManager;
 
 // CLSID_VirtualDesktopManager = {AA509086-5CA9-4C25-8F95-589D3C07B48A}
 const CLSID_VIRTUAL_DESKTOP_MANAGER: GUID = GUID::from_u128(0xaa509086_5ca9_4c25_8f95_589d3c07b48a);
@@ -19,7 +21,7 @@ pub fn init() {
 }
 
 thread_local! {
-    static VDM_CACHE: std::cell::RefCell<Option<Option<IVirtualDesktopManager>>> = std::cell::RefCell::new(None);
+    static VDM_CACHE: std::cell::RefCell<Option<Option<IVirtualDesktopManager>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn get_vdm() -> Option<IVirtualDesktopManager> {
@@ -51,7 +53,10 @@ fn get_vdm() -> Option<IVirtualDesktopManager> {
 /// Returns true if window is on current virtual desktop, or if COM unavailable / filter disabled.
 pub fn is_on_current_desktop(hwnd: HWND) -> bool {
     let filter = {
-        crate::CURRENT_CONFIG.lock().map(|c| c.general.filter_virtual_desktop).unwrap_or(false)
+        crate::CURRENT_CONFIG
+            .lock()
+            .map(|c| c.general.filter_virtual_desktop)
+            .unwrap_or(false)
     };
     if !filter {
         return true;
@@ -69,5 +74,7 @@ pub fn is_on_current_desktop(hwnd: HWND) -> bool {
 
 #[allow(dead_code)]
 pub fn move_to_desktop(_hwnd: HWND, _desktop_id: &str) {
-    println!("[vdesktop] move_to_desktop stub — needs IVirtualDesktopManagerInternal undocumented COM");
+    println!(
+        "[vdesktop] move_to_desktop stub — needs IVirtualDesktopManagerInternal undocumented COM"
+    );
 }

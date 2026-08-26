@@ -41,23 +41,42 @@ pub fn compute_layout(n: usize, area: RECT, gap: i32, layout: Layout) -> Vec<REC
     }
 }
 
-static LAYOUT_CACHE: LazyLock<Mutex<HashMap<String, (SystemTime, rhai::AST, PathBuf)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+type LayoutCacheEntry = (SystemTime, rhai::AST, PathBuf);
+type LayoutCache = HashMap<String, LayoutCacheEntry>;
+
+static LAYOUT_CACHE: LazyLock<Mutex<LayoutCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Try to compute via custom Rhai layout script if `general.layout` names a key in `layouts`
 /// Script must define `fn layout(n, left, top, right, bottom, gap)` returning array of maps with left/top/right/bottom
-pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::Config) -> Option<Vec<RECT>> {
+pub fn try_compute_custom(
+    n: usize,
+    area: RECT,
+    gap: i32,
+    cfg: &crate::config::Config,
+) -> Option<Vec<RECT>> {
     let name = cfg.general.layout.as_str();
     let lc = cfg.layouts.get(name).or_else(|| {
-        cfg.layouts.iter().find(|(layout_name, _)| layout_name.eq_ignore_ascii_case(name)).map(|(_, layout)| layout)
+        cfg.layouts
+            .iter()
+            .find(|(layout_name, _)| layout_name.eq_ignore_ascii_case(name))
+            .map(|(_, layout)| layout)
     })?;
     let script_path = lc.script.as_deref()?;
+    let layout_gap = lc.gap.unwrap_or(gap).max(0);
     // resolve script path: try as given, then relative to config dir, then exe dir, then cwd
     let candidate_paths = {
         let mut v = vec![PathBuf::from(script_path)];
-        if let Some(cfg_path) = crate::CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+        if let Some(cfg_path) = crate::CONFIG_PATH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
             v.push(cfg_path.join(script_path));
         }
-        if let Ok(exe) = std::env::current_exe().and_then(|p| Ok(p.parent().map(|p| p.to_path_buf()).unwrap_or_default())) {
+        if let Ok(exe) =
+            std::env::current_exe().map(|p| p.parent().map(|p| p.to_path_buf()).unwrap_or_default())
+        {
             v.push(exe.join(script_path));
         }
         v.push(PathBuf::from("scripts").join(script_path));
@@ -77,7 +96,10 @@ pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::C
         }
         // fallback to old find_map (for non-existent but readable)
         if found.is_none() {
-            if let Some(c) = candidate_paths.iter().find_map(|p| std::fs::read_to_string(p).ok()) {
+            if let Some(c) = candidate_paths
+                .iter()
+                .find_map(|p| std::fs::read_to_string(p).ok())
+            {
                 // use first candidate as path with dummy mtime
                 found = Some((candidate_paths[0].clone(), SystemTime::UNIX_EPOCH, c));
             }
@@ -85,7 +107,10 @@ pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::C
         match found {
             Some((p, t, c)) => (p, t, c),
             None => {
-                eprintln!("[layout] custom '{}' script not found: {} (tried {:?})", name, script_path, candidate_paths);
+                eprintln!(
+                    "[layout] custom '{}' script not found: {} (tried {:?})",
+                    name, script_path, candidate_paths
+                );
                 return None;
             }
         }
@@ -106,7 +131,10 @@ pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::C
                         return None;
                     }
                 };
-                cache.insert(name.to_string(), (code_mtime, new_ast.clone(), code_path.clone()));
+                cache.insert(
+                    name.to_string(),
+                    (code_mtime, new_ast.clone(), code_path.clone()),
+                );
                 new_ast
             }
         } else {
@@ -118,7 +146,10 @@ pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::C
                     return None;
                 }
             };
-            cache.insert(name.to_string(), (code_mtime, new_ast.clone(), code_path.clone()));
+            cache.insert(
+                name.to_string(),
+                (code_mtime, new_ast.clone(), code_path.clone()),
+            );
             new_ast
         }
     };
@@ -133,18 +164,42 @@ pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::C
         &mut scope,
         &ast,
         "layout",
-        (n as i64, area.left as i64, area.top as i64, area.right as i64, area.bottom as i64, gap as i64),
+        (
+            n as i64,
+            area.left as i64,
+            area.top as i64,
+            area.right as i64,
+            area.bottom as i64,
+            layout_gap as i64,
+        ),
     );
     match res {
         Ok(arr) => {
             let mut rects = Vec::with_capacity(arr.len());
             for v in arr {
                 if let Some(map) = v.clone().try_cast::<rhai::Map>() {
-                    let left = map.get("left").and_then(|d| d.as_int().ok()).unwrap_or(area.left as i64) as i32;
-                    let top = map.get("top").and_then(|d| d.as_int().ok()).unwrap_or(area.top as i64) as i32;
-                    let right = map.get("right").and_then(|d| d.as_int().ok()).unwrap_or(area.right as i64) as i32;
-                    let bottom = map.get("bottom").and_then(|d| d.as_int().ok()).unwrap_or(area.bottom as i64) as i32;
-                    rects.push(RECT { left, top, right, bottom });
+                    let left = map
+                        .get("left")
+                        .and_then(|d| d.as_int().ok())
+                        .unwrap_or(area.left as i64) as i32;
+                    let top = map
+                        .get("top")
+                        .and_then(|d| d.as_int().ok())
+                        .unwrap_or(area.top as i64) as i32;
+                    let right = map
+                        .get("right")
+                        .and_then(|d| d.as_int().ok())
+                        .unwrap_or(area.right as i64) as i32;
+                    let bottom = map
+                        .get("bottom")
+                        .and_then(|d| d.as_int().ok())
+                        .unwrap_or(area.bottom as i64) as i32;
+                    rects.push(RECT {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    });
                 } else if let Some(arr2) = v.try_cast::<rhai::Array>() {
                     // allow [left, top, right, bottom] array
                     if arr2.len() == 4 {
@@ -152,14 +207,26 @@ pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::C
                         let t = arr2[1].as_int().unwrap_or(area.top as i64) as i32;
                         let r = arr2[2].as_int().unwrap_or(area.right as i64) as i32;
                         let b = arr2[3].as_int().unwrap_or(area.bottom as i64) as i32;
-                        rects.push(RECT { left: l, top: t, right: r, bottom: b });
+                        rects.push(RECT {
+                            left: l,
+                            top: t,
+                            right: r,
+                            bottom: b,
+                        });
                     }
                 }
             }
             if rects.len() != n {
-                eprintln!("[layout] custom '{}' returned {} rects for {} windows, padding/truncating", name, rects.len(), n);
+                eprintln!(
+                    "[layout] custom '{}' returned {} rects for {} windows, padding/truncating",
+                    name,
+                    rects.len(),
+                    n
+                );
                 // pad or truncate to n
-                while rects.len() < n { rects.push(shrink_rect(area, gap)); }
+                while rects.len() < n {
+                    rects.push(shrink_rect(area, layout_gap));
+                }
                 rects.truncate(n);
             }
             Some(rects)
@@ -225,7 +292,7 @@ fn master_stack_layout(n: usize, area: RECT, gap: i32) -> Vec<RECT> {
 
 fn grid_layout(n: usize, area: RECT, gap: i32) -> Vec<RECT> {
     let cols = (n as f64).sqrt().ceil() as usize;
-    let rows = (n + cols - 1) / cols;
+    let rows = n.div_ceil(cols);
 
     let width = area.right - area.left;
     let height = area.bottom - area.top;
@@ -247,4 +314,24 @@ fn grid_layout(n: usize, area: RECT, gap: i32) -> Vec<RECT> {
         });
     }
     rects
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_layout, Layout};
+    use windows::Win32::Foundation::RECT;
+
+    #[test]
+    fn monocle_positions_every_window_in_the_same_area() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1200,
+            bottom: 800,
+        };
+        let rects = compute_layout(3, area, 10, Layout::Monocle);
+        assert_eq!(rects.len(), 3);
+        assert!(rects.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!((rects[0].left, rects[0].top), (10, 10));
+    }
 }

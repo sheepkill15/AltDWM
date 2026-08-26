@@ -44,7 +44,7 @@ pub struct General {
     pub taskbar_height: i32,
     #[serde(default = "default_true")]
     pub auto_tile: bool,
-    /// extra height for vertical panels (not used yet)
+    /// Additional inset applied to every edge of each monitor's work area.
     #[serde(default)]
     pub outer_gap: Option<i32>,
     /// filter tiling to current virtual desktop only (requires IVirtualDesktopManager)
@@ -78,7 +78,7 @@ pub struct PanelConfig {
     #[serde(default)]
     pub margin: Option<[i32; 4]>, // top,right,bottom,left
     #[serde(default)]
-    pub background: Option<String>, // hex "#202020" or "rhai: ..."
+    pub background: Option<String>, // hex "#202020"
     #[serde(default)]
     pub widgets: Vec<String>, // ordered widget names
     /// allow arbitrary future keys without parse error (extensibility)
@@ -114,13 +114,11 @@ pub struct WidgetConfig {
     /// fixed width (0 = flex)
     #[serde(default)]
     pub width: Option<i32>,
-    #[serde(default)]
-    pub tooltip: Option<String>,
     #[serde(default, flatten)]
     pub extra: HashMap<String, toml::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuleConfig {
     #[serde(default)]
     pub match_class: Option<String>,
@@ -178,15 +176,33 @@ pub struct LayoutConfig {
 // Defaults helpers
 // ------------------------------------------------------------------
 
-fn default_gap() -> i32 { 8 }
-fn default_taskbar() -> bool { true }
-fn default_taskbar_height() -> i32 { 40 }
-fn default_true() -> bool { true }
-fn default_filter_vd() -> bool { false }
-fn default_layout() -> String { "MasterStack".to_string() }
-fn default_panel_position() -> String { "bottom".to_string() }
-fn default_panel_height() -> i32 { 40 }
-fn default_monitor() -> String { "all".to_string() }
+fn default_gap() -> i32 {
+    8
+}
+fn default_taskbar() -> bool {
+    true
+}
+fn default_taskbar_height() -> i32 {
+    40
+}
+fn default_true() -> bool {
+    true
+}
+fn default_filter_vd() -> bool {
+    false
+}
+fn default_layout() -> String {
+    "MasterStack".to_string()
+}
+fn default_panel_position() -> String {
+    "bottom".to_string()
+}
+fn default_panel_height() -> i32 {
+    40
+}
+fn default_monitor() -> String {
+    "all".to_string()
+}
 
 impl Default for General {
     fn default() -> Self {
@@ -217,6 +233,20 @@ impl Default for PanelConfig {
     }
 }
 
+impl PanelConfig {
+    pub fn margins(&self) -> [i32; 4] {
+        self.margin.unwrap_or([0; 4]).map(|value| value.max(0))
+    }
+
+    pub fn edge_consumption(&self) -> i32 {
+        let [top, right, bottom, left] = self.margins();
+        match self.position.as_str() {
+            "left" | "right" => left + self.height + right,
+            _ => top + self.height + bottom,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -239,21 +269,81 @@ impl Default for Config {
             keybinds: vec![
                 // Alt+Shift chosen because Win+Shift collides with system (Win+Shift+S = Snipping Tool, etc.)
                 // Users can set keys = "Win+Shift+R" etc in config.toml if they prefer — parser supports Win/Ctrl/Alt/Shift combos
-                KeybindConfig { keys: "Alt+Shift+R".into(), action: "retile".into(), description: Some("Retile windows".into()) },
-                KeybindConfig { keys: "Alt+Shift+T".into(), action: "toggle_tiling".into(), description: Some("Toggle tiling".into()) },
-                KeybindConfig { keys: "Alt+Shift+Q".into(), action: "quit".into(), description: Some("Quit AltDWM".into()) },
-                KeybindConfig { keys: "Alt+Shift+G".into(), action: "set_layout(\"Grid\")".into(), description: Some("Grid layout".into()) },
-                KeybindConfig { keys: "Alt+Shift+M".into(), action: "set_layout(\"Monocle\")".into(), description: None },
-                KeybindConfig { keys: "Alt+Shift+F".into(), action: "set_layout(\"Floating\")".into(), description: None },
-                KeybindConfig { keys: "Alt+Shift+S".into(), action: "set_layout(\"MasterStack\")".into(), description: None },
-                KeybindConfig { keys: "Alt+Shift+C".into(), action: "reload_config".into(), description: Some("Hot-reload config".into()) },
-                KeybindConfig { keys: "Alt+Shift+J".into(), action: "focus_next()".into(), description: Some("Focus next window".into()) },
-                KeybindConfig { keys: "Alt+Shift+K".into(), action: "focus_prev()".into(), description: Some("Focus prev window".into()) },
-                KeybindConfig { keys: "Alt+Shift+H".into(), action: "focus_prev()".into(), description: Some("Focus prev (left)".into()) },
-                KeybindConfig { keys: "Alt+Shift+L".into(), action: "focus_next()".into(), description: Some("Focus next (right)".into()) },
-                KeybindConfig { keys: "Alt+Shift+Y".into(), action: "toggle_floating()".into(), description: Some("Toggle floating for focused".into()) },
-                KeybindConfig { keys: "Alt+Shift+N".into(), action: "move_to_next_monitor()".into(), description: Some("Move window to next monitor".into()) },
-                KeybindConfig { keys: "Alt+Shift+P".into(), action: "move_to_prev_monitor()".into(), description: Some("Move window to prev monitor".into()) },
+                KeybindConfig {
+                    keys: "Alt+Shift+R".into(),
+                    action: "retile".into(),
+                    description: Some("Retile windows".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+T".into(),
+                    action: "toggle_tiling".into(),
+                    description: Some("Toggle tiling".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+Q".into(),
+                    action: "quit".into(),
+                    description: Some("Quit AltDWM".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+G".into(),
+                    action: "set_layout(\"Grid\")".into(),
+                    description: Some("Grid layout".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+M".into(),
+                    action: "set_layout(\"Monocle\")".into(),
+                    description: None,
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+F".into(),
+                    action: "set_layout(\"Floating\")".into(),
+                    description: None,
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+S".into(),
+                    action: "set_layout(\"MasterStack\")".into(),
+                    description: None,
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+C".into(),
+                    action: "reload_config".into(),
+                    description: Some("Hot-reload config".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+J".into(),
+                    action: "focus_next()".into(),
+                    description: Some("Focus next window".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+K".into(),
+                    action: "focus_prev()".into(),
+                    description: Some("Focus prev window".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+H".into(),
+                    action: "focus_prev()".into(),
+                    description: Some("Focus prev (left)".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+L".into(),
+                    action: "focus_next()".into(),
+                    description: Some("Focus next (right)".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+Y".into(),
+                    action: "toggle_floating()".into(),
+                    description: Some("Toggle floating for focused".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+N".into(),
+                    action: "move_to_next_monitor()".into(),
+                    description: Some("Move window to next monitor".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+P".into(),
+                    action: "move_to_prev_monitor()".into(),
+                    description: Some("Move window to prev monitor".into()),
+                },
             ],
             layouts: HashMap::new(),
             theme: Theme::default(),
@@ -286,13 +376,22 @@ impl Config {
     pub fn normalize(&mut self) {
         self.general.gap = self.general.gap.max(0);
         self.general.taskbar_height = self.general.taskbar_height.max(1);
+        self.general.outer_gap = self.general.outer_gap.map(|gap| gap.max(0));
         for panel in &mut self.panels {
             panel.height = panel.height.max(1);
+            panel.position.make_ascii_lowercase();
+            panel.margin = panel.margin.map(|values| values.map(|value| value.max(0)));
+        }
+        for widget in &mut self.widgets {
+            widget.width = widget.width.map(|width| width.max(0));
+            widget.interval = widget.interval.map(|interval| interval.max(16));
         }
     }
 
     pub fn compile_regexes(&mut self) {
-        for r in &mut self.rules { r.compile_regexes(); }
+        for r in &mut self.rules {
+            r.compile_regexes();
+        }
     }
 
     pub fn layout_enum(&self) -> Layout {
@@ -302,10 +401,17 @@ impl Config {
             "floating" => Layout::Floating,
             "masterstack" | "master" | "bsp" | "tiling" => Layout::MasterStack,
             other => {
-                if self.layouts.keys().any(|name| name.eq_ignore_ascii_case(other)) {
+                if self
+                    .layouts
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(other))
+                {
                     // custom layout — handled by try_compute_custom, keep MasterStack as fallback enum
                 } else {
-                    eprintln!("[config] unknown layout '{}' -> MasterStack", self.general.layout);
+                    eprintln!(
+                        "[config] unknown layout '{}' -> MasterStack",
+                        self.general.layout
+                    );
                 }
                 Layout::MasterStack
             }
@@ -326,20 +432,77 @@ impl Config {
 
     pub fn validate(&self) -> Vec<String> {
         let mut warns = Vec::new();
+        let mut panel_names = std::collections::HashSet::new();
         for p in &self.panels {
-            if !["top","bottom","left","right"].contains(&p.position.as_str()) {
-                warns.push(format!("panel '{}' invalid position '{}'", p.name, p.position));
+            if p.name.trim().is_empty() {
+                warns.push("panel name cannot be empty".to_string());
+            } else if !panel_names.insert(&p.name) {
+                warns.push(format!("duplicate panel name '{}'", p.name));
+            }
+            if !["top", "bottom", "left", "right"].contains(&p.position.as_str()) {
+                warns.push(format!(
+                    "panel '{}' invalid position '{}'",
+                    p.name, p.position
+                ));
             }
             for w in &p.widgets {
                 if self.widget_by_name(w).is_none() && !is_builtin_widget(w) {
-                    warns.push(format!("panel '{}' references unknown widget '{}'", p.name, w));
+                    warns.push(format!(
+                        "panel '{}' references unknown widget '{}'",
+                        p.name, w
+                    ));
                 }
             }
         }
         let mut widget_names = std::collections::HashSet::new();
         for widget in &self.widgets {
+            if widget.name.trim().is_empty() {
+                warns.push("widget name cannot be empty".to_string());
+            }
             if !widget_names.insert(&widget.name) {
                 warns.push(format!("duplicate widget name '{}'", widget.name));
+            }
+            if widget.extra.contains_key("tooltip") {
+                warns.push(format!(
+                    "widget '{}' uses unsupported key 'tooltip'",
+                    widget.name
+                ));
+            }
+            if let Some(max_len) = widget
+                .extra
+                .get("max_len")
+                .and_then(toml::Value::as_integer)
+            {
+                if max_len < 0 {
+                    warns.push(format!("widget '{}' has a negative max_len", widget.name));
+                }
+            }
+        }
+        let mut keybinds = std::collections::HashSet::new();
+        for keybind in &self.keybinds {
+            let normalized = keybind.keys.to_ascii_lowercase();
+            if !keybinds.insert(normalized) {
+                warns.push(format!("duplicate keybind '{}'", keybind.keys));
+            }
+            if keybind.action.trim().is_empty() {
+                warns.push(format!("keybind '{}' has an empty action", keybind.keys));
+            }
+        }
+        for rule in &self.rules {
+            if let Some(pattern) = &rule.match_class_regex {
+                if let Err(error) = Regex::new(pattern) {
+                    warns.push(format!("invalid class regex '{}': {}", pattern, error));
+                }
+            }
+            if let Some(pattern) = &rule.match_title_regex {
+                if let Err(error) = Regex::new(pattern) {
+                    warns.push(format!("invalid title regex '{}': {}", pattern, error));
+                }
+            }
+        }
+        for (name, layout) in &self.layouts {
+            if layout.script.as_deref().is_none_or(str::is_empty) {
+                warns.push(format!("custom layout '{}' has no script", name));
             }
         }
         warns
@@ -348,7 +511,8 @@ impl Config {
 
 pub fn builtin_widget_config(name: &str) -> Option<WidgetConfig> {
     let widget_type = match name {
-        "spacer" | "workspaces" | "window_title" | "tray" | "clock" | "launcher" | "window_list" => name,
+        "spacer" | "workspaces" | "window_title" | "tray" | "clock" | "launcher"
+        | "window_list" => name,
         _ => return None,
     };
     Some(WidgetConfig {
@@ -362,7 +526,6 @@ pub fn builtin_widget_config(name: &str) -> Option<WidgetConfig> {
         label: None,
         icon: None,
         width: None,
-        tooltip: None,
         extra: HashMap::new(),
     })
 }
@@ -385,15 +548,21 @@ pub fn find_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("config.toml");
-            if p.exists() { return Some(p); }
+            if p.exists() {
+                return Some(p);
+            }
         }
     }
     if let Some(cfg_dir) = dirs::config_dir() {
         let p = cfg_dir.join("AltDWM").join("config.toml");
-        if p.exists() { return Some(p); }
+        if p.exists() {
+            return Some(p);
+        }
     }
     let cwd = PathBuf::from("config.toml");
-    if cwd.exists() { return Some(cwd); }
+    if cwd.exists() {
+        return Some(cwd);
+    }
     if let Some(cfg_dir) = dirs::config_dir() {
         return Some(cfg_dir.join("AltDWM").join("config.toml"));
     }
@@ -405,8 +574,10 @@ pub fn default_config_path() -> PathBuf {
 }
 
 pub fn load_from_path(path: &Path) -> Result<Config, String> {
-    let data = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let mut cfg = toml::from_str::<Config>(&data).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    let data =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let mut cfg =
+        toml::from_str::<Config>(&data).map_err(|e| format!("parse {}: {}", path.display(), e))?;
     cfg.normalize();
     cfg.compile_regexes();
     Ok(cfg)
@@ -419,10 +590,16 @@ pub fn load_or_default(explicit: Option<&Path>) -> (Config, Option<PathBuf>) {
             match load_from_path(p) {
                 Ok(cfg) => {
                     println!("[config] loaded {}", p.display());
-                    for w in cfg.validate() { eprintln!("[config] warn: {}", w); }
+                    for w in cfg.validate() {
+                        eprintln!("[config] warn: {}", w);
+                    }
                     return (cfg, Some(p.clone()));
                 }
-                Err(e) => eprintln!("[config] failed to load {}: {} -> using defaults", p.display(), e),
+                Err(e) => eprintln!(
+                    "[config] failed to load {}: {} -> using defaults",
+                    p.display(),
+                    e
+                ),
             }
         } else {
             println!("[config] no config at {} -> using defaults", p.display());
@@ -431,9 +608,21 @@ pub fn load_or_default(explicit: Option<&Path>) -> (Config, Option<PathBuf>) {
     (Config::default(), path)
 }
 
+/// Load an existing configuration without falling back. Runtime reloads and
+/// `--check-config` use this so a transient parse error cannot replace a
+/// working shell configuration with defaults.
+pub fn load_existing(explicit: Option<&Path>) -> Result<(Config, PathBuf), String> {
+    let path = find_config_path(explicit).ok_or_else(|| "no config path available".to_string())?;
+    if !path.exists() {
+        return Err(format!("config does not exist: {}", path.display()));
+    }
+    load_from_path(&path).map(|cfg| (cfg, path))
+}
+
 pub fn save_to_path(cfg: &Config, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
     let s = toml::to_string_pretty(cfg).map_err(|e| format!("serialize: {}", e))?;
     std::fs::write(path, s).map_err(|e| format!("write {}: {}", path.display(), e))?;
@@ -455,7 +644,13 @@ pub fn example_config_with_panels() -> Config {
             monitor: "all".into(),
             margin: None,
             background: Some("#202020".into()),
-            widgets: vec!["workspaces".into(), "window_list".into(), "spacer".into(), "tray".into(), "clock".into()],
+            widgets: vec![
+                "workspaces".into(),
+                "window_list".into(),
+                "spacer".into(),
+                "tray".into(),
+                "clock".into(),
+            ],
             extra: HashMap::new(),
         },
         PanelConfig {
@@ -470,19 +665,191 @@ pub fn example_config_with_panels() -> Config {
         },
     ];
     cfg.widgets = vec![
-        WidgetConfig { widget_type: "workspaces".into(), name: "workspaces".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
-        WidgetConfig { widget_type: "window_list".into(), name: "window_list".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
-        WidgetConfig { widget_type: "window_title".into(), name: "window_title".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
-        WidgetConfig { widget_type: "tray".into(), name: "tray".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: Some(220), tooltip: None, extra: HashMap::new() },
-        WidgetConfig { widget_type: "clock".into(), name: "clock".into(), format: Some("%H:%M:%S".into()), interval: Some(1000), script: None, action: Some("rhai: launch(\"explorer.exe\")".into()), command: None, label: None, icon: None, width: Some(160), tooltip: None, extra: HashMap::new() },
-        WidgetConfig { widget_type: "spacer".into(), name: "spacer".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
-        WidgetConfig { widget_type: "launcher".into(), name: "launcher".into(), format: None, interval: None, script: None, action: Some("launch('explorer.exe')".into()), command: None, label: Some("Menu".into()), icon: None, width: Some(40), tooltip: Some("Launcher".into()), extra: HashMap::new() },
-        WidgetConfig { widget_type: "custom".into(), name: "cpu".into(), format: None, interval: Some(2000), script: Some("scripts/cpu.rhai".into()), action: None, command: None, label: None, icon: None, width: Some(120), tooltip: None, extra: HashMap::new() },
+        WidgetConfig {
+            widget_type: "workspaces".into(),
+            name: "workspaces".into(),
+            format: None,
+            interval: None,
+            script: None,
+            action: None,
+            command: None,
+            label: None,
+            icon: None,
+            width: None,
+            extra: HashMap::new(),
+        },
+        WidgetConfig {
+            widget_type: "window_list".into(),
+            name: "window_list".into(),
+            format: None,
+            interval: None,
+            script: None,
+            action: None,
+            command: None,
+            label: None,
+            icon: None,
+            width: None,
+            extra: HashMap::new(),
+        },
+        WidgetConfig {
+            widget_type: "window_title".into(),
+            name: "window_title".into(),
+            format: None,
+            interval: None,
+            script: None,
+            action: None,
+            command: None,
+            label: None,
+            icon: None,
+            width: None,
+            extra: HashMap::new(),
+        },
+        WidgetConfig {
+            widget_type: "tray".into(),
+            name: "tray".into(),
+            format: None,
+            interval: None,
+            script: None,
+            action: None,
+            command: None,
+            label: None,
+            icon: None,
+            width: Some(220),
+            extra: HashMap::new(),
+        },
+        WidgetConfig {
+            widget_type: "clock".into(),
+            name: "clock".into(),
+            format: Some("%H:%M:%S".into()),
+            interval: Some(1000),
+            script: None,
+            action: Some("rhai: launch(\"explorer.exe\")".into()),
+            command: None,
+            label: None,
+            icon: None,
+            width: Some(160),
+            extra: HashMap::new(),
+        },
+        WidgetConfig {
+            widget_type: "spacer".into(),
+            name: "spacer".into(),
+            format: None,
+            interval: None,
+            script: None,
+            action: None,
+            command: None,
+            label: None,
+            icon: None,
+            width: None,
+            extra: HashMap::new(),
+        },
+        WidgetConfig {
+            widget_type: "launcher".into(),
+            name: "launcher".into(),
+            format: None,
+            interval: None,
+            script: None,
+            action: Some("launch('explorer.exe')".into()),
+            command: None,
+            label: Some("Menu".into()),
+            icon: None,
+            width: Some(40),
+            extra: HashMap::new(),
+        },
+        WidgetConfig {
+            widget_type: "custom".into(),
+            name: "cpu".into(),
+            format: None,
+            interval: Some(2000),
+            script: Some("scripts/cpu.rhai".into()),
+            action: None,
+            command: None,
+            label: None,
+            icon: None,
+            width: Some(120),
+            extra: HashMap::new(),
+        },
     ];
-    cfg.rules = vec![
-        RuleConfig { match_class: Some("Spotify".into()), match_title: None, match_process: None, match_class_regex: None, match_title_regex: None, compiled_class_regex: None, compiled_title_regex: None, monitor: None, floating: Some(true), opacity: None, layout: None, on_create: None, extra: HashMap::new() },
-    ];
-    cfg.layouts.insert("spiral".into(), LayoutConfig { script: Some("scripts/spiral.rhai".into()), gap: None, extra: HashMap::new() });
+    cfg.rules = vec![RuleConfig {
+        match_class: Some("Spotify".into()),
+        match_title: None,
+        match_process: None,
+        match_class_regex: None,
+        match_title_regex: None,
+        compiled_class_regex: None,
+        compiled_title_regex: None,
+        monitor: None,
+        floating: Some(true),
+        opacity: None,
+        layout: None,
+        on_create: None,
+        extra: HashMap::new(),
+    }];
+    cfg.layouts.insert(
+        "spiral".into(),
+        LayoutConfig {
+            script: Some("scripts/spiral.rhai".into()),
+            gap: None,
+            extra: HashMap::new(),
+        },
+    );
     // To use custom layout: set general.layout = "spiral"
     cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_existing, Config, KeybindConfig, PanelConfig};
+
+    #[test]
+    fn normalization_clamps_geometry_and_intervals() {
+        let mut config = Config::default();
+        config.general.gap = -4;
+        config.general.outer_gap = Some(-2);
+        config.panels.push(PanelConfig {
+            position: "RIGHT".into(),
+            height: -10,
+            margin: Some([-1, 2, -3, 4]),
+            ..PanelConfig::default()
+        });
+        config.normalize();
+        assert_eq!(config.general.gap, 0);
+        assert_eq!(config.general.outer_gap, Some(0));
+        assert_eq!(config.panels[0].position, "right");
+        assert_eq!(config.panels[0].height, 1);
+        assert_eq!(config.panels[0].margin, Some([0, 2, 0, 4]));
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_keybinds_and_bad_regex() {
+        let mut config = Config::default();
+        config.keybinds.push(KeybindConfig {
+            keys: "alt+shift+r".into(),
+            action: "retile".into(),
+            description: None,
+        });
+        config.rules.push(super::RuleConfig {
+            match_class_regex: Some("[".into()),
+            ..Default::default()
+        });
+        let warnings = config.validate().join("\n");
+        assert!(warnings.contains("duplicate keybind"));
+        assert!(warnings.contains("invalid class regex"));
+    }
+
+    #[test]
+    fn strict_load_rejects_invalid_toml() {
+        let path = std::env::temp_dir().join(format!(
+            "alt-dwm-invalid-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "[general\ngap = nope").expect("write fixture");
+        let result = load_existing(Some(&path));
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_err());
+    }
 }

@@ -1,8 +1,8 @@
 //! Rhai scripting for extensibility — actions, custom widgets, layouts.
 //! Sandboxed, sync engine. Exposed functions handle side effects.
-use rhai::{Engine, Scope, Dynamic};
-use std::sync::{OnceLock, Mutex};
+use rhai::{Dynamic, Engine, Scope};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
@@ -11,7 +11,8 @@ static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
 static PREV_IDLE: AtomicU64 = AtomicU64::new(0);
 static PREV_KERNEL: AtomicU64 = AtomicU64::new(0);
 static PREV_USER: AtomicU64 = AtomicU64::new(0);
-static PREV_TICK: std::sync::LazyLock<Mutex<Option<Instant>>> = std::sync::LazyLock::new(|| Mutex::new(None));
+static PREV_TICK: std::sync::LazyLock<Mutex<Option<Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 fn filetime_to_u64(ft: windows::Win32::Foundation::FILETIME) -> u64 {
     ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
@@ -45,7 +46,9 @@ fn get_cpu_usage_real() -> i64 {
         let kernel_delta = kernel_u.saturating_sub(prev_kernel);
         let user_delta = user_u.saturating_sub(prev_user);
         let total = kernel_delta + user_delta;
-        if total == 0 { return 0; }
+        if total == 0 {
+            return 0;
+        }
         let busy = total.saturating_sub(idle_delta);
         ((busy * 100) / total) as i64
     }
@@ -54,7 +57,10 @@ fn get_cpu_usage_real() -> i64 {
 fn get_mem_usage_real() -> i64 {
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     unsafe {
-        let mut stat = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        let mut stat = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
         if GlobalMemoryStatusEx(&mut stat).is_ok() {
             return stat.dwMemoryLoad as i64;
         }
@@ -65,9 +71,18 @@ fn get_mem_usage_real() -> i64 {
 fn build_engine() -> Engine {
     let mut eng = Engine::new();
     eng.set_max_expr_depths(256, 256);
+    // Scripts execute on the shell's UI thread. Bound both CPU work and
+    // allocations so a broken widget/layout cannot hang the replacement shell.
+    eng.set_max_operations(100_000);
+    eng.set_max_call_levels(32);
+    eng.set_max_string_size(64 * 1024);
+    eng.set_max_array_size(4_096);
+    eng.set_max_map_size(1_024);
     eng.register_fn("launch", |cmd: &str| {
         println!("[rhai] launch {}", cmd);
-        let _ = std::process::Command::new("cmd").args(["/C", "start", "", cmd]).spawn();
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", cmd])
+            .spawn();
     });
     eng.register_fn("log", |msg: &str| {
         println!("[rhai] {}", msg);
@@ -94,13 +109,27 @@ fn build_engine() -> Engine {
         println!("[rhai] set_layout {}", name);
         crate::set_layout_by_name(name);
     });
-    eng.register_fn("focus_next", || { crate::focus::focus_next(); });
-    eng.register_fn("focus_prev", || { crate::focus::focus_prev(); });
-    eng.register_fn("focus_direction", |dir: &str| { crate::focus::focus_direction(dir); });
-    eng.register_fn("focus_window", |substr: &str| { crate::focus::focus_window_by_title_substr(substr); });
-    eng.register_fn("toggle_floating", || { crate::focus::toggle_floating_focused(); });
-    eng.register_fn("move_to_next_monitor", || { crate::focus::move_focused_to_monitor("next"); });
-    eng.register_fn("move_to_prev_monitor", || { crate::focus::move_focused_to_monitor("prev"); });
+    eng.register_fn("focus_next", || {
+        crate::focus::focus_next();
+    });
+    eng.register_fn("focus_prev", || {
+        crate::focus::focus_prev();
+    });
+    eng.register_fn("focus_direction", |dir: &str| {
+        crate::focus::focus_direction(dir);
+    });
+    eng.register_fn("focus_window", |substr: &str| {
+        crate::focus::focus_window_by_title_substr(substr);
+    });
+    eng.register_fn("toggle_floating", || {
+        crate::focus::toggle_floating_focused();
+    });
+    eng.register_fn("move_to_next_monitor", || {
+        crate::focus::move_focused_to_monitor("next");
+    });
+    eng.register_fn("move_to_prev_monitor", || {
+        crate::focus::move_focused_to_monitor("prev");
+    });
     eng.register_fn("shell", |cmd: &str| {
         let _ = std::process::Command::new("cmd").args(["/C", cmd]).spawn();
     });
@@ -130,8 +159,11 @@ pub fn eval_text(code: &str) -> Result<String, String> {
     let res: Result<Dynamic, _> = eng.eval_with_scope(&mut scope.clone(), code);
     match res {
         Ok(v) => {
-            if let Some(s) = v.clone().into_string().ok() { Ok(s) }
-            else { Ok(v.to_string()) }
+            if let Ok(s) = v.clone().into_string() {
+                Ok(s)
+            } else {
+                Ok(v.to_string())
+            }
         }
         Err(e) => Err(format!("{}", e)),
     }
@@ -141,7 +173,8 @@ pub fn eval_text(code: &str) -> Result<String, String> {
 pub fn eval_action(code: &str) -> Result<(), String> {
     let eng = engine().lock().map_err(|e| format!("engine lock: {}", e))?;
     let mut scope = Scope::new();
-    eng.run_with_scope(&mut scope, code).map_err(|e| format!("{}", e))
+    eng.run_with_scope(&mut scope, code)
+        .map_err(|e| format!("{}", e))
 }
 
 /// Dispatch string action: "retile" | "quit" | "reload_config" | "launch('...')" | "rhai: ..."
@@ -154,9 +187,16 @@ pub fn dispatch_action(action: &str) {
         }
         return;
     }
-    if act.contains("launch(") || act.contains("log(") || act.contains("set_layout") || act.contains("focus_") || act.contains("toggle_floating") || act.contains("move_to_") || act.contains("retile") {
-        if eval_action(act).is_ok() { return; }
-        // fall through to direct handling on error
+    if (act.contains("launch(")
+        || act.contains("log(")
+        || act.contains("set_layout")
+        || act.contains("focus_")
+        || act.contains("toggle_floating")
+        || act.contains("move_to_")
+        || act.contains("retile"))
+        && eval_action(act).is_ok()
+    {
+        return;
     }
     match act {
         "retile" => crate::request_retile(),
@@ -165,15 +205,15 @@ pub fn dispatch_action(action: &str) {
         "reload_config" => {
             println!("[scripting] reload_config");
             crate::reload_config_async();
-        },
+        }
         "toggle_floating" => crate::focus::toggle_floating_focused(),
         "move_to_next_monitor" => crate::focus::move_focused_to_monitor("next"),
         "move_to_prev_monitor" => crate::focus::move_focused_to_monitor("prev"),
         _ if act.starts_with("set_layout") => {
             if let Some(start) = act.find('"').or(act.find('\'')) {
-                let end = act.rfind('"').or(act.rfind('\'')).unwrap_or(act.len()-1);
+                let end = act.rfind('"').or(act.rfind('\'')).unwrap_or(act.len() - 1);
                 if end > start {
-                    let name = &act[start+1..end];
+                    let name = &act[start + 1..end];
                     crate::set_layout_by_name(name);
                 }
             }
@@ -182,16 +222,37 @@ pub fn dispatch_action(action: &str) {
             if let Some(p1) = act.find('\'').or(act.find('"')) {
                 let p2 = act.rfind('\'').or(act.rfind('"')).unwrap_or(act.len());
                 if p2 > p1 {
-                    let cmd = &act[p1+1..p2];
-                    let _ = std::process::Command::new("cmd").args(["/C","start","",cmd]).spawn();
+                    let cmd = &act[p1 + 1..p2];
+                    let _ = std::process::Command::new("cmd")
+                        .args(["/C", "start", "", cmd])
+                        .spawn();
                 }
             } else {
-                let _ = std::process::Command::new("cmd").args(["/C","start","",act]).spawn();
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", "start", "", act])
+                    .spawn();
             }
-        },
+        }
         other => {
             println!("[scripting] unknown action '{}' -> launch attempt", other);
-            let _ = std::process::Command::new("cmd").args(["/C","start","",other]).spawn();
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "", other])
+                .spawn();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::engine;
+
+    #[test]
+    fn scripts_have_finite_resource_limits() {
+        let engine = engine().lock().expect("engine lock");
+        assert_eq!(engine.max_operations(), 100_000);
+        assert_eq!(engine.max_call_levels(), 32);
+        assert_eq!(engine.max_string_size(), 64 * 1024);
+        assert_eq!(engine.max_array_size(), 4_096);
+        assert_eq!(engine.max_map_size(), 1_024);
     }
 }

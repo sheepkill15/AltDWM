@@ -1,9 +1,8 @@
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, IsIconic,
-    GetWindowLongPtrW, GetWindow, GetAncestor, GWL_EXSTYLE, GA_ROOT, GW_OWNER,
-    WS_EX_TOOLWINDOW, WS_EX_APPWINDOW,
+    GetAncestor, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
+    IsIconic, IsWindowVisible, GA_ROOT, GWL_EXSTYLE, GW_OWNER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 const DWMWA_CLOAKED_U32: u32 = 14;
@@ -118,11 +117,30 @@ pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
         if !title.is_empty() && crate::is_ignored_title(&title) {
             return false;
         }
+        let process = crate::rules::get_process_name(hwnd);
+        let ignored_process = {
+            let cfg = crate::CURRENT_CONFIG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cfg.ignore
+                .processes
+                .iter()
+                .any(|ignored| process.eq_ignore_ascii_case(ignored))
+        };
+        if ignored_process {
+            return false;
+        }
 
         true
     }
 }
 
 pub fn rect_to_string(r: &RECT) -> String {
-    format!("({},{} {}x{})", r.left, r.top, r.right - r.left, r.bottom - r.top)
+    format!(
+        "({},{} {}x{})",
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top
+    )
 }

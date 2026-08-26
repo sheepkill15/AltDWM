@@ -5,12 +5,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub static CONFIG_DIRTY: AtomicBool = AtomicBool::new(false);
-static WATCHER: std::sync::LazyLock<std::sync::Mutex<Option<notify::RecommendedWatcher>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-static WATCHED_DIR: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static WATCHER: std::sync::LazyLock<std::sync::Mutex<Option<notify::RecommendedWatcher>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static WATCHED_DIR: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 /// Spawn watcher for config file. Watches parent directory, debounces 500ms.
 pub fn spawn_watcher(path: PathBuf) {
-    let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     {
         let mut watched = WATCHED_DIR.lock().unwrap_or_else(|e| e.into_inner());
         if watched.as_ref() == Some(&dir) {
@@ -21,18 +26,25 @@ pub fn spawn_watcher(path: PathBuf) {
     let file_name = path.file_name().map(|n| n.to_owned());
 
     std::thread::spawn(move || {
-        use notify::{Watcher, RecursiveMode, EventKind, Config};
+        use notify::{Config, EventKind, RecursiveMode, Watcher};
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher: notify::RecommendedWatcher = match notify::RecommendedWatcher::new(tx, Config::default()) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("[watcher] failed to create watcher for {:?}: {:?}", dir, e);
-                return;
-            }
-        };
+        let mut watcher: notify::RecommendedWatcher =
+            match notify::RecommendedWatcher::new(tx, Config::default()) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("[watcher] failed to create watcher for {:?}: {:?}", dir, e);
+                    *WATCHED_DIR
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = None;
+                    return;
+                }
+            };
         if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
             eprintln!("[watcher] watch failed {:?}: {:?}", dir, e);
+            *WATCHED_DIR
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
             return;
         }
         // keep watcher alive (store in global)
@@ -47,12 +59,18 @@ pub fn spawn_watcher(path: PathBuf) {
                     // filter to our file
                     let is_our_file = if let Some(ref name) = file_name {
                         event.paths.iter().any(|p| p.file_name() == Some(name))
-                    } else { true };
-                    if !is_our_file { continue; }
+                    } else {
+                        true
+                    };
+                    if !is_our_file {
+                        continue;
+                    }
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) => {
                             // debounce 500ms
-                            if last_emit.elapsed() < Duration::from_millis(500) { continue; }
+                            if last_emit.elapsed() < Duration::from_millis(500) {
+                                continue;
+                            }
                             last_emit = Instant::now();
                             println!("[watcher] {} changed -> reload pending", path.display());
                             CONFIG_DIRTY.store(true, Ordering::SeqCst);
@@ -66,6 +84,9 @@ pub fn spawn_watcher(path: PathBuf) {
                 Err(e) => eprintln!("[watcher] error: {:?}", e),
             }
         }
+        *WATCHED_DIR
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     });
 }
 
