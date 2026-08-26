@@ -6,6 +6,7 @@ mod rules;
 mod scripting;
 mod taskbar;
 mod util;
+mod virtual_desktop;
 mod widgets;
 
 use std::collections::HashMap;
@@ -331,6 +332,7 @@ fn do_check_config(explicit: Option<&std::path::Path>) {
 
 fn main() {
     print_banner();
+    virtual_desktop::init();
 
     // --- early arg scan for --config / --generate-config / --check-config / --help
     let args: Vec<String> = std::env::args().collect();

@@ -95,6 +95,17 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
         return;
     }
 
+    // virtual desktop filter (if enabled in config)
+    let before_vd = all_windows.len();
+    let all_windows: Vec<HWND> = all_windows.into_iter().filter(|hwnd| crate::virtual_desktop::is_on_current_desktop(*hwnd)).collect();
+    if all_windows.len() != before_vd {
+        println!("[manager] filtered {} windows not on current virtual desktop", before_vd - all_windows.len());
+    }
+    if all_windows.is_empty() {
+        println!("[manager] no windows on current virtual desktop");
+        return;
+    }
+
     // apply rules — floating windows are excluded from tiling
     let (windows, floating): (Vec<_>, Vec<_>) = all_windows.into_iter().partition(|hwnd| !crate::rules::is_floating(*hwnd));
     if !floating.is_empty() {

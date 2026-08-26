@@ -43,6 +43,9 @@ pub struct General {
     /// extra height for vertical panels (not used yet)
     #[serde(default)]
     pub outer_gap: Option<i32>,
+    /// filter tiling to current virtual desktop only (requires IVirtualDesktopManager)
+    #[serde(default = "default_filter_vd")]
+    pub filter_virtual_desktop: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -169,6 +172,7 @@ fn default_gap() -> i32 { 8 }
 fn default_taskbar() -> bool { true }
 fn default_taskbar_height() -> i32 { 40 }
 fn default_true() -> bool { true }
+fn default_filter_vd() -> bool { false }
 fn default_layout() -> String { "MasterStack".to_string() }
 fn default_panel_position() -> String { "bottom".to_string() }
 fn default_panel_height() -> i32 { 40 }
@@ -183,6 +187,7 @@ impl Default for General {
             taskbar_height: default_taskbar_height(),
             auto_tile: default_true(),
             outer_gap: None,
+            filter_virtual_desktop: default_filter_vd(),
         }
     }
 }
