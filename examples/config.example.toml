@@ -1,0 +1,52 @@
+# AltDWM example config — copy to %APPDATA%/AltDWM/config.toml or ./config.toml
+# Run: alt-dwm --generate-config  (will overwrite docs copy)
+# Hot reload: Win+Shift+C
+
+[general]
+gap = 8
+layout = "MasterStack"   # MasterStack | Grid | Monocle | Floating
+taskbar = true           # legacy shim -> creates a single bottom panel
+taskbar_height = 40
+auto_tile = true
+
+[ignore]
+classes = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "AltDWM_Taskbar", "AltDWM_Host"]
+titles = []
+processes = []
+
+# --- v0.2 DSL (panels/widgets/rules/keybinds) — see docs/EXTENSIBILITY.md
+# Uncomment to try declarative panels (overrides [general].taskbar when present)
+
+# [[panels]]
+# name = "bottom"
+# position = "bottom"   # top | bottom | left | right
+# height = 40
+# monitor = "all"       # all | primary | 1
+# widgets = ["workspaces", "window_title", "tray", "clock"]
+
+# [[panels]]
+# name = "top"
+# position = "top"
+# height = 28
+# monitor = "primary"
+# widgets = ["launcher", "spacer", "clock"]
+
+# [[widgets]]
+# type = "clock"
+# name = "clock"
+# format = "%H:%M:%S"
+# interval = 1000
+
+# [[widgets]]
+# type = "custom"
+# name = "cpu"
+# script = "scripts/cpu.rhai"
+# interval = 2000
+
+# [[rules]]
+# match_class = "Spotify"
+# floating = true
+
+# [[keybinds]]
+# keys = "Win+Return"
+# action = "launch('wt.exe')"
