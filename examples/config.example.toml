@@ -4,6 +4,7 @@ layout = "MasterStack"
 taskbar = true
 taskbar_height = 40
 auto_tile = true
+filter_virtual_desktop = false
 
 [ignore]
 classes = [

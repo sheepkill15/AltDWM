@@ -90,14 +90,38 @@ impl Widget for WindowTitleWidget {
 pub struct TrayWidget { pub cfg: WidgetConfig }
 impl Widget for TrayWidget {
     fn name(&self) -> &str { &self.cfg.name }
-    fn width(&self, _ctx: &PanelCtx) -> i32 { self.cfg.width.unwrap_or(200) }
+    fn width(&self, _ctx: &PanelCtx) -> i32 { self.cfg.width.unwrap_or(220) }
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         unsafe {
+            // Draw 4 placeholder tray icons as colored squares + time, with subtle separators
+            let icon_sz = 16;
+            let gap = 6;
+            let mut x = rect.left + 8;
+            let y = rect.top + (rect.bottom - rect.top - icon_sz) / 2;
+            // icon colors: simulate battery/network/sound
+            let colors = [0x004CB3 as u32, 0x2AA198 as u32, 0x859900 as u32, 0x657B83 as u32];
+            for col in colors {
+                let r = RECT { left: x, top: y, right: x+icon_sz, bottom: y+icon_sz };
+                let br = windows::Win32::Graphics::Gdi::CreateSolidBrush(COLORREF(col));
+                windows::Win32::Graphics::Gdi::FillRect(hdc, &r, br);
+                let _ = windows::Win32::Graphics::Gdi::DeleteObject(br.into());
+                // border
+                let br2 = windows::Win32::Graphics::Gdi::CreateSolidBrush(COLORREF(0x00303030));
+                windows::Win32::Graphics::Gdi::FrameRect(hdc, &r, br2);
+                let _ = windows::Win32::Graphics::Gdi::DeleteObject(br2.into());
+                x += icon_sz + gap;
+            }
+            // separator
+            let sep = RECT { left: x, top: rect.top+6, right: x+1, bottom: rect.bottom-6 };
+            let br = windows::Win32::Graphics::Gdi::CreateSolidBrush(COLORREF(0x00404040));
+            windows::Win32::Graphics::Gdi::FillRect(hdc, &sep, br);
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(br.into());
+            x += 8;
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(0x00808080));
-            let txt = "tray: (Shell_NotifyIcon sink TODO)";
+            SetTextColor(hdc, COLORREF(0x00AAAAAA));
+            let txt = "tray";
             let wide: Vec<u16> = txt.encode_utf16().collect();
-            let _ = TextOutW(hdc, rect.left + 4, rect.top + 12, &wide);
+            let _ = TextOutW(hdc, x, rect.top + 12, &wide);
         }
     }
 }
