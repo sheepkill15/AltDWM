@@ -11,11 +11,11 @@ Goal: let users configure **and change anything** without forking Rust code — 
 
 ## Stack choice — Why TOML + Rhai (not Lua/Python)?
 
-| Option | Pros | Cons |
-|---|---|---|
-| **Lua (`mlua`)** | Familiar to awesomeWM users, large ecosystem | Requires Lua DLL, `unsafe` FFI, non-Rust error handling |
-| **Python** | Familiar | Heavy runtime, distribution hell on Windows |
-| **Rhai** | Pure Rust, resource-limited, `serde` friendly, no DLL, `cargo` only, JS-like syntax | Less known, smaller ecosystem |
+| Option           | Pros                                                                                | Cons                                                    |
+|------------------|-------------------------------------------------------------------------------------|---------------------------------------------------------|
+| **Lua (`mlua`)** | Familiar to awesomeWM users, large ecosystem                                        | Requires Lua DLL, `unsafe` FFI, non-Rust error handling |
+| **Python**       | Familiar                                                                            | Heavy runtime, distribution hell on Windows             |
+| **Rhai**         | Pure Rust, resource-limited, `serde` friendly, no DLL, `cargo` only, JS-like syntax | Less known, smaller ecosystem                           |
 
 **Decision: `TOML` declarative layer + optional `Rhai` scripting.**  
 - TOML is already used for `cargo` and Windows users expect it. Strict schema, good error messages.
@@ -44,16 +44,16 @@ Multiple panels allowed — e.g. top bar + side dock.
 
 Built-ins (v0.2):
 
-| widget | description | key config |
-|---|---|---|
-| `clock` | `Format: 09:41` | `format`, `interval` |
-| `workspaces` | Current tiling layout and live tilable/floating count | `width` |
-| `window_list` | Clickable list of current desktop's tiled windows | `width` |
-| `window_title` | Active window title | `max_len` |
-| `tray` | Visual system-tray placeholder (notification-area hosting is not implemented) | `width` |
-| `spacer` | Flexible gap | `width` (`0` means flexible) |
-| `launcher` | App grid / start button | `label`, `icon`, `command` |
-| `custom` | Rhai-drawn widget | `script`, `interval` |
+| widget         | description                                                                   | key config                   |
+|----------------|-------------------------------------------------------------------------------|------------------------------|
+| `clock`        | `Format: 09:41`                                                               | `format`, `interval`         |
+| `workspaces`   | Current tiling layout and live tilable/floating count                         | `width`                      |
+| `window_list`  | Clickable list of current desktop's tiled windows                             | `width`                      |
+| `window_title` | Active window title                                                           | `max_len`                    |
+| `tray`         | Visual system-tray placeholder (notification-area hosting is not implemented) | `width`                      |
+| `spacer`       | Flexible gap                                                                  | `width` (`0` means flexible) |
+| `launcher`     | App grid / start button                                                       | `label`, `icon`, `command`   |
+| `custom`       | Rhai-drawn widget                                                             | `script`, `interval`         |
 
 Widget registry is extensible:
 
@@ -122,7 +122,8 @@ type = "custom"
 name = "cpu"
 interval = 1000
 script = "scripts/cpu.rhai"      # or inline: on_update = "rhai: get_cpu()"
-
+```
+```rhai
 # scripts/cpu.rhai
 let cpu = get_cpu_usage();
 `CPU ${cpu}%`;

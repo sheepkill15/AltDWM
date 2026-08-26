@@ -66,7 +66,7 @@ pub fn hmonitor_for_target(target: &str) -> Option<HMONITOR> {
         for &h in &mons {
             unsafe {
                 let mut mi = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    cbSize: size_of::<MONITORINFO>() as u32,
                     ..Default::default()
                 };
                 if GetMonitorInfoW(h, &mut mi as *mut _ as *mut _).as_bool()
@@ -91,7 +91,7 @@ pub fn hmonitor_for_target(target: &str) -> Option<HMONITOR> {
         unsafe {
             let mut ex = MONITORINFOEXW {
                 monitorInfo: MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                    cbSize: size_of::<MONITORINFOEXW>() as u32,
                     ..Default::default()
                 },
                 szDevice: [0; 32],
@@ -142,14 +142,14 @@ fn apply_window_chrome(hwnd: HWND, cfg: &crate::config::Config) {
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &corner as *const _ as _,
-            std::mem::size_of_val(&corner) as u32,
+            size_of_val(&corner) as u32,
         );
         let border = cfg.theme.border_color();
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_BORDER_COLOR,
             &border.0 as *const _ as _,
-            std::mem::size_of_val(&border) as u32,
+            size_of_val(&border) as u32,
         );
     }
 }
@@ -163,7 +163,7 @@ fn get_work_area_for_hmonitor(
 ) -> RECT {
     unsafe {
         let mut mi = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
         if !GetMonitorInfoW(hmon, &mut mi as *mut _ as *mut _).as_bool() {
@@ -267,30 +267,20 @@ pub fn tile_windows_reserved(
             );
         }
     }
+    // Apply opacity to every managed window before any layout-specific early return.
+    for hwnd in windows.iter().chain(floating.iter()) {
+        if let Some(opacity) = crate::rules::rule_opacity(*hwnd) {
+            if verbose {
+                println!("[manager] opacity {} for {:?}", opacity, hwnd.0);
+            }
+            crate::rules::apply_opacity(*hwnd, opacity);
+        }
+    }
     if windows.is_empty() {
         if verbose {
             println!("[manager] no tilable windows (all floating)");
         }
-        // still apply opacity to floating windows
-        for hwnd in &floating {
-            if let Some(op) = crate::rules::rule_opacity(*hwnd) {
-                if verbose {
-                    println!("[manager] opacity {} for {:?}", op, hwnd.0);
-                }
-                crate::rules::apply_opacity(*hwnd, op);
-            }
-        }
         return;
-    }
-
-    // apply opacity per rules (both tilable and floating)
-    for hwnd in windows.iter().chain(floating.iter()) {
-        if let Some(op) = crate::rules::rule_opacity(*hwnd) {
-            if verbose {
-                println!("[manager] opacity {} for {:?}", op, hwnd.0);
-            }
-            crate::rules::apply_opacity(*hwnd, op);
-        }
     }
 
     let layout_name = cfg_snapshot.general.layout.clone();

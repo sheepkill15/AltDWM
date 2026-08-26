@@ -75,7 +75,7 @@ pub fn spawn_watcher(path: PathBuf) {
                             println!("[watcher] {} changed -> reload pending", path.display());
                             CONFIG_DIRTY.store(true, Ordering::SeqCst);
                             crate::RETILE_PENDING.store(true, Ordering::SeqCst);
-                            // also wake up message loop via PostMessage to host window?
+                            // also wake-up message loop via PostMessage to host window?
                             // host timer will pick up CONFIG_DIRTY and do full reload
                         }
                         _ => {}

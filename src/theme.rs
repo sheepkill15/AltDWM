@@ -133,7 +133,7 @@ fn parse_hex(s: &str) -> COLORREF {
 }
 
 /// Helper to create a GDI font handle for Segoe UI with theme size (uncached, caller must DeleteObject)
-pub fn create_font(theme: &Theme) -> windows::Win32::Graphics::Gdi::HFONT {
+pub fn create_font(theme: &Theme) -> HFONT {
     use windows::Win32::Graphics::Gdi::{
         CreateFontW, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, FF_DONTCARE, FW_NORMAL,
         OUT_DEFAULT_PRECIS, VARIABLE_PITCH,

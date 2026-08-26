@@ -1,5 +1,5 @@
 //! Focus navigation — cycle through tilable windows
-//! Exposed to keybinds via `focus_next()` / `focus_prev()` etc and Rhai `focus_next()`
+//! Exposed to keybinds via `focus_next()` / `focus_prev()` etc. and Rhai `focus_next()`
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -84,7 +84,7 @@ pub fn move_focused_to_monitor(dir: &str) {
     // center on target monitor work area
     unsafe {
         let mut mi = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
         if GetMonitorInfoW(target, &mut mi as *mut _ as *mut _).as_bool() {

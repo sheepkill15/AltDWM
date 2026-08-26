@@ -1,9 +1,48 @@
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
     IsIconic, IsWindowVisible, GA_ROOT, GWL_EXSTYLE, GW_OWNER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
+
+pub fn register_window_class(
+    class_name: PCWSTR,
+    window_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    label: &str,
+) -> Result<(), String> {
+    use windows::Win32::Graphics::Gdi::HBRUSH;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        LoadCursorW, RegisterClassExW, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, WNDCLASSEXW,
+    };
+
+    unsafe {
+        let hinstance = HINSTANCE(std::ptr::null_mut());
+        let class = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(window_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: Default::default(),
+            hCursor: LoadCursorW(Some(hinstance), IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: class_name,
+            hIconSm: Default::default(),
+        };
+        let atom = RegisterClassExW(&class);
+        if atom == 0 {
+            let error = windows::Win32::Foundation::GetLastError();
+            // ERROR_CLASS_ALREADY_EXISTS is success for hot reload/recreation.
+            if error.0 != 1410 {
+                return Err(format!("{label} RegisterClassExW failed: {error:?}"));
+            }
+        }
+        Ok(())
+    }
+}
 
 const DWMWA_CLOAKED_U32: u32 = 14;
 
@@ -33,17 +72,17 @@ pub fn is_cloaked(hwnd: HWND) -> bool {
             hwnd,
             DWMWA_CLOAKED,
             &mut cloaked as *mut u32 as *mut _,
-            std::mem::size_of::<u32>() as u32,
+            size_of::<u32>() as u32,
         )
     };
     if hr.is_err() {
         // Fallback to raw value 14 if enum variant not matched (avoid transmute)
         let hr2 = unsafe {
-            windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            DwmGetWindowAttribute(
                 hwnd,
                 windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_CLOAKED_U32 as i32),
                 &mut cloaked as *mut u32 as *mut _,
-                std::mem::size_of::<u32>() as u32,
+                size_of::<u32>() as u32,
             )
         };
         if hr2.is_err() {

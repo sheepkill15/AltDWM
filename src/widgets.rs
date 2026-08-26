@@ -59,9 +59,6 @@ impl Widget for ClockWidget {
     fn width(&self, _ctx: &PanelCtx) -> i32 {
         self.cfg.width.unwrap_or(160)
     }
-    fn interval_ms(&self) -> Option<u32> {
-        Some(self.cfg.interval.unwrap_or(1000))
-    }
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         unsafe {
             let theme = crate::CURRENT_CONFIG
@@ -91,6 +88,9 @@ impl Widget for ClockWidget {
     }
     fn on_click(&self, _x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> {
         self.cfg.action.clone()
+    }
+    fn interval_ms(&self) -> Option<u32> {
+        Some(self.cfg.interval.unwrap_or(1000))
     }
 }
 
@@ -499,9 +499,6 @@ impl Widget for CustomWidget {
     fn width(&self, _ctx: &PanelCtx) -> i32 {
         self.cfg.width.unwrap_or(120)
     }
-    fn interval_ms(&self) -> Option<u32> {
-        self.cfg.interval
-    }
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         let interval =
             std::time::Duration::from_millis(self.cfg.interval.unwrap_or(1000).max(1) as u64);
@@ -514,10 +511,8 @@ impl Widget for CustomWidget {
                 } else {
                     read_widget_script(script)
                 };
-                match code.and_then(|code| crate::scripting::eval_text(&code)) {
-                    Ok(s) => s,
-                    Err(e) => format!("rhai:{}", e),
-                }
+                code.and_then(|code| crate::scripting::eval_text(&code))
+                    .unwrap_or_else(|e| format!("rhai:{}", e))
             } else {
                 self.cfg.label.clone().unwrap_or_else(|| "custom".into())
             };
@@ -542,6 +537,9 @@ impl Widget for CustomWidget {
     }
     fn on_click(&self, _x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> {
         self.cfg.action.clone()
+    }
+    fn interval_ms(&self) -> Option<u32> {
+        self.cfg.interval
     }
 }
 

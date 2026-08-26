@@ -25,11 +25,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-    RegisterClassExW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EVENT_OBJECT_CREATE,
-    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, HMENU,
-    HWND_MESSAGE, MSG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CREATE, WM_DESTROY,
-    WM_HOTKEY, WM_TIMER, WNDCLASSEXW,
+    TranslateMessage, CW_USEDEFAULT, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, HMENU, HWND_MESSAGE, MSG,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_TIMER,
 };
 
 use layout::Layout;
@@ -80,7 +79,7 @@ pub fn request_quit() {
         }
     } else {
         unsafe {
-            windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+            PostQuitMessage(0);
         }
     }
 }
@@ -132,6 +131,25 @@ pub fn is_ignored_class(class: &str) -> bool {
 pub fn is_ignored_title(title: &str) -> bool {
     let cfg = CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     cfg.ignore.titles.iter().any(|t| title.contains(t))
+}
+
+fn bar_reserves(cfg: &config::Config) -> (i32, i32) {
+    if cfg.panels.is_empty() {
+        if TASKBAR_ENABLED.load(Ordering::SeqCst) {
+            (0, taskbar::TASKBAR_HEIGHT)
+        } else {
+            (0, 0)
+        }
+    } else {
+        let reserved = |position: &str| {
+            cfg.panels
+                .iter()
+                .filter(|panel| panel.position == position)
+                .map(config::PanelConfig::edge_consumption)
+                .sum()
+        };
+        (reserved("top"), reserved("bottom"))
+    }
 }
 
 fn vk_from_name(name: &str) -> Option<u32> {
@@ -287,11 +305,11 @@ unsafe extern "system" fn win_event_proc(
         return;
     }
     if event == EVENT_OBJECT_DESTROY {
-        crate::rules::forget_window(hwnd);
+        rules::forget_window(hwnd);
     }
     // on_create rules — run even if tiling disabled, but only for CREATE/SHOW
     if event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW {
-        crate::rules::maybe_run_on_create(hwnd);
+        rules::maybe_run_on_create(hwnd);
     }
     if !TILING_ENABLED.load(Ordering::SeqCst) {
         return;
@@ -334,25 +352,7 @@ unsafe extern "system" fn host_wndproc(
                         .clone();
                     let gap = cfg.general.gap;
                     let layout = cfg.layout_enum();
-                    let (top_reserve, bottom_reserve) = if !cfg.panels.is_empty() {
-                        let top: i32 = cfg
-                            .panels
-                            .iter()
-                            .filter(|p| p.position == "top")
-                            .map(|p| p.height)
-                            .sum();
-                        let bottom: i32 = cfg
-                            .panels
-                            .iter()
-                            .filter(|p| p.position == "bottom")
-                            .map(|p| p.height)
-                            .sum();
-                        (top, bottom)
-                    } else if cfg.general.taskbar {
-                        (0, cfg.general.taskbar_height)
-                    } else {
-                        (0, 0)
-                    };
+                    let (top_reserve, bottom_reserve) = bar_reserves(&cfg);
                     let taskbar_hwnd = taskbar::get_taskbar_hwnd();
                     let reserve = if !cfg.panels.is_empty() {
                         None
@@ -383,27 +383,7 @@ fn create_host_window() -> Result<HWND, String> {
     unsafe {
         let hinstance = HINSTANCE(std::ptr::null_mut());
         let class_name = w!("AltDWM_Host");
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(host_wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinstance,
-            hIcon: Default::default(),
-            hCursor: Default::default(),
-            hbrBackground: Default::default(),
-            lpszMenuName: windows::core::PCWSTR::null(),
-            lpszClassName: class_name,
-            hIconSm: Default::default(),
-        };
-        let atom = RegisterClassExW(&wc);
-        if atom == 0 {
-            let err = windows::Win32::Foundation::GetLastError();
-            if err.0 != 1410 {
-                return Err(format!("Host RegisterClassExW failed: {:?}", err));
-            }
-        }
+        util::register_window_class(class_name, host_wndproc, "Host")?;
         let hwnd = CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
             class_name,
@@ -611,6 +591,22 @@ fn apply_config_reload(
     }
 }
 
+fn reload_and_apply_config(
+    overrides: &[(String, String)],
+    panel_handles: &mut Vec<HWND>,
+    taskbar_hwnd: &mut Option<HWND>,
+) {
+    match reload_existing_config(overrides) {
+        Ok((new_cfg, new_path)) => {
+            apply_config_reload(new_cfg, Some(new_path), panel_handles, taskbar_hwnd);
+            request_retile();
+        }
+        Err(error) => {
+            eprintln!("[config] reload rejected; keeping current config: {error}");
+        }
+    }
+}
+
 fn main() {
     let _ = MAIN_TID.set(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
     print_banner();
@@ -798,25 +794,7 @@ fn main() {
     }
 
     if TILING_ENABLED.load(Ordering::SeqCst) {
-        let (top, bottom) = if !cfg.panels.is_empty() {
-            let t: i32 = cfg
-                .panels
-                .iter()
-                .filter(|p| p.position == "top")
-                .map(|p| p.height)
-                .sum();
-            let b: i32 = cfg
-                .panels
-                .iter()
-                .filter(|p| p.position == "bottom")
-                .map(|p| p.height)
-                .sum();
-            (t, b)
-        } else if TASKBAR_ENABLED.load(Ordering::SeqCst) {
-            (0, taskbar::TASKBAR_HEIGHT)
-        } else {
-            (0, 0)
-        };
+        let (top, bottom) = bar_reserves(&cfg);
         manager::tile_windows_reserved(taskbar_hwnd, top, bottom, layout, gap);
     }
 
@@ -851,22 +829,11 @@ fn main() {
                         break;
                     } else if act == "reload_config" {
                         println!("[hotkey] reload config");
-                        match reload_existing_config(&cli_overrides) {
-                            Ok((new_cfg, new_path)) => {
-                                apply_config_reload(
-                                    new_cfg,
-                                    Some(new_path),
-                                    &mut panel_handles,
-                                    &mut taskbar_hwnd,
-                                );
-                                request_retile();
-                            }
-                            Err(error) => {
-                                eprintln!(
-                                    "[config] reload rejected; keeping current config: {error}"
-                                );
-                            }
-                        }
+                        reload_and_apply_config(
+                            &cli_overrides,
+                            &mut panel_handles,
+                            &mut taskbar_hwnd,
+                        );
                     } else if act == "retile" {
                         let l = *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
                         let g = *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner());
@@ -874,25 +841,7 @@ fn main() {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
-                        let (top, bottom) = if !cfg.panels.is_empty() {
-                            let t: i32 = cfg
-                                .panels
-                                .iter()
-                                .filter(|p| p.position == "top")
-                                .map(|p| p.height)
-                                .sum();
-                            let b: i32 = cfg
-                                .panels
-                                .iter()
-                                .filter(|p| p.position == "bottom")
-                                .map(|p| p.height)
-                                .sum();
-                            (t, b)
-                        } else if TASKBAR_ENABLED.load(Ordering::SeqCst) {
-                            (0, taskbar::TASKBAR_HEIGHT)
-                        } else {
-                            (0, 0)
-                        };
+                        let (top, bottom) = bar_reserves(&cfg);
                         manager::tile_windows_reserved(taskbar_hwnd, top, bottom, l, g);
                     } else {
                         // delegate to scripting engine (handles toggle_tiling, set_layout, launch, rhai: ...)
@@ -916,20 +865,7 @@ fn main() {
                         "action requested"
                     }
                 );
-                match reload_existing_config(&cli_overrides) {
-                    Ok((new_cfg, new_path)) => {
-                        apply_config_reload(
-                            new_cfg,
-                            Some(new_path),
-                            &mut panel_handles,
-                            &mut taskbar_hwnd,
-                        );
-                        request_retile();
-                    }
-                    Err(error) => {
-                        eprintln!("[config] reload rejected; keeping current config: {error}");
-                    }
-                }
+                reload_and_apply_config(&cli_overrides, &mut panel_handles, &mut taskbar_hwnd);
             }
         }
         unregister_all_hotkeys();

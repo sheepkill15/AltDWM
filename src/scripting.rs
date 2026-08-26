@@ -58,7 +58,7 @@ fn get_mem_usage_real() -> i64 {
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     unsafe {
         let mut stat = MEMORYSTATUSEX {
-            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            dwLength: size_of::<MEMORYSTATUSEX>() as u32,
             ..Default::default()
         };
         if GlobalMemoryStatusEx(&mut stat).is_ok() {
@@ -97,7 +97,7 @@ fn build_engine() -> Engine {
     eng.register_fn("get_mem_usage", || -> i64 { get_mem_usage_real() });
     eng.register_fn("get_mem", || -> rhai::Map {
         let mut m = rhai::Map::new();
-        m.insert("load".into(), rhai::Dynamic::from_int(get_mem_usage_real()));
+        m.insert("load".into(), Dynamic::from_int(get_mem_usage_real()));
         m
     });
     eng.register_fn("retile", || {

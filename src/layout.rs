@@ -118,25 +118,14 @@ pub fn try_compute_custom(
     // check cache
     let ast = {
         let mut cache = LAYOUT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached_mtime, cached_ast, cached_path)) = cache.get(name) {
-            if *cached_path == code_path && *cached_mtime == code_mtime {
-                cached_ast.clone()
-            } else {
-                // recompile
-                let engine = crate::scripting::engine().lock().ok()?;
-                let new_ast = match engine.compile(&code) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        eprintln!("[layout] custom '{}' compile error: {}", name, e);
-                        return None;
-                    }
-                };
-                cache.insert(
-                    name.to_string(),
-                    (code_mtime, new_ast.clone(), code_path.clone()),
-                );
-                new_ast
-            }
+        let cached_ast = cache
+            .get(name)
+            .and_then(|(cached_mtime, cached_ast, cached_path)| {
+                (*cached_path == code_path && *cached_mtime == code_mtime)
+                    .then(|| cached_ast.clone())
+            });
+        if let Some(cached_ast) = cached_ast {
+            cached_ast
         } else {
             let engine = crate::scripting::engine().lock().ok()?;
             let new_ast = match engine.compile(&code) {

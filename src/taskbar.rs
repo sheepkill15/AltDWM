@@ -2,15 +2,14 @@ use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, SYSTEMTIME, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, SetBkMode, SetTextColor,
-    TextOutW, HBRUSH, PAINTSTRUCT, TRANSPARENT,
+    TextOutW, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetSystemMetrics, RegisterClassExW,
-    SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, HMENU, HWND_TOPMOST, SM_CXSCREEN,
-    SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN,
-    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetSystemMetrics, SetWindowPos, ShowWindow,
+    HMENU, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
+    WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WM_TIMER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 pub const TASKBAR_HEIGHT: i32 = 40;
@@ -67,7 +66,7 @@ unsafe extern "system" fn taskbar_wndproc(
             let wide: Vec<u16> = time_str.encode_utf16().collect();
             let _ = TextOutW(hdc, 10, 12, &wide);
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_font);
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
+            let _ = DeleteObject(font.into());
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -90,31 +89,7 @@ pub fn create_taskbar() -> Result<HWND, String> {
         let hinstance = HINSTANCE(std::ptr::null_mut());
 
         let class_name = w!("AltDWM_Taskbar");
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(taskbar_wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinstance,
-            hIcon: Default::default(),
-            hCursor: windows::Win32::UI::WindowsAndMessaging::LoadCursorW(
-                Some(hinstance),
-                windows::Win32::UI::WindowsAndMessaging::IDC_ARROW,
-            )
-            .unwrap_or_default(),
-            hbrBackground: HBRUSH(std::ptr::null_mut()),
-            lpszMenuName: windows::core::PCWSTR::null(),
-            lpszClassName: class_name,
-            hIconSm: Default::default(),
-        };
-        let atom = RegisterClassExW(&wc);
-        if atom == 0 {
-            let err = windows::Win32::Foundation::GetLastError();
-            if err.0 != 1410 {
-                return Err(format!("RegisterClassExW failed: {:?}", err));
-            }
-        }
+        crate::util::register_window_class(class_name, taskbar_wndproc, "Taskbar")?;
 
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);

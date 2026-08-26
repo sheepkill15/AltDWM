@@ -268,7 +268,7 @@ impl Default for Config {
             rules: vec![],
             keybinds: vec![
                 // Alt+Shift chosen because Win+Shift collides with system (Win+Shift+S = Snipping Tool, etc.)
-                // Users can set keys = "Win+Shift+R" etc in config.toml if they prefer — parser supports Win/Ctrl/Alt/Shift combos
+                // Users can set keys = "Win+Shift+R" etc. in config.toml if they prefer — parser supports Win/Ctrl/Alt/Shift combos
                 KeybindConfig {
                     keys: "Alt+Shift+R".into(),
                     action: "retile".into(),

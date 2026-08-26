@@ -63,10 +63,10 @@ pub fn is_on_current_desktop(hwnd: HWND) -> bool {
     }
     if let Some(vdm) = get_vdm() {
         unsafe {
-            match vdm.IsWindowOnCurrentVirtualDesktop(hwnd) {
-                Ok(b) => return b.as_bool(),
-                Err(_) => return true, // not a top-level or other error -> treat as visible
-            }
+            return match vdm.IsWindowOnCurrentVirtualDesktop(hwnd) {
+                Ok(b) => b.as_bool(),
+                Err(_) => true, // not a top-level or other error -> treat as visible
+            };
         }
     }
     true
