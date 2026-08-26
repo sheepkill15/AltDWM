@@ -89,13 +89,28 @@ pub fn tile_windows(taskbar_hwnd: Option<HWND>, taskbar_height: i32, layout: Lay
 
 /// Tile with explicit top/bottom reserves (for panels DSL)
 pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, bottom_reserve: i32, layout: Layout, gap: i32) {
-    let windows = collect_windows(taskbar_hwnd);
-    if windows.is_empty() {
+    let all_windows = collect_windows(taskbar_hwnd);
+    if all_windows.is_empty() {
         println!("[manager] no manageable windows");
         return;
     }
 
-    println!("[manager] tiling {} windows with layout {} gap={}", windows.len(), layout.name(), gap);
+    // apply rules — floating windows are excluded from tiling
+    let (windows, floating): (Vec<_>, Vec<_>) = all_windows.into_iter().partition(|hwnd| !crate::rules::is_floating(*hwnd));
+    if !floating.is_empty() {
+        println!("[manager] floating {} window(s) per rules:", floating.len());
+        for hwnd in &floating {
+            let cls = crate::util::get_class_name(*hwnd);
+            let title = crate::util::get_window_title(*hwnd);
+            println!("  ~ {:?} class={} title=\"{}\" (floating)", hwnd.0, cls, title);
+        }
+    }
+    if windows.is_empty() {
+        println!("[manager] no tilable windows (all floating)");
+        return;
+    }
+
+    println!("[manager] tiling {} windows with layout {} gap={} ({} floating skipped)", windows.len(), layout.name(), gap, floating.len());
     for hwnd in &windows {
         let cls = crate::util::get_class_name(*hwnd);
         let title = crate::util::get_window_title(*hwnd);

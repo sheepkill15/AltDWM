@@ -2,6 +2,7 @@ mod config;
 mod layout;
 mod manager;
 mod panel;
+mod rules;
 mod scripting;
 mod taskbar;
 mod util;
