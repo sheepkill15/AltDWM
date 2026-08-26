@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows,
-    HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER, SWP_FRAMECHANGED,
+    HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER,
 };
 
 use crate::layout::{compute_layout, Layout};
@@ -149,9 +149,9 @@ fn get_work_area_for_hmonitor(hmon: HMONITOR, top_reserve: i32, bottom_reserve: 
 pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, bottom_reserve: i32, layout: Layout, gap: i32) {
     // snapshot config once per tick to avoid repeated locking
     let cfg_snapshot = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let verbose = std::env::var_os("ALT_DWM_VERBOSE").is_some();
     let all_windows = collect_windows(taskbar_hwnd);
     if all_windows.is_empty() {
-        println!("[manager] no manageable windows");
         return;
     }
 
@@ -162,17 +162,16 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
     } else {
         all_windows
     };
-    if all_windows.len() != before_vd {
+    if verbose && all_windows.len() != before_vd {
         println!("[manager] filtered {} windows not on current virtual desktop", before_vd - all_windows.len());
     }
     if all_windows.is_empty() {
-        println!("[manager] no windows on current virtual desktop");
         return;
     }
 
     // apply rules — floating windows are excluded from tiling (including runtime floating via Alt+Shift+Y)
     let (windows, floating): (Vec<_>, Vec<_>) = all_windows.into_iter().partition(|hwnd| !crate::rules::is_floating(*hwnd) && !crate::focus::is_runtime_floating(*hwnd));
-    if !floating.is_empty() {
+    if verbose && !floating.is_empty() {
         println!("[manager] floating {} window(s) per rules:", floating.len());
         for hwnd in &floating {
             let cls = crate::util::get_class_name(*hwnd);
@@ -181,11 +180,11 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
         }
     }
     if windows.is_empty() {
-        println!("[manager] no tilable windows (all floating)");
+        if verbose { println!("[manager] no tilable windows (all floating)"); }
         // still apply opacity to floating windows
         for hwnd in &floating {
             if let Some(op) = crate::rules::rule_opacity(*hwnd) {
-                println!("[manager] opacity {} for {:?}", op, hwnd.0);
+                if verbose { println!("[manager] opacity {} for {:?}", op, hwnd.0); }
                 crate::rules::apply_opacity(*hwnd, op);
             }
         }
@@ -195,21 +194,23 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
     // apply opacity per rules (both tilable and floating)
     for hwnd in windows.iter().chain(floating.iter()) {
         if let Some(op) = crate::rules::rule_opacity(*hwnd) {
-            println!("[manager] opacity {} for {:?}", op, hwnd.0);
+            if verbose { println!("[manager] opacity {} for {:?}", op, hwnd.0); }
             crate::rules::apply_opacity(*hwnd, op);
         }
     }
 
     let layout_name = cfg_snapshot.general.layout.clone();
-    println!("[manager] tiling {} windows with layout {} gap={} ({} floating skipped)", windows.len(), layout_name, gap, floating.len());
-    for hwnd in &windows {
-        let cls = crate::util::get_class_name(*hwnd);
-        let title = crate::util::get_window_title(*hwnd);
-        println!("  - {:?} class={} title=\"{}\"", hwnd.0, cls, title);
+    if verbose { println!("[manager] tiling {} windows with layout {} gap={} ({} floating skipped)", windows.len(), layout_name, gap, floating.len()); }
+    if verbose {
+        for hwnd in &windows {
+            let cls = crate::util::get_class_name(*hwnd);
+            let title = crate::util::get_window_title(*hwnd);
+            println!("  - {:?} class={} title=\"{}\"", hwnd.0, cls, title);
+        }
     }
 
     if layout == Layout::Floating {
-        println!("[manager] floating - skipping tile");
+        if verbose { println!("[manager] floating - skipping tile"); }
         return;
     }
 
@@ -221,7 +222,7 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
         // check rule for monitor override
         let target_hmon = if let Some(mon_str) = crate::rules::rule_monitor(hwnd) {
             if let Some(h) = hmonitor_for_target(&mon_str) {
-                println!("[manager] {:?} rule monitor='{}' -> hmon 0x{:x}", hwnd.0, mon_str, h.0 as usize);
+                if verbose { println!("[manager] {:?} rule monitor='{}' -> hmon 0x{:x}", hwnd.0, mon_str, h.0 as usize); }
                 h
             } else {
                 eprintln!("[manager] rule monitor '{}' not found for {:?}", mon_str, hwnd.0);
@@ -256,10 +257,10 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
 
     for (mon, wins) in per_monitor {
         let area = monitor_rects.get(&mon).copied().unwrap_or(RECT { left: 0, top: top_reserve, right: 1920, bottom: 1080 - bottom_reserve });
-        println!("[manager] monitor 0x{:x} area {:?}", mon, crate::util::rect_to_string(&area));
+        if verbose { println!("[manager] monitor 0x{:x} area {:?}", mon, crate::util::rect_to_string(&area)); }
         // try custom layout first (if general.layout names a key in layouts with script)
         let rects = if let Some(custom) = crate::layout::try_compute_custom(wins.len(), area, gap, &cfg_snapshot) {
-            println!("[manager] custom layout '{}'", cfg_snapshot.general.layout);
+            if verbose { println!("[manager] custom layout '{}'", cfg_snapshot.general.layout); }
             custom
         } else {
             compute_layout(wins.len(), area, gap, layout)
@@ -289,7 +290,7 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
                 continue;
             }
             apply_window_chrome(*hwnd, &cfg_snapshot);
-            println!("[manager] -> {:?} => {}x{} @ {},{}", hwnd.0, w, h, r.left, r.top);
+            if verbose { println!("[manager] -> {:?} => {}x{} @ {},{}", hwnd.0, w, h, r.left, r.top); }
             unsafe {
                 match DeferWindowPos(
                     hdwp,
@@ -299,7 +300,7 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
                     r.top,
                     w,
                     h,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
                 ) {
                     Ok(h) => hdwp = h,
                     Err(e) => println!("[manager] DeferWindowPos failed for {:?}: {:?}", hwnd.0, e),
@@ -310,7 +311,7 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
 
     unsafe {
         match EndDeferWindowPos(hdwp) {
-            Ok(_) => println!("[manager] tiling committed"),
+            Ok(_) => if verbose { println!("[manager] tiling committed"); },
             Err(e) => println!("[manager] EndDeferWindowPos failed: {:?}", e),
         }
     }

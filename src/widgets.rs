@@ -3,11 +3,14 @@
 use windows::Win32::Foundation::{RECT, HWND};
 use windows::Win32::Graphics::Gdi::{HDC, SetBkMode, SetTextColor, TextOutW, TRANSPARENT};
 use windows::Win32::Foundation::COLORREF;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::config::WidgetConfig;
 
 /// Context passed to every widget during draw / click
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Public extension context; built-ins do not need every field.
 pub struct PanelCtx {
     pub panel_name: String,
     pub monitor: String,
@@ -26,7 +29,6 @@ pub trait Widget: Send + Sync {
     /// return Some(action) to handle click
     fn on_click(&self, _x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> { None }
     fn interval_ms(&self) -> Option<u32> { None }
-    fn tooltip(&self) -> Option<String> { None }
 }
 
 // ---- built-ins --------------------------------------------------
@@ -290,32 +292,38 @@ impl Widget for LauncherWidget {
     }
 }
 
-/// Custom Rhai-drawn widget — script returns text to draw
-pub struct CustomWidget { pub cfg: WidgetConfig }
+/// Custom Rhai-drawn widget — script returns text to draw.
+/// Evaluation is cached by interval so paints never repeatedly execute scripts or read files.
+pub struct CustomWidget {
+    pub cfg: WidgetConfig,
+    state: Mutex<(Option<Instant>, String)>,
+}
 impl Widget for CustomWidget {
     fn name(&self) -> &str { &self.cfg.name }
     fn width(&self, _ctx: &PanelCtx) -> i32 { self.cfg.width.unwrap_or(120) }
     fn interval_ms(&self) -> Option<u32> { self.cfg.interval }
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
-        let txt = if let Some(script) = &self.cfg.script {
-            if script.starts_with("rhai:") {
-                let code = script.trim_start_matches("rhai:").trim();
-                match crate::scripting::eval_text(code) {
+        let interval = std::time::Duration::from_millis(self.cfg.interval.unwrap_or(1000).max(1) as u64);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let refresh = state.0.is_none_or(|last| last.elapsed() >= interval);
+        if refresh {
+            state.1 = if let Some(script) = &self.cfg.script {
+                let code = if let Some(inline) = script.strip_prefix("rhai:") {
+                    Ok(inline.trim().to_string())
+                } else {
+                    read_widget_script(script)
+                };
+                match code.and_then(|code| crate::scripting::eval_text(&code)) {
                     Ok(s) => s,
-                    Err(e) => format!("err:{}", e),
+                    Err(e) => format!("rhai:{}", e),
                 }
             } else {
-                match std::fs::read_to_string(script) {
-                    Ok(code) => match crate::scripting::eval_text(&code) {
-                        Ok(s) => s,
-                        Err(e) => format!("rhai:{}", e),
-                    },
-                    Err(_) => script.clone(),
-                }
-            }
-        } else {
-            self.cfg.label.clone().unwrap_or_else(|| "custom".into())
-        };
+                self.cfg.label.clone().unwrap_or_else(|| "custom".into())
+            };
+            state.0 = Some(Instant::now());
+        }
+        let txt = state.1.clone();
+        drop(state);
         unsafe {
             let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
             let font = crate::theme::get_cached_font(&theme);
@@ -330,6 +338,19 @@ impl Widget for CustomWidget {
     fn on_click(&self, _x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> { self.cfg.action.clone() }
 }
 
+fn read_widget_script(script: &str) -> Result<String, String> {
+    let mut candidates = vec![std::path::PathBuf::from(script)];
+    if let Some(dir) = crate::CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|path| path.parent()) {
+        candidates.push(dir.join(script));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() { candidates.push(dir.join(script)); }
+    }
+    candidates.into_iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .ok_or_else(|| format!("script not found: {}", script))
+}
+
 // ---- factory ----------------------------------------------------
 
 pub fn create_widget(cfg: &WidgetConfig) -> Box<dyn Widget> {
@@ -341,10 +362,10 @@ pub fn create_widget(cfg: &WidgetConfig) -> Box<dyn Widget> {
         "tray" | "systray" => Box::new(TrayWidget { cfg: cfg.clone() }),
         "workspaces" | "workspaces_pills" => Box::new(WorkspacesWidget { cfg: cfg.clone() }),
         "launcher" | "start" => Box::new(LauncherWidget { cfg: cfg.clone() }),
-        "custom" => Box::new(CustomWidget { cfg: cfg.clone() }),
+        "custom" => Box::new(CustomWidget { cfg: cfg.clone(), state: Mutex::new((None, String::new())) }),
         other => {
             eprintln!("[widgets] unknown type '{}' for '{}' -> custom fallback", other, cfg.name);
-            Box::new(CustomWidget { cfg: cfg.clone() })
+            Box::new(CustomWidget { cfg: cfg.clone(), state: Mutex::new((None, String::new())) })
         }
     }
 }

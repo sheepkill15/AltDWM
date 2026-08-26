@@ -6,7 +6,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SetWindowPos, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER, SWP_FRAMECHANGED};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SetWindowPos, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER};
 
 use crate::manager::collect_windows;
 use crate::taskbar;
@@ -71,7 +71,7 @@ pub fn move_focused_to_monitor(dir: &str) {
                 let h = rect.bottom - rect.top;
                 let x = work.left + (work.right - work.left - w) / 2;
                 let y = work.top + (work.bottom - work.top - h) / 2;
-                let _ = SetWindowPos(hwnd, Some(HWND_TOP), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                let _ = SetWindowPos(hwnd, Some(HWND_TOP), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
                 // also set foreground
                 set_foreground(hwnd);
                 crate::request_retile();

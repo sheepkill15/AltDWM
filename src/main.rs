@@ -37,6 +37,7 @@ use windows::core::w;
 // Global state — pub for scripting/panel/util access
 // ------------------------------------------------------------------
 pub static RETILE_PENDING: AtomicBool = AtomicBool::new(false);
+pub static CONFIG_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 pub static TILING_ENABLED: AtomicBool = AtomicBool::new(true);
 pub static TASKBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -67,7 +68,8 @@ pub fn toggle_tiling() {
     if enabled { request_retile(); }
 }
 pub fn set_layout_by_name(name: &str) {
-    let layout = match name.to_lowercase().as_str() {
+    let normalized = name.trim();
+    let layout = match normalized.to_lowercase().as_str() {
         "grid" => Layout::Grid,
         "monocle" => Layout::Monocle,
         "floating" => Layout::Floating,
@@ -76,12 +78,20 @@ pub fn set_layout_by_name(name: &str) {
     *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = layout;
     {
         let mut cfg = CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
-        cfg.set_layout(layout);
+        if let Some(custom_name) = cfg.layouts.keys().find(|key| key.eq_ignore_ascii_case(normalized)).cloned() {
+            // Custom Rhai layouts use MasterStack only as their native fallback.
+            cfg.general.layout = custom_name;
+        } else {
+            cfg.set_layout(layout);
+        }
     }
-    println!("[main] Layout -> {}", layout.name());
+    println!("[main] Layout -> {}", normalized);
     request_retile();
 }
-pub fn reload_config_async() { request_retile(); /* actual reload on next tick */ }
+pub fn reload_config_async() {
+    CONFIG_RELOAD_PENDING.store(true, Ordering::SeqCst);
+    request_retile();
+}
 pub fn is_ignored_class(class: &str) -> bool {
     let cfg = CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     cfg.ignore.classes.iter().any(|c| c == class)
@@ -432,7 +442,7 @@ fn main() {
     for (k,v) in &cli_overrides {
         match k.as_str() {
             "no-taskbar" => { cfg.general.taskbar = false; cfg.panels.clear(); }
-            "gap" => if let Ok(g)=v.parse::<i32>(){ cfg.general.gap = g; }
+            "gap" => if let Ok(g)=v.parse::<i32>(){ cfg.general.gap = g.max(0); }
             "layout" => cfg.general.layout = v.clone(),
             _ => {}
         }
@@ -548,9 +558,10 @@ fn main() {
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
-            // auto-reload from file watcher (debounced, checks atomic flag)
-            if watcher::should_reload() {
-                println!("[watcher] config changed -> reloading");
+            // Reload requests can originate from a file-watch event, a widget action, or Rhai.
+            let watcher_reload = watcher::should_reload();
+            if watcher_reload || CONFIG_RELOAD_PENDING.swap(false, Ordering::SeqCst) {
+                println!("[config] {} -> reloading", if watcher_reload { "file changed" } else { "action requested" });
                 let explicit = CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let (new_cfg, new_path) = config::load_or_default(explicit.as_deref());
                 apply_config_reload(new_cfg, new_path, &mut panel_handles, &mut taskbar_hwnd);

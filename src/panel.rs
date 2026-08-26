@@ -56,8 +56,6 @@ unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
     match msg {
         WM_CREATE => {
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 1000, None);
-            // also custom widget max interval
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, 250, None);
             LRESULT(0)
         }
         WM_TIMER => {
@@ -69,9 +67,11 @@ unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         WM_PAINT => {
             // find panel
             let panels_guard = PANELS.lock().unwrap_or_else(|e| e.into_inner());
-            let panels = panels_guard.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
-            let panel = panels.iter().find(|p| p.hwnd == hwnd);
-            if let Some(p) = panel {
+            let panel_arc = panels_guard.as_ref().cloned();
+            drop(panels_guard);
+            if let Some(panel_arc) = panel_arc {
+                let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
                 let mut rect = RECT::default();
@@ -105,11 +105,12 @@ unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     x += wd;
                 }
                 let _ = EndPaint(hwnd, &ps);
-            } else {
-                let mut ps = PAINTSTRUCT::default();
-                let _hdc = BeginPaint(hwnd, &mut ps);
-                let _ = EndPaint(hwnd, &ps);
+                    return LRESULT(0);
+                }
             }
+            let mut ps = PAINTSTRUCT::default();
+            let _hdc = BeginPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -117,8 +118,11 @@ unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             // route to widget
             let panels_guard = PANELS.lock().unwrap_or_else(|e| e.into_inner());
-            let panels = panels_guard.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
+            let panel_arc = panels_guard.as_ref().cloned();
+            drop(panels_guard);
+            if let Some(panel_arc) = panel_arc {
+                let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
                 let vertical = matches!(p.cfg.position.as_str(), "left" | "right");
@@ -141,6 +145,7 @@ unsafe extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         break;
                     }
                     cur+=wd;
+                }
                 }
             }
             LRESULT(0)
@@ -280,10 +285,7 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
             for wname in &pc.widgets {
                 if let Some(wcfg) = widget_map.get(wname) {
                     widgets_inst.push(widgets::create_widget(wcfg));
-                } else if wname == "spacer" {
-                    let wcfg = crate::config::WidgetConfig {
-                        widget_type: "spacer".into(), name: "spacer".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new()
-                    };
+                } else if let Some(wcfg) = crate::config::builtin_widget_config(wname) {
                     widgets_inst.push(widgets::create_widget(&wcfg));
                 } else {
                     eprintln!("[panel] unknown widget '{}' for panel '{}' — custom fallback", wname, pc.name);
@@ -309,6 +311,10 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
                 let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 apply_panel_chrome(hwnd);
+                // Keep sub-second widgets responsive without polling every panel at 250 ms.
+                if let Some(interval) = widgets_inst.iter().filter_map(|widget| widget.interval_ms()).min().filter(|interval| *interval < 1000) {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, interval, None);
+                }
             }
             println!("[panel] '{}' @ {},{} {}x{} monitor={} (target {}/{}) widgets={}", pc.name, x, y, w, h, pc.monitor, mon_idx+1, targets.len(), pc.widgets.join(","));
             handles.push(hwnd);

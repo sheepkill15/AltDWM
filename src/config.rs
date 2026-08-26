@@ -283,6 +283,14 @@ impl RuleConfig {
 }
 
 impl Config {
+    pub fn normalize(&mut self) {
+        self.general.gap = self.general.gap.max(0);
+        self.general.taskbar_height = self.general.taskbar_height.max(1);
+        for panel in &mut self.panels {
+            panel.height = panel.height.max(1);
+        }
+    }
+
     pub fn compile_regexes(&mut self) {
         for r in &mut self.rules { r.compile_regexes(); }
     }
@@ -294,7 +302,7 @@ impl Config {
             "floating" => Layout::Floating,
             "masterstack" | "master" | "bsp" | "tiling" => Layout::MasterStack,
             other => {
-                if self.layouts.contains_key(other) {
+                if self.layouts.keys().any(|name| name.eq_ignore_ascii_case(other)) {
                     // custom layout — handled by try_compute_custom, keep MasterStack as fallback enum
                 } else {
                     eprintln!("[config] unknown layout '{}' -> MasterStack", self.general.layout);
@@ -328,12 +336,39 @@ impl Config {
                 }
             }
         }
+        let mut widget_names = std::collections::HashSet::new();
+        for widget in &self.widgets {
+            if !widget_names.insert(&widget.name) {
+                warns.push(format!("duplicate widget name '{}'", widget.name));
+            }
+        }
         warns
     }
 }
 
+pub fn builtin_widget_config(name: &str) -> Option<WidgetConfig> {
+    let widget_type = match name {
+        "spacer" | "workspaces" | "window_title" | "tray" | "clock" | "launcher" | "window_list" => name,
+        _ => return None,
+    };
+    Some(WidgetConfig {
+        widget_type: widget_type.into(),
+        name: name.into(),
+        format: None,
+        interval: None,
+        script: None,
+        action: None,
+        command: None,
+        label: None,
+        icon: None,
+        width: None,
+        tooltip: None,
+        extra: HashMap::new(),
+    })
+}
+
 fn is_builtin_widget(name: &str) -> bool {
-    matches!(name, "spacer" | "workspaces" | "window_title" | "tray" | "clock" | "launcher")
+    builtin_widget_config(name).is_some()
 }
 
 // ------------------------------------------------------------------
@@ -372,6 +407,7 @@ pub fn default_config_path() -> PathBuf {
 pub fn load_from_path(path: &Path) -> Result<Config, String> {
     let data = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let mut cfg = toml::from_str::<Config>(&data).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    cfg.normalize();
     cfg.compile_regexes();
     Ok(cfg)
 }

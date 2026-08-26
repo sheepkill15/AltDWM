@@ -47,7 +47,9 @@ static LAYOUT_CACHE: LazyLock<Mutex<HashMap<String, (SystemTime, rhai::AST, Path
 /// Script must define `fn layout(n, left, top, right, bottom, gap)` returning array of maps with left/top/right/bottom
 pub fn try_compute_custom(n: usize, area: RECT, gap: i32, cfg: &crate::config::Config) -> Option<Vec<RECT>> {
     let name = cfg.general.layout.as_str();
-    let lc = cfg.layouts.get(name)?;
+    let lc = cfg.layouts.get(name).or_else(|| {
+        cfg.layouts.iter().find(|(layout_name, _)| layout_name.eq_ignore_ascii_case(name)).map(|(_, layout)| layout)
+    })?;
     let script_path = lc.script.as_deref()?;
     // resolve script path: try as given, then relative to config dir, then exe dir, then cwd
     let candidate_paths = {
