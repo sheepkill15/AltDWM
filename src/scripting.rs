@@ -2,8 +2,65 @@
 //! Sandboxed, sync engine. Exposed functions handle side effects.
 use rhai::{Engine, Scope, Dynamic};
 use std::sync::{OnceLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
+
+// ---- real CPU usage via GetSystemTimes ---------------------------------
+static PREV_IDLE: AtomicU64 = AtomicU64::new(0);
+static PREV_KERNEL: AtomicU64 = AtomicU64::new(0);
+static PREV_USER: AtomicU64 = AtomicU64::new(0);
+static PREV_TICK: std::sync::LazyLock<Mutex<Option<Instant>>> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+fn filetime_to_u64(ft: windows::Win32::Foundation::FILETIME) -> u64 {
+    ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+}
+
+fn get_cpu_usage_real() -> i64 {
+    use windows::Win32::System::Threading::GetSystemTimes;
+    unsafe {
+        let mut idle = windows::Win32::Foundation::FILETIME::default();
+        let mut kernel = windows::Win32::Foundation::FILETIME::default();
+        let mut user = windows::Win32::Foundation::FILETIME::default();
+        if GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_err() {
+            return 0;
+        }
+        let idle_u = filetime_to_u64(idle);
+        let kernel_u = filetime_to_u64(kernel);
+        let user_u = filetime_to_u64(user);
+        let prev_idle = PREV_IDLE.load(Ordering::Relaxed);
+        let prev_kernel = PREV_KERNEL.load(Ordering::Relaxed);
+        let prev_user = PREV_USER.load(Ordering::Relaxed);
+        let prev_tick = *PREV_TICK.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        PREV_IDLE.store(idle_u, Ordering::Relaxed);
+        PREV_KERNEL.store(kernel_u, Ordering::Relaxed);
+        PREV_USER.store(user_u, Ordering::Relaxed);
+        *PREV_TICK.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+        if prev_idle == 0 || prev_tick.is_none() {
+            return 0; // first call, need delta
+        }
+        let idle_delta = idle_u.saturating_sub(prev_idle);
+        let kernel_delta = kernel_u.saturating_sub(prev_kernel);
+        let user_delta = user_u.saturating_sub(prev_user);
+        let total = kernel_delta + user_delta;
+        if total == 0 { return 0; }
+        let busy = total.saturating_sub(idle_delta);
+        ((busy * 100) / total) as i64
+    }
+}
+
+fn get_mem_usage_real() -> i64 {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    unsafe {
+        let mut stat = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        if GlobalMemoryStatusEx(&mut stat).is_ok() {
+            return stat.dwMemoryLoad as i64;
+        }
+        0
+    }
+}
 
 fn build_engine() -> Engine {
     let mut eng = Engine::new();
@@ -15,12 +72,18 @@ fn build_engine() -> Engine {
     eng.register_fn("log", |msg: &str| {
         println!("[rhai] {}", msg);
     });
-    eng.register_fn("get_cpu_usage", || -> i64 { 42 });
+    eng.register_fn("get_cpu_usage", || -> i64 { get_cpu_usage_real() });
     eng.register_fn("focused_title", || -> String {
         unsafe {
             let hwnd = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
             crate::util::get_window_title(hwnd)
         }
+    });
+    eng.register_fn("get_mem_usage", || -> i64 { get_mem_usage_real() });
+    eng.register_fn("get_mem", || -> rhai::Map {
+        let mut m = rhai::Map::new();
+        m.insert("load".into(), rhai::Dynamic::from_int(get_mem_usage_real()));
+        m
     });
     eng.register_fn("retile", || {
         println!("[rhai] retile()");
@@ -40,6 +103,18 @@ fn build_engine() -> Engine {
     eng.register_fn("move_to_prev_monitor", || { crate::focus::move_focused_to_monitor("prev"); });
     eng.register_fn("shell", |cmd: &str| {
         let _ = std::process::Command::new("cmd").args(["/C", cmd]).spawn();
+    });
+    eng.register_fn("window_count", || -> i64 {
+        let tb = crate::taskbar::get_taskbar_hwnd();
+        let wins = crate::manager::collect_windows(tb);
+        wins.len() as i64
+    });
+    eng.register_fn("tilable_count", || -> i64 {
+        let tb = crate::taskbar::get_taskbar_hwnd();
+        let mut wins = crate::manager::collect_windows(tb);
+        wins.retain(|w| !crate::rules::is_floating(*w));
+        wins.retain(|w| crate::virtual_desktop::is_on_current_desktop(*w));
+        wins.len() as i64
     });
     eng
 }

@@ -6,7 +6,7 @@ Goal: let users configure **and change anything** without forking Rust code — 
 
 1. **No recompilation for most changes** — edit `config.toml` + optional `*.rhai` scripts and hit `Alt+Shift+C` (default, `Win+Shift` collides with Snipping Tool) to hot-reload.
 2. **Progressive disclosure** — simple TOML for 80% of users, full scripting for power users. Same file format powers both.
-3. **Stable Rust core, pluggable edges** — `Panel`, `Widget`, `Layout`, `Rule`, `Keybind` are traits. New types can be added as Rust `cdylib` plugins or as Rhai scripts without touching core.
+3. **Stable Rust core, pluggable edges** — `Panel`, `Widget`, `Layout`, `Rule`, `Keybind` form the extension boundary. New widget types are added in Rust through `create_widget`; Rhai covers text widgets, layouts, and actions.
 4. **Fail-safe** — bad config never crashes WM; falls back to defaults and logs. Shell replacement must not brick login.
 
 ## Stack choice — Why TOML + Rhai (not Lua/Python)?
@@ -47,9 +47,10 @@ Built-ins (v0.2):
 | widget | description | key config |
 |---|---|---|
 | `clock` | `Format: 09:41` | `format`, `interval` |
-| `workspaces` | Virtual desktop / workspace pills | `show_icons` |
+| `workspaces` | Current tiling layout and live tilable/floating count | `width` |
+| `window_list` | Clickable list of current desktop's tiled windows | `width` |
 | `window_title` | Active window title | `max_len` |
-| `tray` | System tray (`Shell_NotifyIcon`) | `icon_size` |
+| `tray` | Visual system-tray placeholder (notification-area hosting is not implemented) | `width` |
 | `spacer` | Flexible gap | `size` |
 | `launcher` | App grid / start button | `icon`, `command` |
 | `custom` | Rhai-drawn widget | `script`, `interval` |
@@ -67,7 +68,7 @@ pub trait Widget: Send {
 }
 ```
 
-Adding a widget = implement trait + `inventory::submit!{ WidgetFactory }` or drop a `plugins/my_widget.dll` built against `alt_dwm_api`.
+Adding a widget = implement the trait and add its branch in `create_widget`. Dynamic DLL plugins are not implemented.
 
 ### 3) Rules — auto-manage windows (like bspwm `bspc rule` / Hyprland `windowrule`)
 
@@ -76,9 +77,9 @@ Adding a widget = implement trait + `inventory::submit!{ WidgetFactory }` or dro
 match_class = "Discord"
 match_title = ".*YouTube.*"
 monitor = 2
-layout = "floating"
+floating = true
 opacity = 0.9
-on_create = "rhai: move_to_workspace(2)"
+on_create = "rhai: focus_next()"
 ```
 
 Matcher uses class/title/process regex; action can be declarative or Rhai.
@@ -89,10 +90,10 @@ Built-ins: `MasterStack`, `Grid`, `Monocle`, `Floating`. Custom:
 
 ```toml
 [layouts.my_spiral]
-script = "scripts/spiral.rhai"   # fn layout(wins, area) -> [rects]
+script = "scripts/spiral.rhai"   # fn layout(n, left, top, right, bottom, gap) -> [rects]
 ```
 
-Rhai `layout` receives `windows.len()` + `area` rect and returns rect array — same engine as resize.
+Rhai `layout` receives window count, work-area bounds, and gap; it returns maps or arrays of `[left, top, right, bottom]`.
 
 ### 5) Keybinds & Actions — fully data-driven
 
@@ -103,10 +104,10 @@ action = "retile"
 
 [[keybinds]]
 keys = "Alt+Shift+1"
-action = "rhai: focus_workspace(1)"
+action = "focus_next()"
 ```
 
-Actions: `retile`, `toggle_tiling`, `set_layout("grid")`, `launch("wt.exe")`, `rhai: <code>`.
+Actions: `retile`, `toggle_tiling`, `set_layout("grid")`, `launch("wt.exe")`, `focus_next()`, `toggle_floating()`, `move_to_next_monitor()`, `rhai: <code>`.
 
 ### 6) Scripting — Rhai callbacks
 
@@ -129,11 +130,11 @@ Exposed API (via `rhai::Engine` in `src/scripting.rs`):
 ```
 launch(cmd)           // CreateProcess
 get_cpu_usage() -> int
-get_mem() -> map
+get_mem_usage() -> int / get_mem() -> map
 focused_title() -> string
-windows() -> array    // manageable HWNDs
+window_count() / tilable_count() -> int
 retile() / set_layout(str)
-move_to_workspace(n)
+focus_next() / focus_prev() / move_to_next_monitor()
 log(msg)
 ```
 
@@ -155,7 +156,7 @@ plugins/
 ## Hot reload & safety
 
 - `Alt+Shift+C` (default) or `FileSystemWatcher` on `config.toml` → `Config::load_or_default` → diff → recreate panels without killing WM.
-- Parse errors → log + `MessageBoxW` (if not headless) + keep last good config. Never leave user without a shell.
+- Parse errors → log + default configuration fallback. The current implementation does not show a MessageBox.
 - `alt-dwm --check-config` validates without applying.
 
 ## Example full config
@@ -204,9 +205,9 @@ action = "launch('wt.exe')"
 
 ## Roadmap (commits)
 
-1. **Done**: basic `config.toml` (`general`+`ignore`) + path discovery (`src/config.rs:109`)
-2. **Next (this PR)**: extend to `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`, widget trait scaffold, Panel manager, TOML-only widgets
-3. **Follow-up**: `rhai` engine + `scripts/*.rhai` for custom widgets/layouts/callbacks
-4. **Later**: Rust `cdylib` plugin loader + systray + virtual-desktop workspaces + `uiAccess` manifest
+1. **Done**: `config.toml` (`general`+`ignore`) + path discovery.
+2. **Done**: `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`, widget trait scaffold, panel manager, TOML widgets.
+3. **Done**: Rhai engine + `scripts/*.rhai` for custom widgets/layouts/callbacks.
+4. **Later**: real notification-area hosting, virtual-desktop workspace switching, elevated-window hook DLL, optional plugin ABI.
 
 This keeps easy tasks easy (edit TOML) and hard tasks possible (Rhai/Rust) — same model as Linux WMs but native to Windows.

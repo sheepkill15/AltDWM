@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SetWindowPos, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER, SWP_FRAMECHANGED};
 
@@ -15,6 +15,22 @@ static RUNTIME_FLOATING: LazyLock<Mutex<HashSet<isize>>> = LazyLock::new(|| Mute
 
 pub fn is_runtime_floating(hwnd: HWND) -> bool {
     RUNTIME_FLOATING.lock().unwrap_or_else(|e| e.into_inner()).contains(&(hwnd.0 as isize))
+}
+
+fn prune_stale_floating() {
+    // Remove destroyed windows only — keep IsWindow==true entries (floating windows may be cloaked)
+    let mut to_remove = Vec::new();
+    {
+        let set = RUNTIME_FLOATING.lock().unwrap_or_else(|e| e.into_inner());
+        for k in set.iter() {
+            let hwnd = HWND(*k as *mut std::ffi::c_void);
+            unsafe { if !windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)).as_bool() { to_remove.push(*k); } }
+        }
+    }
+    if !to_remove.is_empty() {
+        let mut set = RUNTIME_FLOATING.lock().unwrap_or_else(|e| e.into_inner());
+        for k in to_remove { set.remove(&k); }
+    }
 }
 pub fn toggle_floating_focused() {
     let hwnd = unsafe { GetForegroundWindow() };
@@ -67,6 +83,7 @@ pub fn move_focused_to_monitor(dir: &str) {
 
 /// Get tilable windows in tiling order (same as manager)
 fn tilable_windows() -> Vec<HWND> {
+    prune_stale_floating();
     let tb = taskbar::get_taskbar_hwnd();
     let mut wins = collect_windows(tb);
     wins.retain(|hwnd| !crate::rules::is_floating(*hwnd) && !is_runtime_floating(*hwnd));

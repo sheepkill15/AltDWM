@@ -405,15 +405,6 @@ pub fn save_to_path(cfg: &Config, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn ensure_default_file(explicit: Option<&Path>) -> Result<PathBuf, String> {
-    let path = find_config_path(explicit).unwrap_or_else(default_config_path);
-    if !path.exists() {
-        let cfg = example_config_with_panels();
-        save_to_path(&cfg, &path)?;
-    }
-    Ok(path)
-}
-
 /// Example that demonstrates full DSL — used by --generate-config
 pub fn example_config_with_panels() -> Config {
     let mut cfg = Config::default();

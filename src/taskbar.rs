@@ -1,16 +1,15 @@
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM, RECT, SYSTEMTIME};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM, RECT, SYSTEMTIME};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, MonitorFromWindow,
-    SetBkMode, SetTextColor, TextOutW, HBRUSH, PAINTSTRUCT, TRANSPARENT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, SetBkMode, SetTextColor, TextOutW, HBRUSH,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, GetSystemMetrics, RegisterClassExW, ShowWindow,
-    PostQuitMessage, SystemParametersInfoW, SPI_GETWORKAREA, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    HMENU, MSG, SW_SHOW, WM_CREATE, WM_DESTROY, WM_PAINT, WM_TIMER, WM_LBUTTONDOWN, WNDCLASSEXW,
+    CS_HREDRAW, CS_VREDRAW, HMENU, SW_SHOW, WM_CREATE, WM_DESTROY, WM_PAINT, WM_TIMER, WM_LBUTTONDOWN, WNDCLASSEXW,
     WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE, SM_CXSCREEN, SM_CYSCREEN,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, HWND_TOPMOST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, HWND_TOPMOST,
 };
 
 pub const TASKBAR_HEIGHT: i32 = 40;
@@ -52,7 +51,7 @@ unsafe extern "system" fn taskbar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                 st.wHour, st.wMinute, st.wSecond
             );
             let wide: Vec<u16> = time_str.encode_utf16().collect();
-            TextOutW(hdc, 10, 12, &wide);
+            let _ = TextOutW(hdc, 10, 12, &wide);
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_font);
             let _ = windows::Win32::Graphics::Gdi::DeleteObject(font.into());
             let _ = EndPaint(hwnd, &ps);
@@ -64,6 +63,7 @@ unsafe extern "system" fn taskbar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
         }
         WM_DESTROY => {
             let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 1);
+            TASKBAR_HWND.store(0, std::sync::atomic::Ordering::SeqCst);
             // don't PostQuitMessage — only host posts quit (taskbar is not main)
             LRESULT(0)
         }

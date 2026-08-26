@@ -102,7 +102,6 @@ impl Widget for TrayWidget {
         unsafe {
             let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
             let icon_sz = 16;
-            let gap = 6;
             let mut x = rect.left + 8;
             let y = rect.top + (rect.bottom - rect.top - icon_sz) / 2;
             let colors = [theme.accent_color().0, 0x2AA198 as u32, 0x859900 as u32, theme.border_color().0];
@@ -114,7 +113,7 @@ impl Widget for TrayWidget {
                 if theme.rounding > 0 {
                     let hbr = br;
                     let hrgn = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(r.left, r.top, r.right, r.bottom, theme.rounding, theme.rounding);
-                    windows::Win32::Graphics::Gdi::FillRgn(hdc, hrgn, hbr);
+                    let _ = windows::Win32::Graphics::Gdi::FillRgn(hdc, hrgn, hbr);
                     let _ = windows::Win32::Graphics::Gdi::DeleteObject(hrgn.into());
                     let _ = windows::Win32::Graphics::Gdi::DeleteObject(hbr.into());
                 } else {
@@ -143,17 +142,46 @@ impl Widget for TrayWidget {
 pub struct WorkspacesWidget { pub cfg: WidgetConfig }
 impl Widget for WorkspacesWidget {
     fn name(&self) -> &str { &self.cfg.name }
-    fn width(&self, _ctx: &PanelCtx) -> i32 { self.cfg.width.unwrap_or(140) }
+    fn width(&self, _ctx: &PanelCtx) -> i32 { self.cfg.width.unwrap_or(180) }
     fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
         unsafe {
             let theme = crate::CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).theme.clone();
             let font = crate::theme::get_cached_font(&theme);
             let old = windows::Win32::Graphics::Gdi::SelectObject(hdc, font.into());
             SetBkMode(hdc, TRANSPARENT);
+            // real counts: tilable windows + layout
+            let tb = crate::taskbar::get_taskbar_hwnd();
+            let mut wins = crate::manager::collect_windows(tb);
+            wins.retain(|w| !crate::rules::is_floating(*w) && !crate::focus::is_runtime_floating(*w));
+            wins.retain(|w| crate::virtual_desktop::is_on_current_desktop(*w));
+            let count = wins.len();
+            let layout = crate::CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()).name();
+            let tiling = if crate::TILING_ENABLED.load(std::sync::atomic::Ordering::SeqCst) { "" } else { " [PAUSED]" };
+            // include panel monitor context
+            let txt = format!("WS {} | {}{} ", count, layout, tiling);
+            // pills: highlight first pill as active
+            let pill_w = 56;
+            let y = rect.top + 6;
+            let mut x = rect.left + 4;
+            // active pill
+            let r_active = RECT { left: x, top: y, right: x+pill_w, bottom: y+20 };
+            let hrgn = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(r_active.left, r_active.top, r_active.right, r_active.bottom, theme.rounding, theme.rounding);
+            let br = windows::Win32::Graphics::Gdi::CreateSolidBrush(theme.accent_active_color());
+            let _ = windows::Win32::Graphics::Gdi::FillRgn(hdc, hrgn, br);
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(hrgn.into());
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(br.into());
             SetTextColor(hdc, theme.text_color());
-            let txt = "WS 1  2  3";
             let wide: Vec<u16> = txt.encode_utf16().collect();
-            let _ = TextOutW(hdc, rect.left + 6, rect.top + 12, &wide);
+            let _ = TextOutW(hdc, x+6, y+2, &wide);
+            x += pill_w + 6;
+            // extra info: total manageable (including floating)
+            let total = crate::manager::collect_windows(tb).len();
+            if total > count {
+                SetTextColor(hdc, theme.text_dim_color());
+                let extra = format!("+{} float", total - count);
+                let wide2: Vec<u16> = extra.encode_utf16().collect();
+                let _ = TextOutW(hdc, x, y+4, &wide2);
+            }
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old);
                     }
     }
@@ -200,7 +228,7 @@ impl Widget for WindowListWidget {
                 if theme.rounding > 0 {
                     let hrgn = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(r.left, r.top, r.right, r.bottom, theme.rounding, theme.rounding);
                     let br = windows::Win32::Graphics::Gdi::CreateSolidBrush(bg);
-                    windows::Win32::Graphics::Gdi::FillRgn(hdc, hrgn, br);
+                    let _ = windows::Win32::Graphics::Gdi::FillRgn(hdc, hrgn, br);
                     let _ = windows::Win32::Graphics::Gdi::DeleteObject(hrgn.into());
                     let _ = windows::Win32::Graphics::Gdi::DeleteObject(br.into());
                 } else {

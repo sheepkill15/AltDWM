@@ -64,7 +64,7 @@ Without `uiAccess`, `SetWindowPos` on elevated windows fails (`ERROR_ACCESS_DENI
 
 ## DPI
 
-Manifest declares `PerMonitorV2` (`alt-dwm.manifest`). `GetMonitorInfoW` + `GetSystemMetrics(SM_CXSCREEN)` are per-monitor aware. Test with mixed DPI monitors and `gap` changes.
+Manifest declares `PerMonitorV2` (`alt-dwm.manifest`). Panels and tiling derive display bounds from `GetMonitorInfoW`; test `monitor = "all"`, primary-only bars, and mixed-DPI displays.
 
 ## Troubleshooting
 

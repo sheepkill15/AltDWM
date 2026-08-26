@@ -1,8 +1,8 @@
-use windows::Win32::Foundation::{HWND, RECT, COLORREF};
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, IsIconic,
-    GetWindowLongPtrW, GetWindow, GetAncestor, GWL_EXSTYLE, GWL_STYLE, GA_ROOT, GW_OWNER,
+    GetWindowLongPtrW, GetWindow, GetAncestor, GWL_EXSTYLE, GA_ROOT, GW_OWNER,
     WS_EX_TOOLWINDOW, WS_EX_APPWINDOW,
 };
 
@@ -38,11 +38,11 @@ pub fn is_cloaked(hwnd: HWND) -> bool {
         )
     };
     if hr.is_err() {
-        // Fallback to raw value if enum variant not matched
+        // Fallback to raw value 14 if enum variant not matched (avoid transmute)
         let hr2 = unsafe {
             windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
                 hwnd,
-                std::mem::transmute(DWMWA_CLOAKED_U32),
+                windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_CLOAKED_U32 as i32),
                 &mut cloaked as *mut u32 as *mut _,
                 std::mem::size_of::<u32>() as u32,
             )

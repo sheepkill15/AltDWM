@@ -49,7 +49,7 @@ pub fn get_all_monitors() -> Vec<HMONITOR> {
     mons
 }
 
-fn hmonitor_for_target(target: &str) -> Option<HMONITOR> {
+pub fn hmonitor_for_target(target: &str) -> Option<HMONITOR> {
     let mons = get_all_monitors();
     if mons.is_empty() { return None; }
     let lower = target.to_lowercase();
@@ -86,6 +86,24 @@ fn hmonitor_for_target(target: &str) -> Option<HMONITOR> {
     None
 }
 
+fn panel_reserves_for_monitor(hmon: HMONITOR, cfg: &crate::config::Config) -> (i32, i32) {
+    let mut top = 0;
+    let mut bottom = 0;
+    for panel in &cfg.panels {
+        let applies = panel.monitor.eq_ignore_ascii_case("all")
+            || hmonitor_for_target(&panel.monitor).is_some_and(|target| target == hmon);
+        if !applies {
+            continue;
+        }
+        match panel.position.as_str() {
+            "top" => top += panel.height.max(0),
+            "bottom" => bottom += panel.height.max(0),
+            _ => {}
+        }
+    }
+    (top, bottom)
+}
+
 fn apply_window_chrome(hwnd: HWND, cfg: &crate::config::Config) {
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE};
     const DWMWCP_ROUND: u32 = 2;
@@ -105,74 +123,26 @@ fn get_work_area_for_hmonitor(hmon: HMONITOR, top_reserve: i32, bottom_reserve: 
         }
         let mut work = mi.rcWork;
         let is_primary = is_primary_monitor(&mi);
-        if top_reserve > 0 || bottom_reserve > 0 {
+        let (panel_top, panel_bottom) = if cfg.panels.is_empty() {
+            (top_reserve, bottom_reserve)
+        } else {
+            panel_reserves_for_monitor(hmon, cfg)
+        };
+        if panel_top > 0 || panel_bottom > 0 {
             let apply = if taskbar_hwnd.is_some() {
                 if let Some(tb) = taskbar_hwnd {
                     MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST) == hmon
                 } else { false }
-            } else {
-                let has_all = cfg.panels.iter().any(|p| p.monitor == "all");
-                has_all || is_primary
-            };
+            } else { !cfg.panels.is_empty() || is_primary };
             if apply {
-                work.top += top_reserve;
-                work.bottom -= bottom_reserve;
+                work.top += panel_top;
+                work.bottom -= panel_bottom;
             }
         }
         if work.bottom <= work.top { work.bottom = work.top + 100; }
         if work.right <= work.left { work.right = work.left + 100; }
         work
     }
-}
-
-fn get_work_area_for_hwnd(hwnd: HWND, top_reserve: i32, bottom_reserve: i32, taskbar_hwnd: Option<HWND>, cfg: &crate::config::Config) -> RECT {
-    unsafe {
-        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        let mut mi = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(hmon, &mut mi as *mut _ as *mut _).as_bool() {
-            return RECT {
-                left: 0,
-                top: top_reserve,
-                right: 1920,
-                bottom: 1080 - bottom_reserve,
-            };
-        }
-        let mut work = mi.rcWork;
-        let is_primary = is_primary_monitor(&mi);
-        // Reserve for panels / taskbar
-        // For legacy taskbar (taskbar_hwnd Some), only reserve on that monitor; for panels (None + reserves), reserve on primary / "all"
-        if top_reserve > 0 || bottom_reserve > 0 {
-            let apply = if taskbar_hwnd.is_some() {
-                // legacy: only monitor containing taskbar
-                if let Some(tb) = taskbar_hwnd {
-                    MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST) == hmon
-                } else { false }
-            } else {
-                let has_all = cfg.panels.iter().any(|p| p.monitor == "all");
-                has_all || is_primary
-            };
-            if apply {
-                work.top += top_reserve;
-                work.bottom -= bottom_reserve;
-            }
-        }
-        if work.bottom <= work.top {
-            work.bottom = work.top + 100;
-        }
-        if work.right <= work.left {
-            work.right = work.left + 100;
-        }
-        work
-    }
-}
-
-/// Tile all windows using the given layout.
-/// Legacy wrapper — only bottom reserved.
-pub fn tile_windows(taskbar_hwnd: Option<HWND>, taskbar_height: i32, layout: Layout, gap: i32) {
-    tile_windows_reserved(taskbar_hwnd, 0, taskbar_height, layout, gap)
 }
 
 /// Tile with explicit top/bottom reserves (for panels DSL)

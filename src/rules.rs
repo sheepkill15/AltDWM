@@ -10,13 +10,9 @@ fn matches_pattern(text: &str, pattern: &str, compiled: Option<&Regex>, regex_pa
     if let Some(re) = compiled {
         return re.is_match(text);
     }
-    if let Some(rx) = regex_pattern {
-        // fallback compile (should have been cached, but handle if called before compile)
-        if let Ok(re) = Regex::new(rx) {
-            return re.is_match(text);
-        } else {
-            eprintln!("[rules] invalid regex '{}'", rx);
-        }
+    if regex_pattern.is_some() {
+        // regex present but not compiled -> invalid, already warned in compile_regexes
+        return false;
     }
     if pattern.is_empty() { return false; }
     text.to_lowercase().contains(&pattern.to_lowercase())
@@ -38,12 +34,12 @@ pub fn rule_matches(hwnd: HWND, rule: &RuleConfig) -> bool {
         has_condition = true;
         let ok = matches_exact(&class, pat) || matches_pattern(&class, pat, rule.compiled_class_regex.as_ref(), rule.match_class_regex.as_ref());
         matched &= ok;
-    } else if rule.compiled_class_regex.is_some() || rule.match_class_regex.is_some() {
+    } else if rule.match_class_regex.is_some() {
         has_condition = true;
         if let Some(re) = rule.compiled_class_regex.as_ref() {
             matched &= re.is_match(&class);
-        } else if let Some(rx) = &rule.match_class_regex {
-            if let Ok(re) = Regex::new(rx) { matched &= re.is_match(&class); } else { matched = false; }
+        } else {
+            matched = false;
         }
     }
 
@@ -51,12 +47,10 @@ pub fn rule_matches(hwnd: HWND, rule: &RuleConfig) -> bool {
         has_condition = true;
         let ok = matches_pattern(&title, pat, rule.compiled_title_regex.as_ref(), rule.match_title_regex.as_ref());
         matched &= ok;
-    } else if rule.compiled_title_regex.is_some() || rule.match_title_regex.is_some() {
+    } else if rule.match_title_regex.is_some() {
         has_condition = true;
         if let Some(re) = rule.compiled_title_regex.as_ref() { matched &= re.is_match(&title); }
-        else if let Some(rx) = &rule.match_title_regex {
-            if let Ok(re) = Regex::new(rx) { matched &= re.is_match(&title); } else { matched = false; }
-        }
+        else { matched = false; }
     }
 
     if let Some(pat) = &rule.match_process {
@@ -131,14 +125,32 @@ pub fn rule_opacity(hwnd: HWND) -> Option<f32> {
     None
 }
 
+static OPACITY_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<isize, u8>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 pub fn apply_opacity(hwnd: HWND, opacity: f32) {
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, SetLayeredWindowAttributes, GWL_EXSTYLE, WS_EX_LAYERED, LWA_ALPHA};
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0) as u8;
+    {
+        let mut cache = OPACITY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&prev) = cache.get(&(hwnd.0 as isize)) {
+            if prev == alpha { return; }
+        }
+        cache.insert(hwnd.0 as isize, alpha);
+        // prune destroyed windows lazily
+        if cache.len() > 512 {
+            let mut dead = Vec::new();
+            for k in cache.keys() {
+                let h = HWND(*k as *mut std::ffi::c_void);
+                unsafe { if !windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(h)).as_bool() { dead.push(*k); } }
+            }
+            for k in dead { cache.remove(&k); }
+        }
+    }
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         if (ex & WS_EX_LAYERED.0) == 0 {
             let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex | WS_EX_LAYERED.0) as isize);
         }
-        let alpha = (opacity.clamp(0.0, 1.0) * 255.0) as u8;
         let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), alpha, LWA_ALPHA);
     }
 }

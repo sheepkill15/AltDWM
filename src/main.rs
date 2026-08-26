@@ -206,16 +206,6 @@ fn unregister_all_hotkeys() {
     }
 }
 
-// Hotkey IDs (legacy fallback, now dynamic)
-const HK_RETILE: i32 = 1;
-const HK_TOGGLE: i32 = 2;
-const HK_QUIT: i32 = 3;
-const HK_GRID: i32 = 4;
-const HK_MONOCLE: i32 = 5;
-const HK_FLOAT: i32 = 6;
-const HK_MASTERSTACK: i32 = 7;
-const HK_RELOAD: i32 = 8;
-
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
@@ -365,6 +355,39 @@ fn do_check_config(explicit: Option<&std::path::Path>) {
     std::process::exit(0);
 }
 
+fn apply_config_reload(new_cfg: config::Config, new_path: Option<PathBuf>, panel_handles: &mut Vec<HWND>, taskbar_hwnd: &mut Option<HWND>) {
+    for w in new_cfg.validate() { eprintln!("[config] warn: {}", w); }
+    *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.general.gap;
+    *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.layout_enum();
+    *CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
+    *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = new_path.clone();
+    register_keybinds(&new_cfg);
+    panel::destroy_panels();
+    panel_handles.clear();
+    // destroy legacy taskbar if panels now exist or taskbar disabled
+    if !new_cfg.panels.is_empty() || !new_cfg.general.taskbar {
+        if let Some(h) = taskbar_hwnd.take() {
+            unsafe { let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(h); }
+            TASKBAR_ENABLED.store(false, Ordering::SeqCst);
+        }
+    }
+    if !new_cfg.panels.is_empty() {
+        match panel::create_panels(&new_cfg) {
+            Ok(hs) => *panel_handles = hs,
+            Err(e) => eprintln!("[panel] recreate failed: {}", e),
+        }
+        TASKBAR_ENABLED.store(false, Ordering::SeqCst);
+    } else if new_cfg.general.taskbar {
+        if taskbar_hwnd.is_none() {
+            match taskbar::create_taskbar() {
+                Ok(h) => { *taskbar_hwnd = Some(h); TASKBAR_ENABLED.store(true, Ordering::SeqCst); },
+                Err(e) => { eprintln!("[taskbar] recreate failed: {}", e); TASKBAR_ENABLED.store(false, Ordering::SeqCst); },
+            }
+        }
+    }
+    if let Some(p) = new_path { watcher::spawn_watcher(p); }
+}
+
 fn main() {
     let _ = MAIN_TID.set(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
     print_banner();
@@ -444,19 +467,19 @@ fn main() {
 
     // --- panels vs legacy taskbar
     let mut panel_handles: Vec<HWND> = Vec::new();
-    let taskbar_hwnd = if !cfg.panels.is_empty() {
+    let mut taskbar_hwnd: Option<HWND> = if !cfg.panels.is_empty() {
         match panel::create_panels(&cfg) {
             Ok(hs) => { panel_handles = hs; None },
             Err(e) => { eprintln!("[panel] failed: {} -> fallback to taskbar", e); None }
         }
     } else { None };
 
-    let taskbar_hwnd = if taskbar_hwnd.is_none() && cfg.general.taskbar && cfg.panels.is_empty() {
+    if taskbar_hwnd.is_none() && cfg.general.taskbar && cfg.panels.is_empty() {
         match taskbar::create_taskbar() {
-            Ok(h) => Some(h),
-            Err(e) => { eprintln!("[taskbar] failed: {} - continuing without bar", e); TASKBAR_ENABLED.store(false, Ordering::SeqCst); None }
+            Ok(h) => taskbar_hwnd = Some(h),
+            Err(e) => { eprintln!("[taskbar] failed: {} - continuing without bar", e); TASKBAR_ENABLED.store(false, Ordering::SeqCst); }
         }
-    } else { taskbar_hwnd };
+    }
 
     // hotkeys — dynamic from config.toml [[keybinds]]
     register_keybinds(&cfg);
@@ -504,18 +527,7 @@ fn main() {
                         println!("[hotkey] reload config");
                         let explicit = CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let (new_cfg, new_path) = config::load_or_default(explicit.as_deref());
-                        for w in new_cfg.validate() { eprintln!("[config] warn: {}", w); }
-                        *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.general.gap;
-                        *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.layout_enum();
-                        *CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
-                        *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = new_path;
-                        // re-register hotkeys (config may have changed keybinds)
-                        register_keybinds(&new_cfg);
-                        panel::destroy_panels();
-                        if !new_cfg.panels.is_empty() {
-                            if let Ok(hs)=panel::create_panels(&new_cfg){ panel_handles=hs; }
-                        }
-                        // if panels cleared, recreate legacy taskbar if needed — for MVP just retile
+                        apply_config_reload(new_cfg, new_path, &mut panel_handles, &mut taskbar_hwnd);
                         request_retile();
                     } else if act == "retile" {
                         let l=*CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()); let g=*CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()); let cfg=CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -541,17 +553,7 @@ fn main() {
                 println!("[watcher] config changed -> reloading");
                 let explicit = CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let (new_cfg, new_path) = config::load_or_default(explicit.as_deref());
-                for w in new_cfg.validate() { eprintln!("[config] warn: {}", w); }
-                *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.general.gap;
-                *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.layout_enum();
-                *CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
-                *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = new_path.clone();
-                register_keybinds(&new_cfg);
-                panel::destroy_panels();
-                if !new_cfg.panels.is_empty() {
-                    if let Ok(hs) = panel::create_panels(&new_cfg) { panel_handles = hs; }
-                }
-                if let Some(p) = new_path { watcher::spawn_watcher(p); }
+                apply_config_reload(new_cfg, new_path, &mut panel_handles, &mut taskbar_hwnd);
                 request_retile();
             }
         }

@@ -20,14 +20,13 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
-    "Win32_Globalization",
 ] }
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
-dirs = "5.0"
+toml = "1"
+dirs = "6"
 rhai = { version = "1.22", features = ["sync"] }
 regex = "1.11"
-notify = "6.1"
+notify = "8"
 
 [profile.dev]
 panic = "unwind"

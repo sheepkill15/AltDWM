@@ -7,7 +7,7 @@ use windows::Win32::UI::Shell::IVirtualDesktopManager;
 use windows::core::GUID;
 
 // CLSID_VirtualDesktopManager = {AA509086-5CA9-4C25-8F95-589D3C07B48A}
-const CLSID_VirtualDesktopManager: GUID = GUID::from_u128(0xaa509086_5ca9_4c25_8f95_589d3c07b48a);
+const CLSID_VIRTUAL_DESKTOP_MANAGER: GUID = GUID::from_u128(0xaa509086_5ca9_4c25_8f95_589d3c07b48a);
 
 /// Call once at startup to ensure COM initialized on main thread
 pub fn init() {
@@ -31,7 +31,7 @@ fn get_vdm() -> Option<IVirtualDesktopManager> {
         // not yet cached — create
         let res = unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            CoCreateInstance::<_, IVirtualDesktopManager>(&CLSID_VirtualDesktopManager, None, CLSCTX_ALL)
+            CoCreateInstance::<_, IVirtualDesktopManager>(&CLSID_VIRTUAL_DESKTOP_MANAGER, None, CLSCTX_ALL)
         };
         let opt = match res {
             Ok(m) => Some(m),
