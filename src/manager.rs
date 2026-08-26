@@ -1,7 +1,7 @@
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::core::BOOL;
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows,
@@ -32,6 +32,86 @@ unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
 fn is_primary_monitor(mi: &MONITORINFO) -> bool {
     mi.rcMonitor.left == 0 && mi.rcMonitor.top == 0
+}
+
+fn get_all_monitors() -> Vec<HMONITOR> {
+    let mut mons: Vec<HMONITOR> = Vec::new();
+    unsafe extern "system" fn enum_cb(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, lparam: LPARAM) -> BOOL {
+        let v = &mut *(lparam.0 as *mut Vec<HMONITOR>);
+        v.push(hmon);
+        BOOL(1)
+    }
+    unsafe {
+        let ptr = &mut mons as *mut Vec<HMONITOR> as isize;
+        let _ = EnumDisplayMonitors(None, None, Some(enum_cb), LPARAM(ptr));
+    }
+    mons
+}
+
+fn hmonitor_for_target(target: &str) -> Option<HMONITOR> {
+    let mons = get_all_monitors();
+    if mons.is_empty() { return None; }
+    let lower = target.to_lowercase();
+    if lower == "primary" || lower == "1" {
+        // primary is at (0,0), find it, else first
+        for &h in &mons {
+            unsafe {
+                let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                if GetMonitorInfoW(h, &mut mi as *mut _ as *mut _).as_bool() && is_primary_monitor(&mi) {
+                    return Some(h);
+                }
+            }
+        }
+        return Some(mons[0]);
+    }
+    if let Ok(idx) = lower.parse::<usize>() {
+        if idx >= 1 && idx <= mons.len() {
+            return Some(mons[idx - 1]);
+        }
+    }
+    if lower == "all" { return None; } // don't override
+    // try substring match on device name via MONITORINFOEXW
+    for &h in &mons {
+        unsafe {
+            let mut ex = MONITORINFOEXW { monitorInfo: MONITORINFO { cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32, ..Default::default() }, szDevice: [0; 32] };
+            if GetMonitorInfoW(h, &mut ex as *mut _ as *mut _ as *mut MONITORINFO).as_bool() {
+                let dev = String::from_utf16_lossy(&ex.szDevice).trim_matches(char::from(0)).to_string();
+                if dev.to_lowercase().contains(&lower) {
+                    return Some(h);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_work_area_for_hmonitor(hmon: HMONITOR, top_reserve: i32, bottom_reserve: i32, taskbar_hwnd: Option<HWND>) -> RECT {
+    unsafe {
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(hmon, &mut mi as *mut _ as *mut _).as_bool() {
+            return RECT { left: 0, top: top_reserve, right: 1920, bottom: 1080 - bottom_reserve };
+        }
+        let mut work = mi.rcWork;
+        let is_primary = is_primary_monitor(&mi);
+        if top_reserve > 0 || bottom_reserve > 0 {
+            let apply = if taskbar_hwnd.is_some() {
+                if let Some(tb) = taskbar_hwnd {
+                    MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST) == hmon
+                } else { false }
+            } else {
+                let cfg = crate::CURRENT_CONFIG.lock().unwrap();
+                let has_all = cfg.panels.iter().any(|p| p.monitor == "all");
+                has_all || is_primary
+            };
+            if apply {
+                work.top += top_reserve;
+                work.bottom -= bottom_reserve;
+            }
+        }
+        if work.bottom <= work.top { work.bottom = work.top + 100; }
+        if work.right <= work.left { work.right = work.left + 100; }
+        work
+    }
 }
 
 fn get_work_area_for_hwnd(hwnd: HWND, top_reserve: i32, bottom_reserve: i32, taskbar_hwnd: Option<HWND>) -> RECT {
@@ -139,14 +219,23 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
     let mut monitor_rects: HashMap<isize, RECT> = HashMap::new();
 
     for hwnd in windows {
-        unsafe {
-            let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            let key = hmon.0 as isize;
-            per_monitor.entry(key).or_default().push(hwnd);
-            if !monitor_rects.contains_key(&key) {
-                let area = get_work_area_for_hwnd(hwnd, top_reserve, bottom_reserve, taskbar_hwnd);
-                monitor_rects.insert(key, area);
+        // check rule for monitor override
+        let target_hmon = if let Some(mon_str) = crate::rules::rule_monitor(hwnd) {
+            if let Some(h) = hmonitor_for_target(&mon_str) {
+                println!("[manager] {:?} rule monitor='{}' -> hmon 0x{:x}", hwnd.0, mon_str, h.0 as usize);
+                h
+            } else {
+                eprintln!("[manager] rule monitor '{}' not found for {:?}", mon_str, hwnd.0);
+                unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
             }
+        } else {
+            unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
+        };
+        let key = target_hmon.0 as isize;
+        per_monitor.entry(key).or_default().push(hwnd);
+        if !monitor_rects.contains_key(&key) {
+            let area = get_work_area_for_hmonitor(target_hmon, top_reserve, bottom_reserve, taskbar_hwnd);
+            monitor_rects.insert(key, area);
         }
     }
 

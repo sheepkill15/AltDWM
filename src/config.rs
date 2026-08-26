@@ -391,7 +391,7 @@ pub fn example_config_with_panels() -> Config {
             monitor: "all".into(),
             margin: None,
             background: Some("#202020".into()),
-            widgets: vec!["workspaces".into(), "window_title".into(), "spacer".into(), "tray".into(), "clock".into()],
+            widgets: vec!["workspaces".into(), "window_list".into(), "spacer".into(), "tray".into(), "clock".into()],
             extra: HashMap::new(),
         },
         PanelConfig {
@@ -407,8 +407,9 @@ pub fn example_config_with_panels() -> Config {
     ];
     cfg.widgets = vec![
         WidgetConfig { widget_type: "workspaces".into(), name: "workspaces".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
+        WidgetConfig { widget_type: "window_list".into(), name: "window_list".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
         WidgetConfig { widget_type: "window_title".into(), name: "window_title".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
-        WidgetConfig { widget_type: "tray".into(), name: "tray".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: Some(200), tooltip: None, extra: HashMap::new() },
+        WidgetConfig { widget_type: "tray".into(), name: "tray".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: Some(220), tooltip: None, extra: HashMap::new() },
         WidgetConfig { widget_type: "clock".into(), name: "clock".into(), format: Some("%H:%M:%S".into()), interval: Some(1000), script: None, action: Some("rhai: launch(\"explorer.exe\")".into()), command: None, label: None, icon: None, width: Some(160), tooltip: None, extra: HashMap::new() },
         WidgetConfig { widget_type: "spacer".into(), name: "spacer".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
         WidgetConfig { widget_type: "launcher".into(), name: "launcher".into(), format: None, interval: None, script: None, action: Some("launch('explorer.exe')".into()), command: None, label: Some("Menu".into()), icon: None, width: Some(40), tooltip: Some("Launcher".into()), extra: HashMap::new() },

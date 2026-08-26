@@ -26,7 +26,7 @@ monitor = "all"
 background = "#202020"
 widgets = [
     "workspaces",
-    "window_title",
+    "window_list",
     "spacer",
     "tray",
     "clock",
@@ -49,13 +49,17 @@ type = "workspaces"
 name = "workspaces"
 
 [[widgets]]
+type = "window_list"
+name = "window_list"
+
+[[widgets]]
 type = "window_title"
 name = "window_title"
 
 [[widgets]]
 type = "tray"
 name = "tray"
-width = 200
+width = 220
 
 [[widgets]]
 type = "clock"
@@ -124,6 +128,26 @@ action = 'set_layout("MasterStack")'
 keys = "Alt+Shift+C"
 action = "reload_config"
 description = "Hot-reload config"
+
+[[keybinds]]
+keys = "Alt+Shift+J"
+action = "focus_next()"
+description = "Focus next window"
+
+[[keybinds]]
+keys = "Alt+Shift+K"
+action = "focus_prev()"
+description = "Focus prev window"
+
+[[keybinds]]
+keys = "Alt+Shift+H"
+action = "focus_prev()"
+description = "Focus prev (left)"
+
+[[keybinds]]
+keys = "Alt+Shift+L"
+action = "focus_next()"
+description = "Focus next (right)"
 
 [layouts.spiral]
 script = "scripts/spiral.rhai"

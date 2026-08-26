@@ -139,9 +139,75 @@ impl Widget for WorkspacesWidget {
             let _ = TextOutW(hdc, rect.left + 6, rect.top + 12, &wide);
         }
     }
-    fn on_click(&self, x: i32, _y: i32, ctx: &PanelCtx) -> Option<String> {
+    fn on_click(&self, x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> {
         let idx = (x - 6) / 28 + 1;
         Some(format!("rhai: focus_workspace({})", idx))
+    }
+}
+
+pub struct WindowListWidget { pub cfg: WidgetConfig }
+impl Widget for WindowListWidget {
+    fn name(&self) -> &str { &self.cfg.name }
+    fn width(&self, _ctx: &PanelCtx) -> i32 { 0 } // flex
+    fn draw(&self, hdc: HDC, rect: RECT, _ctx: &PanelCtx) {
+        unsafe {
+            SetBkMode(hdc, TRANSPARENT);
+            let wins = {
+                let tb = crate::taskbar::get_taskbar_hwnd();
+                let mut v = crate::manager::collect_windows(tb);
+                v.retain(|w| !crate::rules::is_floating(*w));
+                v.retain(|w| crate::virtual_desktop::is_on_current_desktop(*w));
+                v
+            };
+            let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+            let mut x = rect.left + 4;
+            let y = rect.top + 6;
+            let max_w = rect.right - rect.left - 8;
+            // draw each window as pill with title
+            for hwnd in wins {
+                let mut title = crate::util::get_window_title(hwnd);
+                if title.is_empty() { title = crate::util::get_class_name(hwnd); }
+                if title.len() > 16 { title.truncate(16); }
+                let is_active = hwnd.0 == fg.0;
+                let bg = if is_active { COLORREF(0x003A6EA5) } else { COLORREF(0x00303030) };
+                let fg_col = if is_active { COLORREF(0x00FFFFFF) } else { COLORREF(0x00CCCCCC) };
+                let txt = format!(" {} ", title);
+                let wide: Vec<u16> = txt.encode_utf16().collect();
+                // estimate width: 7px per char + 16 padding
+                let w = (txt.len() as i32 * 7 + 16).min(140);
+                if x + w > rect.right - 4 { break; }
+                let r = RECT { left: x, top: y, right: x+w, bottom: y+20 };
+                let br = windows::Win32::Graphics::Gdi::CreateSolidBrush(bg);
+                windows::Win32::Graphics::Gdi::FillRect(hdc, &r, br);
+                let _ = windows::Win32::Graphics::Gdi::DeleteObject(br.into());
+                SetTextColor(hdc, fg_col);
+                let _ = TextOutW(hdc, x+6, y+2, &wide);
+                x += w + 4;
+                if x > rect.right - 20 { break; }
+                if x > max_w + rect.left { break; }
+            }
+            if x == rect.left + 4 {
+                SetTextColor(hdc, COLORREF(0x00808080));
+                let txt = "— no windows —";
+                let wide: Vec<u16> = txt.encode_utf16().collect();
+                let _ = TextOutW(hdc, x, y+2, &wide);
+            }
+        }
+    }
+    fn on_click(&self, x: i32, _y: i32, _ctx: &PanelCtx) -> Option<String> {
+        let wins = {
+            let tb = crate::taskbar::get_taskbar_hwnd();
+            let mut v = crate::manager::collect_windows(tb);
+            v.retain(|w| !crate::rules::is_floating(*w));
+            v.retain(|w| crate::virtual_desktop::is_on_current_desktop(*w));
+            v
+        };
+        if wins.is_empty() { return None; }
+        // avg pill width ~80px, map click to index
+        let idx = ((x - 4) / 80).max(0) as usize % wins.len();
+        let hwnd = wins[idx];
+        crate::focus::focus_hwnd(hwnd);
+        None
     }
 }
 
@@ -207,6 +273,7 @@ pub fn create_widget(cfg: &WidgetConfig) -> Box<dyn Widget> {
         "clock" => Box::new(ClockWidget { cfg: cfg.clone() }),
         "spacer" => Box::new(SpacerWidget { cfg: cfg.clone() }),
         "window_title" | "title" => Box::new(WindowTitleWidget { cfg: cfg.clone() }),
+        "window_list" | "tasklist" => Box::new(WindowListWidget { cfg: cfg.clone() }),
         "tray" | "systray" => Box::new(TrayWidget { cfg: cfg.clone() }),
         "workspaces" | "workspaces_pills" => Box::new(WorkspacesWidget { cfg: cfg.clone() }),
         "launcher" | "start" => Box::new(LauncherWidget { cfg: cfg.clone() }),

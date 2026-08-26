@@ -80,3 +80,7 @@ pub fn focus_window_by_title_substr(substr: &str) {
         }
     }
 }
+
+pub fn focus_hwnd(hwnd: HWND) {
+    set_foreground(hwnd);
+}
