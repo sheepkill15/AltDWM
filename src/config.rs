@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::layout::Layout;
+
+// ------------------------------------------------------------------
+// Top-level Config — DSL root (see docs/EXTENSIBILITY.md)
+// ------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -9,43 +14,165 @@ pub struct Config {
     pub general: General,
     #[serde(default)]
     pub ignore: Ignore,
+
+    // v0.2 DSL — all optional, ignored if empty (backward compat with [general] only)
+    #[serde(default)]
+    pub panels: Vec<PanelConfig>,
+    #[serde(default)]
+    pub widgets: Vec<WidgetConfig>,
+    #[serde(default)]
+    pub rules: Vec<RuleConfig>,
+    #[serde(default)]
+    pub keybinds: Vec<KeybindConfig>,
+    #[serde(default)]
+    pub layouts: HashMap<String, LayoutConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct General {
-    /// gap between windows (inner + outer uniform for MVP)
     #[serde(default = "default_gap")]
     pub gap: i32,
-    /// initial layout name
     #[serde(default = "default_layout")]
     pub layout: String,
     #[serde(default = "default_taskbar")]
     pub taskbar: bool,
     #[serde(default = "default_taskbar_height")]
     pub taskbar_height: i32,
-    /// auto-tile on window events
     #[serde(default = "default_true")]
     pub auto_tile: bool,
+    /// extra height for vertical panels (not used yet)
+    #[serde(default)]
+    pub outer_gap: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Ignore {
-    /// class names to never tile (exact match)
     #[serde(default)]
     pub classes: Vec<String>,
-    /// substring match on title to ignore
     #[serde(default)]
     pub titles: Vec<String>,
-    /// process exe names to ignore (future, not used yet)
     #[serde(default)]
     pub processes: Vec<String>,
 }
+
+// ------------------------------------------------------------------
+// DSL pieces — Panel / Widget / Rule / Keybind / Layout
+// ------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelConfig {
+    pub name: String,
+    #[serde(default = "default_panel_position")]
+    pub position: String, // top | bottom | left | right
+    #[serde(default = "default_panel_height")]
+    pub height: i32,
+    #[serde(default = "default_monitor")]
+    pub monitor: String, // all | primary | 1 | 2 | "Dell U2720Q"
+    #[serde(default)]
+    pub margin: Option<[i32; 4]>, // top,right,bottom,left
+    #[serde(default)]
+    pub background: Option<String>, // hex "#202020" or "rhai: ..."
+    #[serde(default)]
+    pub widgets: Vec<String>, // ordered widget names
+    /// allow arbitrary future keys without parse error (extensibility)
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetConfig {
+    /// widget type: clock | workspaces | window_title | tray | spacer | launcher | custom | ...
+    #[serde(rename = "type", alias = "widget_type", alias = "kind")]
+    pub widget_type: String,
+    pub name: String,
+    /// strftime-like for clock, or template for custom
+    #[serde(default)]
+    pub format: Option<String>,
+    /// update interval ms
+    #[serde(default)]
+    pub interval: Option<u32>,
+    /// Rhai script path or inline `rhai: ...`
+    #[serde(default)]
+    pub script: Option<String>,
+    /// click action: launch cmd or rhai: ...
+    #[serde(default)]
+    pub action: Option<String>,
+    /// command for launcher / on_click
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// fixed width (0 = flex)
+    #[serde(default)]
+    pub width: Option<i32>,
+    #[serde(default)]
+    pub tooltip: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleConfig {
+    #[serde(default)]
+    pub match_class: Option<String>,
+    #[serde(default)]
+    pub match_title: Option<String>,
+    #[serde(default)]
+    pub match_process: Option<String>,
+    /// regex variant (if regex crate used)
+    #[serde(default)]
+    pub match_class_regex: Option<String>,
+    #[serde(default)]
+    pub match_title_regex: Option<String>,
+    #[serde(default)]
+    pub monitor: Option<String>,
+    #[serde(default)]
+    pub floating: Option<bool>,
+    #[serde(default)]
+    pub opacity: Option<f32>,
+    #[serde(default)]
+    pub layout: Option<String>,
+    #[serde(default)]
+    pub on_create: Option<String>, // rhai: ...
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeybindConfig {
+    /// "Win+Shift+R" etc
+    pub keys: String,
+    /// "retile" | "toggle_tiling" | "set_layout(\"grid\")" | "launch('wt.exe')" | "rhai: ..."
+    pub action: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LayoutConfig {
+    /// path to rhai script: fn layout(n, area) -> [rects]
+    #[serde(default)]
+    pub script: Option<String>,
+    #[serde(default)]
+    pub gap: Option<i32>,
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, toml::Value>,
+}
+
+// ------------------------------------------------------------------
+// Defaults helpers
+// ------------------------------------------------------------------
 
 fn default_gap() -> i32 { 8 }
 fn default_taskbar() -> bool { true }
 fn default_taskbar_height() -> i32 { 40 }
 fn default_true() -> bool { true }
 fn default_layout() -> String { "MasterStack".to_string() }
+fn default_panel_position() -> String { "bottom".to_string() }
+fn default_panel_height() -> i32 { 40 }
+fn default_monitor() -> String { "all".to_string() }
 
 impl Default for General {
     fn default() -> Self {
@@ -55,6 +182,22 @@ impl Default for General {
             taskbar: default_taskbar(),
             taskbar_height: default_taskbar_height(),
             auto_tile: default_true(),
+            outer_gap: None,
+        }
+    }
+}
+
+impl Default for PanelConfig {
+    fn default() -> Self {
+        Self {
+            name: "bottom".into(),
+            position: default_panel_position(),
+            height: default_panel_height(),
+            monitor: default_monitor(),
+            margin: None,
+            background: None,
+            widgets: vec!["workspaces".into(), "window_title".into(), "clock".into()],
+            extra: HashMap::new(),
         }
     }
 }
@@ -75,9 +218,27 @@ impl Default for Config {
                 titles: vec![],
                 processes: vec![],
             },
+            panels: vec![],
+            widgets: vec![],
+            rules: vec![],
+            keybinds: vec![
+                KeybindConfig { keys: "Win+Shift+R".into(), action: "retile".into(), description: Some("Retile windows".into()) },
+                KeybindConfig { keys: "Win+Shift+T".into(), action: "toggle_tiling".into(), description: Some("Toggle tiling".into()) },
+                KeybindConfig { keys: "Win+Shift+Q".into(), action: "quit".into(), description: Some("Quit AltDWM".into()) },
+                KeybindConfig { keys: "Win+Shift+G".into(), action: "set_layout(\"Grid\")".into(), description: Some("Grid layout".into()) },
+                KeybindConfig { keys: "Win+Shift+M".into(), action: "set_layout(\"Monocle\")".into(), description: None },
+                KeybindConfig { keys: "Win+Shift+F".into(), action: "set_layout(\"Floating\")".into(), description: None },
+                KeybindConfig { keys: "Win+Shift+S".into(), action: "set_layout(\"MasterStack\")".into(), description: None },
+                KeybindConfig { keys: "Win+Shift+C".into(), action: "reload_config".into(), description: Some("Hot-reload config".into()) },
+            ],
+            layouts: HashMap::new(),
         }
     }
 }
+
+// ------------------------------------------------------------------
+// Config helpers
+// ------------------------------------------------------------------
 
 impl Config {
     pub fn layout_enum(&self) -> Layout {
@@ -86,8 +247,13 @@ impl Config {
             "monocle" => Layout::Monocle,
             "floating" => Layout::Floating,
             "masterstack" | "master" | "bsp" | "tiling" => Layout::MasterStack,
-            _ => {
-                eprintln!("[config] unknown layout '{}' -> MasterStack", self.general.layout);
+            other => {
+                // also check custom layouts map
+                if self.layouts.contains_key(other) {
+                    eprintln!("[config] custom layout '{}' has script, falling back to MasterStack until scripting lands", other);
+                } else {
+                    eprintln!("[config] unknown layout '{}' -> MasterStack", self.general.layout);
+                }
                 Layout::MasterStack
             }
         }
@@ -96,55 +262,61 @@ impl Config {
     pub fn set_layout(&mut self, l: Layout) {
         self.general.layout = l.name().to_string();
     }
+
+    pub fn is_legacy_taskbar_mode(&self) -> bool {
+        self.panels.is_empty()
+    }
+
+    pub fn widget_by_name(&self, name: &str) -> Option<&WidgetConfig> {
+        self.widgets.iter().find(|w| w.name == name)
+    }
+
+    pub fn validate(&self) -> Vec<String> {
+        let mut warns = Vec::new();
+        for p in &self.panels {
+            if !["top","bottom","left","right"].contains(&p.position.as_str()) {
+                warns.push(format!("panel '{}' invalid position '{}'", p.name, p.position));
+            }
+            for w in &p.widgets {
+                if self.widget_by_name(w).is_none() && !is_builtin_widget(w) {
+                    warns.push(format!("panel '{}' references unknown widget '{}'", p.name, w));
+                }
+            }
+        }
+        warns
+    }
 }
 
-// --- path discovery ---
+fn is_builtin_widget(name: &str) -> bool {
+    matches!(name, "spacer" | "workspaces" | "window_title" | "tray" | "clock" | "launcher")
+}
 
-/// Search order:
-/// 1. explicit --config path
-/// 2. ./config.toml (next to exe)
-/// 3. %APPDATA%/AltDWM/config.toml  (dirs::config_dir)
-/// 4. ~/.config/altdwm/config.toml (dirs::config_dir fallback)
-/// 5. ./config.toml (cwd)
+// ------------------------------------------------------------------
+// Path discovery & I/O (unchanged, now supports expanded Config)
+// ------------------------------------------------------------------
+
 pub fn find_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         if p.exists() {
             return Some(p.to_path_buf());
         }
-        // explicit given but not found -> still return that path so caller can create there
         return Some(p.to_path_buf());
     }
-
-    // next to exe
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("config.toml");
-            if p.exists() {
-                return Some(p);
-            }
-            // also check AltDWM/config.toml next to exe dir? skip
+            if p.exists() { return Some(p); }
         }
     }
-
     if let Some(cfg_dir) = dirs::config_dir() {
         let p = cfg_dir.join("AltDWM").join("config.toml");
-        if p.exists() {
-            return Some(p);
-        }
+        if p.exists() { return Some(p); }
     }
-
     let cwd = PathBuf::from("config.toml");
-    if cwd.exists() {
-        return Some(cwd);
-    }
-
-    // default create location: %APPDATA%/AltDWM/config.toml if that dir exists, else ./config.toml
+    if cwd.exists() { return Some(cwd); }
     if let Some(cfg_dir) = dirs::config_dir() {
-        let p = cfg_dir.join("AltDWM").join("config.toml");
-        // return this as default even if not exists, so generate there
-        return Some(p);
+        return Some(cfg_dir.join("AltDWM").join("config.toml"));
     }
-
     Some(cwd)
 }
 
@@ -164,11 +336,10 @@ pub fn load_or_default(explicit: Option<&Path>) -> (Config, Option<PathBuf>) {
             match load_from_path(p) {
                 Ok(cfg) => {
                     println!("[config] loaded {}", p.display());
+                    for w in cfg.validate() { eprintln!("[config] warn: {}", w); }
                     return (cfg, Some(p.clone()));
                 }
-                Err(e) => {
-                    eprintln!("[config] failed to load {}: {} -> using defaults", p.display(), e);
-                }
+                Err(e) => eprintln!("[config] failed to load {}: {} -> using defaults", p.display(), e),
             }
         } else {
             println!("[config] no config at {} -> using defaults", p.display());
@@ -190,8 +361,51 @@ pub fn save_to_path(cfg: &Config, path: &Path) -> Result<(), String> {
 pub fn ensure_default_file(explicit: Option<&Path>) -> Result<PathBuf, String> {
     let path = find_config_path(explicit).unwrap_or_else(default_config_path);
     if !path.exists() {
-        let cfg = Config::default();
+        let cfg = example_config_with_panels();
         save_to_path(&cfg, &path)?;
     }
     Ok(path)
+}
+
+/// Example that demonstrates full DSL — used by --generate-config
+pub fn example_config_with_panels() -> Config {
+    let mut cfg = Config::default();
+    cfg.general.gap = 8;
+    cfg.general.layout = "MasterStack".into();
+    // add sample panels/widgets/rules so generated file is illustrative
+    cfg.panels = vec![
+        PanelConfig {
+            name: "bottom".into(),
+            position: "bottom".into(),
+            height: 40,
+            monitor: "all".into(),
+            margin: None,
+            background: Some("#202020".into()),
+            widgets: vec!["workspaces".into(), "window_title".into(), "spacer".into(), "tray".into(), "clock".into()],
+            extra: HashMap::new(),
+        },
+        PanelConfig {
+            name: "top".into(),
+            position: "top".into(),
+            height: 28,
+            monitor: "primary".into(),
+            margin: None,
+            background: Some("#1a1a1a".into()),
+            widgets: vec!["launcher".into(), "spacer".into(), "cpu".into()],
+            extra: HashMap::new(),
+        },
+    ];
+    cfg.widgets = vec![
+        WidgetConfig { widget_type: "workspaces".into(), name: "workspaces".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
+        WidgetConfig { widget_type: "window_title".into(), name: "window_title".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
+        WidgetConfig { widget_type: "tray".into(), name: "tray".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: Some(200), tooltip: None, extra: HashMap::new() },
+        WidgetConfig { widget_type: "clock".into(), name: "clock".into(), format: Some("%H:%M:%S".into()), interval: Some(1000), script: None, action: Some("rhai: launch(\"explorer.exe\")".into()), command: None, label: None, icon: None, width: Some(160), tooltip: None, extra: HashMap::new() },
+        WidgetConfig { widget_type: "spacer".into(), name: "spacer".into(), format: None, interval: None, script: None, action: None, command: None, label: None, icon: None, width: None, tooltip: None, extra: HashMap::new() },
+        WidgetConfig { widget_type: "launcher".into(), name: "launcher".into(), format: None, interval: None, script: None, action: Some("launch('explorer.exe')".into()), command: None, label: Some("Menu".into()), icon: None, width: Some(40), tooltip: Some("Launcher".into()), extra: HashMap::new() },
+        WidgetConfig { widget_type: "custom".into(), name: "cpu".into(), format: None, interval: Some(2000), script: Some("scripts/cpu.rhai".into()), action: None, command: None, label: None, icon: None, width: Some(120), tooltip: None, extra: HashMap::new() },
+    ];
+    cfg.rules = vec![
+        RuleConfig { match_class: Some("Spotify".into()), match_title: None, match_process: None, match_class_regex: None, match_title_regex: None, monitor: None, floating: Some(true), opacity: None, layout: None, on_create: None, extra: HashMap::new() },
+    ];
+    cfg
 }

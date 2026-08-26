@@ -4,101 +4,133 @@ Rust prototype that **proves** a full Explorer replacement is possible on Window
 
 > `explorer.exe` (taskbar + desktop + Start) **= replaceable** via `Winlogon\Shell`  
 > `dwm.exe` (compositor) **= NOT replaceable** — you hook it via `Win32`/`DWM` APIs instead.  
-> AltDWM does the latter: `SetWinEventHook` + `DeferWindowPos` + a custom taskbar.
+> AltDWM does the latter: `SetWinEventHook` + `DeferWindowPos` + declarative panels.
 
 Tested on Windows 11, 2 monitors, Rust 1.98 + `windows` 0.61.
 
-## What this prototype does
+## What this prototype does (0.2.0)
 
-- **Tiling WM** (`src/manager.rs`): enumerates top-level windows via `EnumWindows`, filters with `IsWindowVisible`, `IsIconic`, `DwmGetWindowAttribute(DWMWA_CLOAKED)`, `WS_EX_TOOLWINDOW`, `GetAncestor(GA_ROOT)`, etc. (`src/util.rs:15`). Groups per-monitor via `MonitorFromWindow`/`GetMonitorInfoW` and tiles with `BeginDeferWindowPos`/`DeferWindowPos`/`EndDeferWindowPos` atomic moves (`src/manager.rs:112`).
-- **Layouts** (`src/layout.rs:7`): `MasterStack` (60/40, stack right), `Grid`, `Monocle`, `Floating`.
-- **Event-driven** (`src/main.rs:43`): `SetWinEventHook` for `EVENT_SYSTEM_FOREGROUND`, `MINIMIZESTART/END`, `MOVESIZEEND`, `OBJECT_CREATE/DESTROY/SHOW/HIDE` (`WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`). Callback just sets `RETILE_PENDING`; a 200ms `WM_TIMER` on a message-only `AltDWM_Host` window does the actual `tile_windows` to avoid re-entrancy.
-- **Taskbar replacement** (`src/taskbar.rs:26`): `WS_EX_TOPMOST | WS_EX_TOOLWINDOW` popup at bottom (`1920x40`), `FillRect` + `TextOutW` clock, 1s timer. Reserves `40px` from work area so tiled windows don't overlap it. Excluded from tiling via class filter.
-- **Hotkeys** (`src/main.rs:274`): Thread `RegisterHotKey` (`Win+Shift+`):
-  - `R` retile, `T` toggle tiling, `Q` quit, `G` grid, `M` monocle, `F` floating, `S` masterStack
+- **Tiling WM** (`src/manager.rs:84`): `EnumWindows` + `IsWindowVisible`/`IsIconic`/`DwmGetWindowAttribute(DWMWA_CLOAKED)`/`WS_EX_TOOLWINDOW`/`GA_ROOT` (`src/util.rs:57`). Per-monitor `MonitorFromWindow`/`GetMonitorInfoW`; atomic `BeginDeferWindowPos`/`DeferWindowPos` (`src/manager.rs:150`).
+- **Layouts** (`src/layout.rs:7`): `MasterStack` (60/40), `Grid`, `Monocle`, `Floating` — pluggable via `[[layouts.my]] script="..."` (Rhai).
+- **Event-driven** (`src/main.rs:89`): `SetWinEventHook` for `FOREGROUND/MINIMIZE/MOVESIZE/OBJECT_*` (`WINEVENT_OUTOFCONTEXT`). 200ms `WM_TIMER` on `AltDWM_Host` (message-only) does `tile_windows_reserved`.
+- **Declarative panels DSL** (`src/config.rs:16`, `docs/EXTENSIBILITY.md`): TOML `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`. Multiple bars: `position=top|bottom|left|right`, `monitor=all|primary`, `widgets=[...]`. Example `examples/config.example.toml` has `bottom` (40px, `workspaces/title/spacer/tray/clock`) + `top` (28px, `launcher/spacer/cpu`).
+- **Widgets** (`src/widgets.rs:14` trait): `clock` (strftime `%H:%M:%S`), `workspaces`, `window_title` (foreground), `tray` (stub `Shell_NotifyIcon` sink), `spacer` (flex), `launcher`, `custom` (Rhai script returns text). `create_widget` factory + `extra` flattened map for forward-compat.
+- **Panels** (`src/panel.rs:47`): Each `[[panels]]` is a `WS_POPUP|WS_EX_TOPMOST` window (`AltDWM_Panel` class), flex layout for widgets, 1s + 250ms timers, click → `scripting::dispatch_action`.
+- **Scripting** (`src/scripting.rs:8`): Embedded `rhai` 1.26 engine. Exposes `launch(cmd)`, `log(msg)`, `get_cpu_usage()`, `focused_title()`, `retile()`, `set_layout(name)`. Any `action = "rhai: ..."` or `script = "scripts/cpu.rhai"` evaluated sandboxed.
+- **Config** (`src/config.rs:109`): Search `exe_dir/config.toml` → `%APPDATA%/AltDWM/config.toml` → `./config.toml`. `general`+`ignore` + `panels/widgets/rules/keybinds/layouts` with `flatten` extras for easy extend. `--config`, `--generate-config`, `--check-config`, `Win+Shift+C` hot-reload. `validate()` warns on bad panels.
+- **Hotkeys** (`src/main.rs:273`): Thread `RegisterHotKey` (`Win+Shift+`): `R` retile, `T` toggle, `Q` quit, `G` grid, `M` monocle, `F` floating, `S` masterStack, `C` reload config.
 
 ## Quick start
 
 ```powershell
-# cargo is in .cargo\bin - add to PATH for this shell
 $env:PATH += ";$HOME\.cargo\bin"
-
 cargo run -- --help
-cargo run -- --no-taskbar --gap 12 --layout grid   # tiling only
-cargo run                                           # tiling + 40px taskbar
+cargo run                                           # default taskbar 40px
+cargo run -- --no-taskbar --gap 12 --layout grid
+cargo run -- --config ./examples/config.example.toml  # panels DSL demo
+cargo run -- --generate-config   # writes %APPDATA%/AltDWM/config.toml
+cargo run -- --check-config      # validate
 
-# hotkeys while running:
-# Win+Shift+R retile, T toggle, Q quit, G/M/F/S switch layout
+# hotkeys: Win+Shift+R/T/Q/G/M/F/S/C (reload)
 ```
 
-Exit with `Win+Shift+Q` or `Ctrl+C` (kills process - no shell hook yet).
-
-## Verify shell-replacement capability
+## Verify shell-replacement capability (no registry touched automatically)
 
 ```powershell
-# 1. Build release
 cargo build --release  # -> target\release\alt-dwm.exe
+.\target\release\alt-dwm.exe --replace-shell  # prints reg commands only
 
-# 2. Print registry commands
-.\target\release\alt-dwm.exe --replace-shell
-
-# 3. (Safe test without reboot) kill Explorer, AltDWM keeps tiling:
+# safe test without reboot:
 taskkill /f /im explorer.exe
-# ... move windows, AltDWM retile still works (dwm.exe stays alive)
-explorer.exe   # restore
+# AltDWM keeps tiling (dwm.exe alive) -> explorer.exe to restore
 
-# 4. Real shell replacement (requires admin, logoff required):
-#    Copy exe to C:\AltDWM\alt-dwm.exe first!
+# real (requires admin, logoff):
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d "C:\AltDWM\alt-dwm.exe" /f
-# restore:
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d "explorer.exe" /f
-# per-user (no admin):
-reg add "HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d "C:\AltDWM\alt-dwm.exe" /f
+reg add "HKLM\..." /v Shell /d "explorer.exe" /f   # restore
 ```
+
+## Extensibility DSL
+
+See `docs/EXTENSIBILITY.md` + `examples/config.example.toml` + `scripts/*.rhai`.
+
+```toml
+[[panels]]
+name = "bottom"
+position = "bottom"
+height = 40
+monitor = "all"
+widgets = ["workspaces", "window_title", "spacer", "tray", "clock"]
+
+[[widgets]]
+type = "clock"
+name = "clock"
+format = "%H:%M:%S"
+interval = 1000
+action = 'rhai: launch("explorer.exe")'
+
+[[widgets]]
+type = "custom"
+name = "cpu"
+script = "scripts/cpu.rhai"
+interval = 2000
+
+[[rules]]
+match_class = "Spotify"
+floating = true
+
+[[keybinds]]
+keys = "Win+Return"
+action = "launch('wt.exe')"
+```
+
+Panels reserve `top`+`bottom` heights before tiling — e.g. `top 28 + bottom 40` → primary work `1920x964` at `0,28` (see log). Widgets implement `trait Widget` (`src/widgets.rs:21`) — add a Rust widget by `create_widget` + `extra` map, or a Rhai script, or a future `plugins/*.dll` cdylib.
 
 ## Project layout
 
 ```
-Cargo.toml           # windows = { version="0.61", features=[Win32_Foundation, Graphics_Gdi/Dwm, ...] } (src/main.rs imports)
-src/main.rs          # Arg parse, host window, WinEventHook, message loop, hotkeys
-src/manager.rs       # collect_windows, per-monitor DeferWindowPos tiling
-src/layout.rs        # MasterStack/Grid/Monocle/Floating rect math
-src/taskbar.rs       # AltDWM_Taskbar window
-src/util.rs          # is_cloaked, is_manageable, class/title helpers
+Cargo.toml  # windows 0.61 + serde/toml/dirs + rhai 1.26 + regex 1.13
+src/main.rs      # host window, WinEventHook, message loop, config hot-reload, hotkeys (public statics for crate::)
+src/config.rs    # Config{general,ignore,panels,widgets,rules,keybinds,layouts} + find/load/validate
+src/manager.rs   # collect_windows, tile_windows_reserved(top,bottom), per-monitor DeferWindowPos
+src/layout.rs    # MasterStack/Grid/Monocle/Floating + compute_layout
+src/taskbar.rs   # legacy AltDWM_Taskbar (fallback when no panels)
+src/panel.rs     # AltDWM_Panel — declarative panels from config
+src/widgets.rs   # Widget trait + clock/spacer/title/tray/workspaces/launcher/custom
+src/scripting.rs # rhai engine + dispatch_action
+src/util.rs      # is_cloaked, is_manageable (+ config ignore)
+docs/EXTENSIBILITY.md
+examples/config.example.toml
+scripts/cpu.rhai, spiral.rhai
 ```
 
-## Key APIs proven working (log from real run)
+## Key APIs proven (real log, 0.2.0 panels)
 
 ```
-[host] message-only window hwnd=0x80636
-[hotkey] registered Win+Shift+R/T/Q/G/M/F/S
-[hook] FOREGROUND 0x3-0x3 => ...
-[manager] tiling 3 windows with layout MasterStack gap=8
-  - 0x503bc class=Chrome_WidgetWin_1 title="OpenCode"
-[manager] monitor 0x40079 area "(0,0 1920x992)"   # primary, 40px reserved for AltDWM taskbar
-[manager] monitor 0x2008b area "(-1920,0 1920x1032)"  # secondary
-[manager] tiling committed
-[taskbar] created hwnd=0x205f6 1920x40 @ 0,1040
+[config] loaded C:\...\alt_test_cfg.toml
+[panel] 'bottom' @ 0,1040 1920x40 monitor=all widgets=workspaces,window_title,spacer,tray,clock
+[panel] 'top' @ 0,0 1920x28 monitor=primary widgets=launcher,spacer,cpu
+[manager] monitor 0x40079 area "(0,28 1920x964)"  # 28 top + 40 bottom reserved
+[manager] -> 0x2046a => 1148x948 @ 8,36
 ```
+
+Fallback (no panels) → `[taskbar] 1920x40 @ 0,1040` + `"(0,0 1920x992)"`.
 
 ## Why DWM is not replaceable
 
-- `dwm.exe` + `dwmcore.dll`/`udwm.dll` + `win32k.sys` own the `DirectComposition` swapchains since Vista. No `RegisterCompositor` API exists. Replacing would need a kernel driver + reimplementing `WDDM` presentation — breaks PatchGuard/SecureBoot and every update.  
-- All existing WMs (`GlazeWM`, `Komorebi`, `bug.n`, `FancyWM`, `Cairo`) keep `dwm.exe` and just call `DwmGet/SetWindowAttribute`, `DwmExtendFrame`, `SetWindowPos`. AltDWM follows that model.
-- For deeper tweaks (Mica, rounded corners, `IVirtualDesktopManagerInternal`) you need `MinHook`/`Detours` DLL injection into `explorer.exe`/`dwm.exe` — fragile, per-build offsets (see `Windhawk`, `ExplorerPatcher`). Left as future work.
+- `dwm.exe`+`dwmcore.dll`/`win32k.sys` own `DirectComposition` swapchains since Vista. No `RegisterCompositor` — would need kernel driver + `WDDM` reimpl, breaks PatchGuard. All WMs (`GlazeWM`, `Komorebi`, `Cairo`) keep `dwm.exe` and call `Dwm*`/`SetWindowPos`. For Mica/rounded corners/`IVirtualDesktopManagerInternal`, inject via `MinHook`/`Detours` (`Windhawk`) — per-build offsets.
 
 ## Next steps
 
-- `AltDHook.dll` (C++ `WH_CBT`/`WH_SHELL` hook) for windows that ignore `WinEvent` (elevated, `WS_EX_NOACTIVATE`).
-- `IVirtualDesktopManagerInternal` (COM in `twinui.pcshell.dll`) for workspaces.
-- System tray (`Shell_NotifyIcon` + `NOTIFYICONDATA`) and Start search (`ISearchManager`).
-- `uiAccess=true` manifest + signing to tile elevated windows.
-- Config file (`~/.config/altdwm/config.toml`) for gaps/layout per monitor.
+- `AltDHook.dll` (`WH_CBT`) for elevated windows
+- `IVirtualDesktopManager` + `IVirtualDesktopManagerInternal` workspaces
+- Real `Shell_NotifyIcon` systray sink
+- `uiAccess` manifest + signing
+- Rhai custom layouts (`fn layout(n, area) -> rects`)
 
 ## Build
 
 ```powershell
 cargo check
 cargo build
-cargo build --release  # lto + opt-level="z"
+cargo build --release  # lto + opt-level z
 ```

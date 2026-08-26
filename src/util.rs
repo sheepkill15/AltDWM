@@ -93,12 +93,14 @@ pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
         }
 
         let class = get_class_name(hwnd);
+        // hard-coded shell classes
         match class.as_str() {
             "Progman" => return false,
             "WorkerW" => return false,
             "Shell_TrayWnd" => return false,
             "Shell_SecondaryTrayWnd" => return false,
             "AltDWM_Taskbar" => return false,
+            "AltDWM_Panel" => return false,
             "AltDWM_Host" => return false,
             "Windows.UI.Core.CoreWindow" => {
                 let title = get_window_title(hwnd);
@@ -107,6 +109,14 @@ pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
                 }
             }
             _ => {}
+        }
+        // config-driven ignore (extensibility: user adds classes/titles in config.toml)
+        if crate::is_ignored_class(&class) {
+            return false;
+        }
+        let title = get_window_title(hwnd);
+        if !title.is_empty() && crate::is_ignored_title(&title) {
+            return false;
         }
 
         true

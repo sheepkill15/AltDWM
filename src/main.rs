@@ -1,35 +1,74 @@
+mod config;
 mod layout;
 mod manager;
+mod panel;
+mod scripting;
 mod taskbar;
 mod util;
+mod widgets;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, LazyLock};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-    RegisterClassExW, TranslateMessage, HMENU, HWND_MESSAGE, MSG, WM_HOTKEY, WM_TIMER, WM_CREATE,
-    WM_DESTROY, WNDCLASSEXW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-    EVENT_SYSTEM_MOVESIZEEND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage, RegisterClassExW,
+    TranslateMessage, HMENU, HWND_MESSAGE, MSG, WM_HOTKEY, WM_CREATE, WM_DESTROY, WM_TIMER, WNDCLASSEXW, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 use layout::Layout;
 use windows::core::w;
 
-// Global state
-static RETILE_PENDING: AtomicBool = AtomicBool::new(false);
-static TILING_ENABLED: AtomicBool = AtomicBool::new(true);
-static TASKBAR_ENABLED: AtomicBool = AtomicBool::new(true);
+// ------------------------------------------------------------------
+// Global state — pub for scripting/panel/util access
+// ------------------------------------------------------------------
+pub static RETILE_PENDING: AtomicBool = AtomicBool::new(false);
+pub static TILING_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static TASKBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 
-static CURRENT_LAYOUT: Mutex<Layout> = Mutex::new(Layout::MasterStack);
-static CURRENT_GAP: Mutex<i32> = Mutex::new(8);
+pub static CURRENT_LAYOUT: LazyLock<Mutex<Layout>> = LazyLock::new(|| Mutex::new(Layout::MasterStack));
+pub static CURRENT_GAP: LazyLock<Mutex<i32>> = LazyLock::new(|| Mutex::new(8));
+pub static CONFIG_PATH: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+pub static CURRENT_CONFIG: LazyLock<Mutex<config::Config>> = LazyLock::new(|| Mutex::new(config::Config::default()));
+
+// helpers for scripting / manager
+pub fn request_retile() { RETILE_PENDING.store(true, Ordering::SeqCst); }
+pub fn toggle_tiling() {
+    let enabled = !TILING_ENABLED.load(Ordering::SeqCst);
+    TILING_ENABLED.store(enabled, Ordering::SeqCst);
+    println!("[main] Tiling {}", if enabled { "ENABLED" } else { "DISABLED" });
+    if enabled { request_retile(); }
+}
+pub fn set_layout_by_name(name: &str) {
+    let layout = match name.to_lowercase().as_str() {
+        "grid" => Layout::Grid,
+        "monocle" => Layout::Monocle,
+        "floating" => Layout::Floating,
+        _ => Layout::MasterStack,
+    };
+    *CURRENT_LAYOUT.lock().unwrap() = layout;
+    {
+        let mut cfg = CURRENT_CONFIG.lock().unwrap();
+        cfg.set_layout(layout);
+    }
+    println!("[main] Layout -> {}", layout.name());
+    request_retile();
+}
+pub fn reload_config_async() { request_retile(); /* actual reload on next tick */ }
+pub fn is_ignored_class(class: &str) -> bool {
+    let cfg = CURRENT_CONFIG.lock().unwrap();
+    cfg.ignore.classes.iter().any(|c| c == class)
+}
+pub fn is_ignored_title(title: &str) -> bool {
+    let cfg = CURRENT_CONFIG.lock().unwrap();
+    cfg.ignore.titles.iter().any(|t| title.contains(t))
+}
 
 // Hotkey IDs
 const HK_RETILE: i32 = 1;
@@ -39,6 +78,7 @@ const HK_GRID: i32 = 4;
 const HK_MONOCLE: i32 = 5;
 const HK_FLOAT: i32 = 6;
 const HK_MASTERSTACK: i32 = 7;
+const HK_RELOAD: i32 = 8;
 
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
@@ -49,12 +89,12 @@ unsafe extern "system" fn win_event_proc(
     _event_thread: u32,
     _event_time: u32,
 ) {
-    if id_object != 0 {
-        return;
-    }
-    if hwnd.0.is_null() {
-        return;
-    }
+    if id_object != 0 { return; }
+    if hwnd.0.is_null() { return; }
+    if !TILING_ENABLED.load(Ordering::SeqCst) { return; }
+    // respect auto_tile from config
+    let auto = { CURRENT_CONFIG.lock().unwrap().general.auto_tile };
+    if !auto { return; }
     RETILE_PENDING.store(true, Ordering::SeqCst);
 }
 
@@ -68,17 +108,21 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_TIMER => {
             if wparam.0 == 100 {
+                // handle reload request if pending (checked via scripting flag? for now just retile)
                 if RETILE_PENDING.load(Ordering::SeqCst) && TILING_ENABLED.load(Ordering::SeqCst) {
                     RETILE_PENDING.store(false, Ordering::SeqCst);
+                    // compute panel/taskbar reservation — now top+bottom aware
+                    let cfg = CURRENT_CONFIG.lock().unwrap().clone();
+                    let gap = cfg.general.gap;
+                    let layout = cfg.layout_enum();
+                    let (top_reserve, bottom_reserve) = if !cfg.panels.is_empty() {
+                        let top: i32 = cfg.panels.iter().filter(|p| p.position=="top").map(|p| p.height).sum();
+                        let bottom: i32 = cfg.panels.iter().filter(|p| p.position=="bottom").map(|p| p.height).sum();
+                        (top, bottom)
+                    } else if cfg.general.taskbar { (0, cfg.general.taskbar_height) } else { (0,0) };
                     let taskbar_hwnd = taskbar::get_taskbar_hwnd();
-                    let gap = *CURRENT_GAP.lock().unwrap();
-                    let layout = *CURRENT_LAYOUT.lock().unwrap();
-                    let tb_height = if TASKBAR_ENABLED.load(Ordering::SeqCst) {
-                        taskbar::TASKBAR_HEIGHT
-                    } else {
-                        0
-                    };
-                    manager::tile_windows(taskbar_hwnd, tb_height, layout, gap);
+                    let reserve = if !cfg.panels.is_empty() { None } else { taskbar_hwnd };
+                    manager::tile_windows_reserved(reserve, top_reserve, bottom_reserve, layout, gap);
                 }
             }
             LRESULT(0)
@@ -100,12 +144,9 @@ fn create_host_window() -> Result<HWND, String> {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(host_wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
+            cbClsExtra: 0, cbWndExtra: 0,
             hInstance: hinstance.into(),
-            hIcon: Default::default(),
-            hCursor: Default::default(),
-            hbrBackground: Default::default(),
+            hIcon: Default::default(), hCursor: Default::default(), hbrBackground: Default::default(),
             lpszMenuName: windows::core::PCWSTR::null(),
             lpszClassName: class_name,
             hIconSm: Default::default(),
@@ -113,25 +154,15 @@ fn create_host_window() -> Result<HWND, String> {
         let atom = RegisterClassExW(&wc);
         if atom == 0 {
             let err = windows::Win32::Foundation::GetLastError();
-            if err.0 != 1410 {
-                return Err(format!("Host RegisterClassExW failed: {:?}", err));
-            }
+            if err.0 != 1410 { return Err(format!("Host RegisterClassExW failed: {:?}", err)); }
         }
         let hwnd = CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-            class_name,
-            w!("AltDWM Host"),
+            class_name, w!("AltDWM Host"),
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            Some(HWND_MESSAGE),
-            Some(HMENU(std::ptr::null_mut())),
-            Some(hinstance),
-            None,
-        )
-        .map_err(|e| format!("Host CreateWindowExW failed: {:?}", e))?;
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            Some(HWND_MESSAGE), Some(HMENU(std::ptr::null_mut())), Some(hinstance), None,
+        ).map_err(|e| format!("Host CreateWindowExW failed: {:?}", e))?;
         HOST_HWND = hwnd;
         println!("[host] message-only window hwnd={:?}", hwnd.0);
         Ok(hwnd)
@@ -142,10 +173,10 @@ fn print_banner() {
     println!(r#"
   ___   _ _   ___  _ _ _ _  
  / _ \ | | | |   \| | | | | 
-| |_| || | | | |) | | | | |  AltDWM 0.1.0 - Experimental Windows Shell
- \___/ |_|_| |___/|_|_|_|_|  Rust + Win32 + DWM (dwm.exe stays, explorer.exe replaced)
+| |_| || | | | |) | | | | |  AltDWM 0.2.0 - Experimental Windows Shell
+ \___/ |_|_| |___/|_|_|_|_|  Rust + Win32 + DWM (declarative panels + Rhai)
 "#);
-    println!("  Hotkeys (Win+Shift+): R=retile T=toggle tiling Q=quit G=grid M=monocle F=float S=masterStack");
+    println!("  Hotkeys (Win+Shift+): R=retile T=toggle Q=quit G=grid M=monocle F=float S=master C=reload");
     println!("  ---");
 }
 
@@ -153,124 +184,132 @@ fn print_help() {
     println!(r#"Usage: alt-dwm [OPTIONS]
 
 Options:
-  --no-taskbar       Disable taskbar replacement (only tiling WM)
-  --gap <px>         Gap between windows (default 8)
-  --layout <name>    Initial layout: masterstack, grid, monocle, floating (default masterstack)
-  --help             Show this help
-  --replace-shell    Print registry command to replace explorer.exe (requires admin)
+  --config <path>     Use explicit config.toml path
+  --generate-config   Write example config to default path and exit
+  --check-config      Validate config and exit
+  --no-taskbar        Disable taskbar/panels (only tiling)
+  --gap <px>          Override gap (default from config)
+  --layout <name>     Override layout: masterstack, grid, monocle, floating
+  --help              Show this help
+  --replace-shell     Print registry command to replace explorer.exe
 
 Examples:
   alt-dwm
+  alt-dwm --config ./config.toml
   alt-dwm --gap 12 --layout grid
-  alt-dwm --no-taskbar
+  alt-dwm --generate-config
+  alt-dwm --check-config
 
-Shell replacement (run as admin):
-  reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d "C:\path\to\alt-dwm.exe" /f
-  # Or per-user (no admin, logoff required):
-  reg add "HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d "C:\path\to\alt-dwm.exe" /f
-  # Restore:
-  reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d "explorer.exe" /f
-
-Note: dwm.exe is NOT replaceable on Windows 11. AltDWM tiles via SetWinEventHook + DeferWindowPos.
+Config search: ./config.toml -> exe_dir/config.toml -> %APPDATA%/AltDWM/config.toml -> ./config.toml
+DSL: see docs/EXTENSIBILITY.md + examples/config.example.toml
 "#);
 }
 
-fn parse_args() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut iter = args.iter().skip(1).peekable();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                print_help();
-                std::process::exit(0);
-            }
-            "--no-taskbar" => {
-                TASKBAR_ENABLED.store(false, Ordering::SeqCst);
-                println!("[args] taskbar disabled");
-            }
-            "--gap" => {
-                if let Some(v) = iter.next() {
-                    if let Ok(g) = v.parse::<i32>() {
-                        *CURRENT_GAP.lock().unwrap() = g;
-                        println!("[args] gap={}", g);
-                    }
-                }
-            }
-            "--layout" => {
-                if let Some(v) = iter.next() {
-                    let layout = match v.to_lowercase().as_str() {
-                        "grid" => Layout::Grid,
-                        "monocle" => Layout::Monocle,
-                        "floating" => Layout::Floating,
-                        "masterstack" | "master" | "bsp" => Layout::MasterStack,
-                        _ => {
-                            eprintln!("Unknown layout '{}', use masterstack|grid|monocle|floating", v);
-                            continue;
-                        }
-                    };
-                    *CURRENT_LAYOUT.lock().unwrap() = layout;
-                    println!("[args] layout={}", layout.name());
-                }
-            }
-            "--replace-shell" => {
-                let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("alt-dwm.exe"));
-                println!("\nTo REPLACE explorer.exe (shell) with AltDWM:");
-                println!("  1. Copy {} to a safe location (e.g. C:\\AltDWM\\alt-dwm.exe)", exe.display());
-                println!("  2. Run as ADMIN:");
-                println!("     reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"C:\\AltDWM\\alt-dwm.exe\" /f");
-                println!("  3. Log off/on or reboot. Kill explorer.exe to test: taskkill /f /im explorer.exe");
-                println!("  Restore: reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"explorer.exe\" /f");
-                println!("\nPer-user (no admin):");
-                println!("  reg add \"HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"{}\" /f", exe.display());
-                std::process::exit(0);
-            }
-            other => {
-                eprintln!("Unknown arg '{}' -- use --help", other);
-            }
-        }
+fn do_generate_config(explicit: Option<&std::path::Path>) {
+    let path = config::find_config_path(explicit).unwrap_or_else(config::default_config_path);
+    let cfg = config::example_config_with_panels();
+    match config::save_to_path(&cfg, &path) {
+        Ok(_) => println!("Generated example config at {}", path.display()),
+        Err(e) => { eprintln!("Failed to generate config: {}", e); std::process::exit(1); }
     }
+    std::process::exit(0);
+}
+
+fn do_check_config(explicit: Option<&std::path::Path>) {
+    let (cfg, path) = config::load_or_default(explicit);
+    println!("Config: {:?}", path);
+    println!("general: gap={} layout={} taskbar={}", cfg.general.gap, cfg.general.layout, cfg.general.taskbar);
+    let warns = cfg.validate();
+    if warns.is_empty() { println!("validate: ok"); } else { for w in warns { println!("warn: {}", w); } }
+    println!("panels: {}  widgets: {}  rules: {}  keybinds: {}", cfg.panels.len(), cfg.widgets.len(), cfg.rules.len(), cfg.keybinds.len());
+    std::process::exit(0);
 }
 
 fn main() {
     print_banner();
-    parse_args();
 
-    let gap = *CURRENT_GAP.lock().unwrap();
-    let layout = *CURRENT_LAYOUT.lock().unwrap();
-    println!(
-        "[main] starting - tiling={} layout={} gap={} taskbar={}",
-        TILING_ENABLED.load(Ordering::SeqCst),
-        layout.name(),
-        gap,
-        TASKBAR_ENABLED.load(Ordering::SeqCst)
-    );
-    println!(
-        "[main] pid={} exe={:?}",
-        std::process::id(),
-        std::env::current_exe().unwrap_or_default()
-    );
+    // --- early arg scan for --config / --generate-config / --check-config / --help
+    let args: Vec<String> = std::env::args().collect();
+    let mut explicit_cfg: Option<PathBuf> = None;
+    let mut do_generate = false;
+    let mut do_check = false;
+    let mut cli_overrides: Vec<(String,String)> = Vec::new();
+    let mut iter = args.iter().skip(1).peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--help" | "-h" => { print_help(); std::process::exit(0); }
+            "--config" => { if let Some(v)=iter.next(){ explicit_cfg = Some(PathBuf::from(v)); } }
+            "--generate-config" => do_generate = true,
+            "--check-config" => do_check = true,
+            "--replace-shell" => {
+                let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("alt-dwm.exe"));
+                println!("\nTo REPLACE explorer.exe (shell) with AltDWM:");
+                println!("  1. Copy {} to C:\\AltDWM\\alt-dwm.exe", exe.display());
+                println!("  2. Run as ADMIN: reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"C:\\AltDWM\\alt-dwm.exe\" /f");
+                println!("  3. Logoff/reboot. Test: taskkill /f /im explorer.exe -> alt-dwm will tile -> explorer.exe to restore");
+                println!("  Restore: reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"explorer.exe\" /f");
+                std::process::exit(0);
+            }
+            "--no-taskbar" => cli_overrides.push(("no-taskbar".into(), "".into())),
+            "--gap" => if let Some(v)=iter.next(){ cli_overrides.push(("gap".into(), v.clone())); },
+            "--layout" => if let Some(v)=iter.next(){ cli_overrides.push(("layout".into(), v.clone())); },
+            other => eprintln!("Unknown arg '{}' -- use --help", other),
+        }
+    }
+
+    if do_generate { do_generate_config(explicit_cfg.as_deref()); }
+    if do_check { do_check_config(explicit_cfg.as_deref()); }
+
+    // --- load config
+    let (mut cfg, cfg_path) = config::load_or_default(explicit_cfg.as_deref());
+    *CONFIG_PATH.lock().unwrap() = cfg_path.clone();
+    // apply CLI overrides (they win over file)
+    for (k,v) in &cli_overrides {
+        match k.as_str() {
+            "no-taskbar" => { cfg.general.taskbar = false; cfg.panels.clear(); }
+            "gap" => if let Ok(g)=v.parse::<i32>(){ cfg.general.gap = g; }
+            "layout" => cfg.general.layout = v.clone(),
+            _ => {}
+        }
+    }
+    // validate
+    for w in cfg.validate() { eprintln!("[config] warn: {}", w); }
+
+    // push to globals
+    *CURRENT_CONFIG.lock().unwrap() = cfg.clone();
+    *CURRENT_GAP.lock().unwrap() = cfg.general.gap;
+    *CURRENT_LAYOUT.lock().unwrap() = cfg.layout_enum();
+    TASKBAR_ENABLED.store(cfg.general.taskbar && cfg.panels.is_empty(), Ordering::SeqCst);
+    TILING_ENABLED.store(true, Ordering::SeqCst);
+
+    let gap = cfg.general.gap;
+    let layout = cfg.layout_enum();
+    println!("[main] config {:?} — gap={} layout={} taskbar={} panels={} widgets={} rules={} keybinds={}",
+        cfg_path, gap, layout.name(), cfg.general.taskbar, cfg.panels.len(), cfg.widgets.len(), cfg.rules.len(), cfg.keybinds.len());
+    println!("[main] pid={} exe={:?}", std::process::id(), std::env::current_exe().unwrap_or_default());
 
     let host_hwnd = match create_host_window() {
         Ok(h) => h,
-        Err(e) => {
-            eprintln!("[main] failed to create host window: {}", e);
-            return;
-        }
+        Err(e) => { eprintln!("[main] host failed: {}", e); return; }
     };
 
-    let taskbar_hwnd = if TASKBAR_ENABLED.load(Ordering::SeqCst) {
+    // --- panels vs legacy taskbar
+    let mut panel_handles: Vec<HWND> = Vec::new();
+    let taskbar_hwnd = if !cfg.panels.is_empty() {
+        match panel::create_panels(&cfg) {
+            Ok(hs) => { panel_handles = hs; None },
+            Err(e) => { eprintln!("[panel] failed: {} -> fallback to taskbar", e); None }
+        }
+    } else { None };
+
+    let taskbar_hwnd = if taskbar_hwnd.is_none() && cfg.general.taskbar && cfg.panels.is_empty() {
         match taskbar::create_taskbar() {
             Ok(h) => Some(h),
-            Err(e) => {
-                eprintln!("[taskbar] failed: {} - continuing without taskbar", e);
-                TASKBAR_ENABLED.store(false, Ordering::SeqCst);
-                None
-            }
+            Err(e) => { eprintln!("[taskbar] failed: {} - continuing without bar", e); TASKBAR_ENABLED.store(false, Ordering::SeqCst); None }
         }
-    } else {
-        None
-    };
+    } else { taskbar_hwnd };
 
+    // hotkeys — register built-ins + config keybinds (for now static set, future parse cfg.keybinds)
     unsafe {
         let mods = MOD_WIN | MOD_SHIFT | MOD_NOREPEAT;
         let ok = |id, vk| RegisterHotKey(None, id, mods, vk as u32);
@@ -281,33 +320,17 @@ fn main() {
         let _ = ok(HK_MONOCLE, 0x4D);
         let _ = ok(HK_FLOAT, 0x46);
         let _ = ok(HK_MASTERSTACK, 0x53);
-        println!("[hotkey] registered Win+Shift+R/T/Q/G/M/F/S");
+        let _ = ok(HK_RELOAD, 0x43); // C
+        println!("[hotkey] Win+Shift+R/T/Q/G/M/F/S/C (reload)");
+        // TODO: register cfg.keybinds dynamically via ParseKeys
     }
 
     let mut hooks: Vec<HWINEVENTHOOK> = Vec::new();
     unsafe {
         let mut try_hook = |event_min: u32, event_max: u32, label: &str| {
-            let h = SetWinEventHook(
-                event_min,
-                event_max,
-                None,
-                Some(win_event_proc),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-            );
-            if h.0.is_null() {
-                eprintln!(
-                    "[hook] SetWinEventHook failed for {} (0x{:x}-0x{:x}): {:?}",
-                    label,
-                    event_min,
-                    event_max,
-                    windows::Win32::Foundation::GetLastError()
-                );
-            } else {
-                println!("[hook] {} 0x{:x}-0x{:x} => {:?}", label, event_min, event_max, h.0);
-                hooks.push(h);
-            }
+            let h = SetWinEventHook(event_min, event_max, None, Some(win_event_proc), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+            if h.0.is_null() { eprintln!("[hook] {} failed: {:?}", label, windows::Win32::Foundation::GetLastError()); }
+            else { println!("[hook] {} 0x{:x}-0x{:x} => {:?}", label, event_min, event_max, h.0); hooks.push(h); }
         };
         try_hook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, "FOREGROUND");
         try_hook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, "MINIMIZE");
@@ -319,94 +342,67 @@ fn main() {
     }
 
     if TILING_ENABLED.load(Ordering::SeqCst) {
-        let tb_height = if TASKBAR_ENABLED.load(Ordering::SeqCst) {
-            taskbar::TASKBAR_HEIGHT
-        } else {
-            0
-        };
-        manager::tile_windows(taskbar_hwnd, tb_height, layout, gap);
+        let (top, bottom) = if !cfg.panels.is_empty() {
+            let t: i32 = cfg.panels.iter().filter(|p| p.position=="top").map(|p| p.height).sum();
+            let b: i32 = cfg.panels.iter().filter(|p| p.position=="bottom").map(|p| p.height).sum();
+            (t,b)
+        } else if TASKBAR_ENABLED.load(Ordering::SeqCst) { (0, taskbar::TASKBAR_HEIGHT) } else { (0,0) };
+        manager::tile_windows_reserved(taskbar_hwnd, top, bottom, layout, gap);
     }
 
-    println!("[main] entering message loop - press Win+Shift+Q to quit");
-    println!("[main] hint: to test shell replacement, run: taskkill /f /im explorer.exe  (then AltDWM will tile) -> run explorer.exe to restore");
-
+    println!("[main] message loop — Win+Shift+Q quit, C reload");
     let mut msg = MSG::default();
     unsafe {
         loop {
             let ret = GetMessageW(&mut msg, None, 0, 0);
-            // GetMessageW returns BOOL with -1 error, 0 WM_QUIT, >0 message
-            if ret.0 == 0 {
-                println!("[main] WM_QUIT received, exiting");
-                break;
-            }
-            if ret.0 == -1 {
-                eprintln!("[main] GetMessageW error: {:?}", windows::Win32::Foundation::GetLastError());
-                break;
-            }
-
+            if ret.0 == 0 { println!("[main] WM_QUIT"); break; }
+            if ret.0 == -1 { eprintln!("[main] GetMessageW {:?}", windows::Win32::Foundation::GetLastError()); break; }
             if msg.message == WM_HOTKEY {
                 let id = msg.wParam.0 as i32;
                 match id {
                     HK_RETILE => {
-                        println!("[hotkey] Retile");
-                        let tb_h = if TASKBAR_ENABLED.load(Ordering::SeqCst) {
-                            taskbar::TASKBAR_HEIGHT
-                        } else {
-                            0
-                        };
-                        let l = *CURRENT_LAYOUT.lock().unwrap();
-                        let g = *CURRENT_GAP.lock().unwrap();
-                        manager::tile_windows(taskbar_hwnd, tb_h, l, g);
+                        let l=*CURRENT_LAYOUT.lock().unwrap(); let g=*CURRENT_GAP.lock().unwrap(); let cfg=CURRENT_CONFIG.lock().unwrap().clone();
+                        let (top,bottom)= if !cfg.panels.is_empty(){
+                            let t: i32 = cfg.panels.iter().filter(|p| p.position=="top").map(|p| p.height).sum();
+                            let b: i32 = cfg.panels.iter().filter(|p| p.position=="bottom").map(|p| p.height).sum();
+                            (t,b)
+                        } else if TASKBAR_ENABLED.load(Ordering::SeqCst){ (0, taskbar::TASKBAR_HEIGHT)} else { (0,0)};
+                        manager::tile_windows_reserved(taskbar_hwnd, top, bottom, l, g);
                     }
-                    HK_TOGGLE => {
-                        let enabled = !TILING_ENABLED.load(Ordering::SeqCst);
-                        TILING_ENABLED.store(enabled, Ordering::SeqCst);
-                        println!("[hotkey] Tiling {}", if enabled { "ENABLED" } else { "DISABLED (-> floating)" });
-                        if enabled {
-                            RETILE_PENDING.store(true, Ordering::SeqCst);
+                    HK_TOGGLE => toggle_tiling(),
+                    HK_QUIT => break,
+                    HK_GRID => set_layout_by_name("Grid"),
+                    HK_MONOCLE => set_layout_by_name("Monocle"),
+                    HK_FLOAT => set_layout_by_name("Floating"),
+                    HK_MASTERSTACK => set_layout_by_name("MasterStack"),
+                    HK_RELOAD => {
+                        println!("[hotkey] reload config");
+                        let explicit = CONFIG_PATH.lock().unwrap().clone();
+                        let (new_cfg, new_path) = config::load_or_default(explicit.as_deref());
+                        for w in new_cfg.validate() { eprintln!("[config] warn: {}", w); }
+                        let gap = new_cfg.general.gap;
+                        *CURRENT_GAP.lock().unwrap() = gap;
+                        *CURRENT_LAYOUT.lock().unwrap() = new_cfg.layout_enum();
+                        *CURRENT_CONFIG.lock().unwrap() = new_cfg.clone();
+                        *CONFIG_PATH.lock().unwrap() = new_path;
+                        // recreate panels if they changed
+                        panel::destroy_panels();
+                        if !new_cfg.panels.is_empty() {
+                            if let Ok(hs)=panel::create_panels(&new_cfg){ panel_handles=hs; }
                         }
-                    }
-                    HK_QUIT => {
-                        println!("[hotkey] Quit");
-                        break;
-                    }
-                    HK_GRID => {
-                        *CURRENT_LAYOUT.lock().unwrap() = Layout::Grid;
-                        println!("[hotkey] Layout -> Grid");
-                        RETILE_PENDING.store(true, Ordering::SeqCst);
-                    }
-                    HK_MONOCLE => {
-                        *CURRENT_LAYOUT.lock().unwrap() = Layout::Monocle;
-                        println!("[hotkey] Layout -> Monocle");
-                        RETILE_PENDING.store(true, Ordering::SeqCst);
-                    }
-                    HK_FLOAT => {
-                        *CURRENT_LAYOUT.lock().unwrap() = Layout::Floating;
-                        println!("[hotkey] Layout -> Floating (no tiling)");
-                    }
-                    HK_MASTERSTACK => {
-                        *CURRENT_LAYOUT.lock().unwrap() = Layout::MasterStack;
-                        println!("[hotkey] Layout -> MasterStack");
-                        RETILE_PENDING.store(true, Ordering::SeqCst);
+                        request_retile();
                     }
                     _ => {}
                 }
                 continue;
             }
-
-            TranslateMessage(&msg);
+            let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-
-        println!("[main] cleaning up...");
-        for vk in [HK_RETILE, HK_TOGGLE, HK_QUIT, HK_GRID, HK_MONOCLE, HK_FLOAT, HK_MASTERSTACK] {
-            let _ = UnregisterHotKey(None, vk);
-        }
-        for h in hooks {
-            let _ = UnhookWinEvent(h);
-        }
-        let _ = host_hwnd;
+        for id in [HK_RETILE,HK_TOGGLE,HK_QUIT,HK_GRID,HK_MONOCLE,HK_FLOAT,HK_MASTERSTACK,HK_RELOAD] { let _=UnregisterHotKey(None,id); }
+        for h in hooks { let _=UnhookWinEvent(h); }
+        panel::destroy_panels();
+        let _=host_hwnd; let _=panel_handles;
     }
-
     println!("[main] bye");
 }

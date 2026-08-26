@@ -1,52 +1,127 @@
-# AltDWM example config — copy to %APPDATA%/AltDWM/config.toml or ./config.toml
-# Run: alt-dwm --generate-config  (will overwrite docs copy)
-# Hot reload: Win+Shift+C
-
 [general]
 gap = 8
-layout = "MasterStack"   # MasterStack | Grid | Monocle | Floating
-taskbar = true           # legacy shim -> creates a single bottom panel
+layout = "MasterStack"
+taskbar = true
 taskbar_height = 40
 auto_tile = true
 
 [ignore]
-classes = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "AltDWM_Taskbar", "AltDWM_Host"]
+classes = [
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "AltDWM_Taskbar",
+    "AltDWM_Host",
+]
 titles = []
 processes = []
 
-# --- v0.2 DSL (panels/widgets/rules/keybinds) — see docs/EXTENSIBILITY.md
-# Uncomment to try declarative panels (overrides [general].taskbar when present)
+[[panels]]
+name = "bottom"
+position = "bottom"
+height = 40
+monitor = "all"
+background = "#202020"
+widgets = [
+    "workspaces",
+    "window_title",
+    "spacer",
+    "tray",
+    "clock",
+]
 
-# [[panels]]
-# name = "bottom"
-# position = "bottom"   # top | bottom | left | right
-# height = 40
-# monitor = "all"       # all | primary | 1
-# widgets = ["workspaces", "window_title", "tray", "clock"]
+[[panels]]
+name = "top"
+position = "top"
+height = 28
+monitor = "primary"
+background = "#1a1a1a"
+widgets = [
+    "launcher",
+    "spacer",
+    "cpu",
+]
 
-# [[panels]]
-# name = "top"
-# position = "top"
-# height = 28
-# monitor = "primary"
-# widgets = ["launcher", "spacer", "clock"]
+[[widgets]]
+type = "workspaces"
+name = "workspaces"
 
-# [[widgets]]
-# type = "clock"
-# name = "clock"
-# format = "%H:%M:%S"
-# interval = 1000
+[[widgets]]
+type = "window_title"
+name = "window_title"
 
-# [[widgets]]
-# type = "custom"
-# name = "cpu"
-# script = "scripts/cpu.rhai"
-# interval = 2000
+[[widgets]]
+type = "tray"
+name = "tray"
+width = 200
 
-# [[rules]]
-# match_class = "Spotify"
-# floating = true
+[[widgets]]
+type = "clock"
+name = "clock"
+format = "%H:%M:%S"
+interval = 1000
+action = 'rhai: launch("explorer.exe")'
+width = 160
 
-# [[keybinds]]
-# keys = "Win+Return"
-# action = "launch('wt.exe')"
+[[widgets]]
+type = "spacer"
+name = "spacer"
+
+[[widgets]]
+type = "launcher"
+name = "launcher"
+action = "launch('explorer.exe')"
+label = "Menu"
+width = 40
+tooltip = "Launcher"
+
+[[widgets]]
+type = "custom"
+name = "cpu"
+interval = 2000
+script = "scripts/cpu.rhai"
+width = 120
+
+[[rules]]
+match_class = "Spotify"
+floating = true
+
+[[keybinds]]
+keys = "Win+Shift+R"
+action = "retile"
+description = "Retile windows"
+
+[[keybinds]]
+keys = "Win+Shift+T"
+action = "toggle_tiling"
+description = "Toggle tiling"
+
+[[keybinds]]
+keys = "Win+Shift+Q"
+action = "quit"
+description = "Quit AltDWM"
+
+[[keybinds]]
+keys = "Win+Shift+G"
+action = 'set_layout("Grid")'
+description = "Grid layout"
+
+[[keybinds]]
+keys = "Win+Shift+M"
+action = 'set_layout("Monocle")'
+
+[[keybinds]]
+keys = "Win+Shift+F"
+action = 'set_layout("Floating")'
+
+[[keybinds]]
+keys = "Win+Shift+S"
+action = 'set_layout("MasterStack")'
+
+[[keybinds]]
+keys = "Win+Shift+C"
+action = "reload_config"
+description = "Hot-reload config"
+
+[layouts]
