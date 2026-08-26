@@ -8,6 +8,7 @@ mod scripting;
 mod taskbar;
 mod util;
 mod virtual_desktop;
+mod watcher;
 mod widgets;
 
 use std::collections::HashMap;
@@ -389,6 +390,13 @@ fn main() {
     TASKBAR_ENABLED.store(cfg.general.taskbar && cfg.panels.is_empty(), Ordering::SeqCst);
     TILING_ENABLED.store(true, Ordering::SeqCst);
 
+    // spawn file watcher for auto-reload (config.toml -> hot-reload without restart)
+    if let Some(p) = cfg_path.clone() {
+        watcher::spawn_watcher(p);
+    } else {
+        watcher::spawn_watcher(config::default_config_path());
+    }
+
     let gap = cfg.general.gap;
     let layout = cfg.layout_enum();
     println!("[main] config {:?} — gap={} layout={} taskbar={} panels={} widgets={} rules={} keybinds={}",
@@ -494,6 +502,24 @@ fn main() {
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            // auto-reload from file watcher (debounced, checks atomic flag)
+            if watcher::should_reload() {
+                println!("[watcher] config changed -> reloading");
+                let explicit = CONFIG_PATH.lock().unwrap().clone();
+                let (new_cfg, new_path) = config::load_or_default(explicit.as_deref());
+                for w in new_cfg.validate() { eprintln!("[config] warn: {}", w); }
+                *CURRENT_GAP.lock().unwrap() = new_cfg.general.gap;
+                *CURRENT_LAYOUT.lock().unwrap() = new_cfg.layout_enum();
+                *CURRENT_CONFIG.lock().unwrap() = new_cfg.clone();
+                *CONFIG_PATH.lock().unwrap() = new_path.clone();
+                register_keybinds(&new_cfg);
+                panel::destroy_panels();
+                if !new_cfg.panels.is_empty() {
+                    if let Ok(hs) = panel::create_panels(&new_cfg) { panel_handles = hs; }
+                }
+                if let Some(p) = new_path { watcher::spawn_watcher(p); }
+                request_retile();
+            }
         }
         unregister_all_hotkeys();
         for h in hooks { let _=UnhookWinEvent(h); }

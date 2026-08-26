@@ -27,6 +27,7 @@ toml = "0.8"
 dirs = "5.0"
 rhai = { version = "1.22", features = ["sync"] }
 regex = "1.11"
+notify = "6.1"
 
 [profile.dev]
 panic = "abort"
