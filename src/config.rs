@@ -237,6 +237,10 @@ impl Default for Config {
                 KeybindConfig { keys: "Alt+Shift+F".into(), action: "set_layout(\"Floating\")".into(), description: None },
                 KeybindConfig { keys: "Alt+Shift+S".into(), action: "set_layout(\"MasterStack\")".into(), description: None },
                 KeybindConfig { keys: "Alt+Shift+C".into(), action: "reload_config".into(), description: Some("Hot-reload config".into()) },
+                KeybindConfig { keys: "Alt+Shift+J".into(), action: "focus_next()".into(), description: Some("Focus next window".into()) },
+                KeybindConfig { keys: "Alt+Shift+K".into(), action: "focus_prev()".into(), description: Some("Focus prev window".into()) },
+                KeybindConfig { keys: "Alt+Shift+H".into(), action: "focus_prev()".into(), description: Some("Focus prev (left)".into()) },
+                KeybindConfig { keys: "Alt+Shift+L".into(), action: "focus_next()".into(), description: Some("Focus next (right)".into()) },
             ],
             layouts: HashMap::new(),
         }

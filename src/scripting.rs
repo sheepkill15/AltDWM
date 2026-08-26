@@ -31,6 +31,10 @@ fn build_engine() -> Engine {
         println!("[rhai] set_layout {}", name);
         crate::set_layout_by_name(name);
     });
+    eng.register_fn("focus_next", || { crate::focus::focus_next(); });
+    eng.register_fn("focus_prev", || { crate::focus::focus_prev(); });
+    eng.register_fn("focus_direction", |dir: &str| { crate::focus::focus_direction(dir); });
+    eng.register_fn("focus_window", |substr: &str| { crate::focus::focus_window_by_title_substr(substr); });
     eng.register_fn("shell", |cmd: &str| {
         let _ = std::process::Command::new("cmd").args(["/C", cmd]).spawn();
     });
@@ -72,7 +76,7 @@ pub fn dispatch_action(action: &str) {
         }
         return;
     }
-    if act.contains("launch(") || act.contains("log(") || act.contains("set_layout") {
+    if act.contains("launch(") || act.contains("log(") || act.contains("set_layout") || act.contains("focus_") || act.contains("retile") {
         if eval_action(act).is_ok() { return; }
         // fall through to direct handling on error
     }

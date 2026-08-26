@@ -1,4 +1,5 @@
 mod config;
+mod focus;
 mod layout;
 mod manager;
 mod panel;
@@ -281,7 +282,7 @@ fn print_banner() {
  \___/ |_|_| |___/|_|_|_|_|  Rust + Win32 + DWM (declarative panels + Rhai)
 "#);
     // defaults are Alt+Shift to avoid Win+Shift system collisions (Win+Shift+S = Snipping Tool)
-    println!("  Hotkeys (Alt+Shift+): R=retile T=toggle Q=quit G=grid M=monocle F=float S=master C=reload  (configurable in config.toml)");
+    println!("  Hotkeys (Alt+Shift+): R=retile T=toggle Q=quit G=grid M=monocle F=float S=master C=reload J/K/H/L=focus  (configurable)");
     println!("  ---");
 }
 
