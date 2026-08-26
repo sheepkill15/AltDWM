@@ -125,4 +125,5 @@ keys = "Alt+Shift+C"
 action = "reload_config"
 description = "Hot-reload config"
 
-[layouts]
+[layouts.spiral]
+script = "scripts/spiral.rhai"

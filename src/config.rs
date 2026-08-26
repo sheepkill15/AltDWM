@@ -255,9 +255,8 @@ impl Config {
             "floating" => Layout::Floating,
             "masterstack" | "master" | "bsp" | "tiling" => Layout::MasterStack,
             other => {
-                // also check custom layouts map
                 if self.layouts.contains_key(other) {
-                    eprintln!("[config] custom layout '{}' has script, falling back to MasterStack until scripting lands", other);
+                    // custom layout — handled by try_compute_custom, keep MasterStack as fallback enum
                 } else {
                     eprintln!("[config] unknown layout '{}' -> MasterStack", self.general.layout);
                 }
@@ -414,5 +413,7 @@ pub fn example_config_with_panels() -> Config {
     cfg.rules = vec![
         RuleConfig { match_class: Some("Spotify".into()), match_title: None, match_process: None, match_class_regex: None, match_title_regex: None, monitor: None, floating: Some(true), opacity: None, layout: None, on_create: None, extra: HashMap::new() },
     ];
+    cfg.layouts.insert("spiral".into(), LayoutConfig { script: Some("scripts/spiral.rhai".into()), gap: None, extra: HashMap::new() });
+    // To use custom layout: set general.layout = "spiral"
     cfg
 }

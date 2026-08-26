@@ -7,6 +7,7 @@ static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
 
 fn build_engine() -> Engine {
     let mut eng = Engine::new();
+    eng.set_max_expr_depths(256, 256);
     eng.register_fn("launch", |cmd: &str| {
         println!("[rhai] launch {}", cmd);
         let _ = std::process::Command::new("cmd").args(["/C", "start", "", cmd]).spawn();

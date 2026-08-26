@@ -121,7 +121,8 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
         return;
     }
 
-    println!("[manager] tiling {} windows with layout {} gap={} ({} floating skipped)", windows.len(), layout.name(), gap, floating.len());
+    let layout_name = crate::CURRENT_CONFIG.lock().unwrap().general.layout.clone();
+    println!("[manager] tiling {} windows with layout {} gap={} ({} floating skipped)", windows.len(), layout_name, gap, floating.len());
     for hwnd in &windows {
         let cls = crate::util::get_class_name(*hwnd);
         let title = crate::util::get_window_title(*hwnd);
@@ -164,7 +165,14 @@ pub fn tile_windows_reserved(taskbar_hwnd: Option<HWND>, top_reserve: i32, botto
     for (mon, wins) in per_monitor {
         let area = monitor_rects.get(&mon).copied().unwrap_or(RECT { left: 0, top: top_reserve, right: 1920, bottom: 1080 - bottom_reserve });
         println!("[manager] monitor 0x{:x} area {:?}", mon, crate::util::rect_to_string(&area));
-        let rects = compute_layout(wins.len(), area, gap, layout);
+        // try custom layout first (if general.layout names a key in layouts with script)
+        let cfg = crate::CURRENT_CONFIG.lock().unwrap().clone();
+        let rects = if let Some(custom) = crate::layout::try_compute_custom(wins.len(), area, gap, &cfg) {
+            println!("[manager] custom layout '{}'", cfg.general.layout);
+            custom
+        } else {
+            compute_layout(wins.len(), area, gap, layout)
+        };
         let effective_rects = if layout == Layout::Monocle && !rects.is_empty() {
             vec![rects[0]]
         } else {
