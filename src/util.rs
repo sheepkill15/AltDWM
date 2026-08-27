@@ -92,6 +92,12 @@ pub fn is_cloaked(hwnd: HWND) -> bool {
     cloaked != 0
 }
 
+fn has_independent_app_presence(ex_style: u32, has_owner: bool) -> bool {
+    let app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
+    let tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
+    (!has_owner || app_window) && (!tool_window || app_window)
+}
+
 pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
     unsafe {
         if hwnd.0.is_null() {
@@ -112,17 +118,14 @@ pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
         if GetAncestor(hwnd, GA_ROOT) != hwnd {
             return false;
         }
-        // Owned windows are dialogs/popups, don't tile
-        // GetWindow returns Result<HWND> in 0.61 - if Ok and not null, it's owned
-        if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
-            if !owner.0.is_null() {
-                return false;
-            }
-        }
-
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        // Skip tool windows (tooltips, etc.) unless they have APPWINDOW
-        if (ex_style & WS_EX_TOOLWINDOW.0) != 0 && (ex_style & WS_EX_APPWINDOW.0) == 0 {
+        // Most owned windows are transient dialogs/popups. WS_EX_APPWINDOW is the
+        // explicit exception: Windows uses it to give an owned top-level window
+        // its own taskbar presence, so it must also be independently manageable.
+        // Rejecting all owned windows caused legitimate application windows to
+        // disappear from AltDWM entirely.
+        let has_owner = GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.0.is_null());
+        if !has_independent_app_presence(ex_style, has_owner) {
             return false;
         }
 
@@ -182,4 +185,21 @@ pub fn rect_to_string(r: &RECT) -> String {
         r.right - r.left,
         r.bottom - r.top
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_independent_app_presence;
+    use windows::Win32::UI::WindowsAndMessaging::{WS_EX_APPWINDOW, WS_EX_TOOLWINDOW};
+
+    #[test]
+    fn owned_appwindow_is_independently_manageable() {
+        assert!(has_independent_app_presence(WS_EX_APPWINDOW.0, true));
+    }
+
+    #[test]
+    fn transient_owned_and_tool_windows_are_not_independently_manageable() {
+        assert!(!has_independent_app_presence(0, true));
+        assert!(!has_independent_app_presence(WS_EX_TOOLWINDOW.0, false));
+    }
 }

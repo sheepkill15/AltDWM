@@ -8,6 +8,33 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::IVirtualDesktopManager;
 
+thread_local! {
+    // COM may pump panel paint/timer messages while answering a desktop query.
+    // Widgets can ask for the tilable-window count from those messages, which
+    // would otherwise recursively issue the same COM query and hang startup.
+    static QUERY_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct QueryGuard;
+
+impl QueryGuard {
+    fn enter() -> Option<Self> {
+        QUERY_ACTIVE.with(|active| {
+            if active.replace(true) {
+                None
+            } else {
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        QUERY_ACTIVE.with(|active| active.set(false));
+    }
+}
+
 // CLSID_VirtualDesktopManager = {AA509086-5CA9-4C25-8F95-589D3C07B48A}
 const CLSID_VIRTUAL_DESKTOP_MANAGER: GUID = GUID::from_u128(0xaa509086_5ca9_4c25_8f95_589d3c07b48a);
 
@@ -61,6 +88,11 @@ pub fn is_on_current_desktop(hwnd: HWND) -> bool {
     if !filter {
         return true;
     }
+    let Some(_query_guard) = QueryGuard::enter() else {
+        // A nested query means COM re-entered our UI thread. Treat the window as
+        // visible for this pass so painting can finish and the outer call can return.
+        return true;
+    };
     if let Some(vdm) = get_vdm() {
         unsafe {
             return match vdm.IsWindowOnCurrentVirtualDesktop(hwnd) {
@@ -77,4 +109,17 @@ pub fn move_to_desktop(_hwnd: HWND, _desktop_id: &str) {
     println!(
         "[vdesktop] move_to_desktop stub — needs IVirtualDesktopManagerInternal undocumented COM"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryGuard;
+
+    #[test]
+    fn virtual_desktop_queries_are_not_reentrant() {
+        let outer = QueryGuard::enter().expect("first query should enter");
+        assert!(QueryGuard::enter().is_none());
+        drop(outer);
+        assert!(QueryGuard::enter().is_some());
+    }
 }

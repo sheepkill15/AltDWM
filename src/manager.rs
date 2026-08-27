@@ -12,6 +12,28 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::layout::{compute_layout, Layout};
 use crate::util::is_manageable;
 
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
+// EnumWindows enumerates in Z-order. Focusing a window changes that order, so
+// feeding it directly to a layout makes every focus change reshuffle the tiles.
+// Keep the discovery order of each live HWND and only append newly managed
+// windows. Temporarily hidden/minimized windows retain their former slot.
+static WINDOW_ORDER: LazyLock<Mutex<Vec<isize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn reconcile_window_order<F>(order: &mut Vec<isize>, eligible: &[isize], mut is_alive: F)
+where
+    F: FnMut(isize) -> bool,
+{
+    order.retain(|key| is_alive(*key));
+    let mut known: HashSet<isize> = order.iter().copied().collect();
+    for key in eligible {
+        if known.insert(*key) {
+            order.push(*key);
+        }
+    }
+}
+
 /// Collect all manageable windows, grouped by monitor
 pub fn collect_windows(taskbar_hwnd: Option<HWND>) -> Vec<HWND> {
     let mut windows: Vec<HWND> = Vec::new();
@@ -19,9 +41,21 @@ pub fn collect_windows(taskbar_hwnd: Option<HWND>) -> Vec<HWND> {
         let ptr = &mut windows as *mut Vec<HWND> as isize;
         let _ = EnumWindows(Some(enum_cb), LPARAM(ptr));
     }
-    windows
+    let eligible: Vec<HWND> = windows
         .into_iter()
         .filter(|hwnd| is_manageable(*hwnd, taskbar_hwnd))
+        .collect();
+    let eligible_keys: Vec<isize> = eligible.iter().map(|hwnd| hwnd.0 as isize).collect();
+    let eligible_set: HashSet<isize> = eligible_keys.iter().copied().collect();
+    let mut order = WINDOW_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    reconcile_window_order(&mut order, &eligible_keys, |key| unsafe {
+        let hwnd = HWND(key as *mut std::ffi::c_void);
+        windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)).as_bool()
+    });
+    order
+        .iter()
+        .filter(|key| eligible_set.contains(key))
+        .map(|key| HWND(*key as *mut std::ffi::c_void))
         .collect()
 }
 
@@ -432,7 +466,7 @@ pub fn tile_windows_reserved(
 
 #[cfg(test)]
 mod tests {
-    use super::panel_reserves_for_monitor;
+    use super::{panel_reserves_for_monitor, reconcile_window_order};
     use crate::config::{Config, PanelConfig};
     use windows::Win32::Graphics::Gdi::HMONITOR;
 
@@ -457,5 +491,28 @@ mod tests {
         };
         let reserves = panel_reserves_for_monitor(HMONITOR::default(), &config);
         assert_eq!(reserves, (15, 29, 43, 57));
+    }
+
+    #[test]
+    fn window_order_does_not_follow_focus_z_order() {
+        let mut order = Vec::new();
+        reconcile_window_order(&mut order, &[10, 20, 30], |_| true);
+        reconcile_window_order(&mut order, &[30, 10, 20], |_| true);
+        assert_eq!(order, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn temporarily_ineligible_window_keeps_its_slot() {
+        let mut order = vec![10, 20, 30];
+        reconcile_window_order(&mut order, &[10, 30], |_| true);
+        reconcile_window_order(&mut order, &[20, 30, 10], |_| true);
+        assert_eq!(order, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn destroyed_windows_are_pruned_before_new_windows_append() {
+        let mut order = vec![10, 20, 30];
+        reconcile_window_order(&mut order, &[40, 30, 10], |key| key != 20);
+        assert_eq!(order, vec![10, 30, 40]);
     }
 }
