@@ -7,6 +7,20 @@ param(
 $ErrorActionPreference = "Stop"
 $projectRoot = $PSScriptRoot
 
+function Get-OptionalRegistryValue {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $Name
+    )
+
+    $item = Get-ItemProperty -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return $null }
+
+    $property = $item.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 if (-not $PerUser) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -70,12 +84,16 @@ $winlogonPath = if ($PerUser) {
     "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 }
 $statePath = if ($PerUser) { "HKCU:\SOFTWARE\AltDWM" } else { "HKLM:\SOFTWARE\AltDWM" }
-New-Item -Force -Path $winlogonPath | Out-Null
-New-Item -Force -Path $statePath | Out-Null
+if (-not (Test-Path -LiteralPath $winlogonPath)) {
+    New-Item -Path $winlogonPath | Out-Null
+}
+if (-not (Test-Path -LiteralPath $statePath)) {
+    New-Item -Path $statePath | Out-Null
+}
 
-$currentShell = Get-ItemPropertyValue -Path $winlogonPath -Name Shell -ErrorAction SilentlyContinue
+$currentShell = Get-OptionalRegistryValue -Path $winlogonPath -Name Shell
 $normalizedCurrent = if ($null -eq $currentShell) { "" } else { $currentShell.Trim().Trim('"') }
-$existingBackup = Get-ItemPropertyValue -Path $statePath -Name PreviousShellPresent -ErrorAction SilentlyContinue
+$existingBackup = Get-OptionalRegistryValue -Path $statePath -Name PreviousShellPresent
 if (-not $normalizedCurrent.Equals($destExe, [StringComparison]::OrdinalIgnoreCase) -and $null -eq $existingBackup) {
     $hadPreviousShell = $null -ne $currentShell
     New-ItemProperty -Path $statePath -Name PreviousShellPresent -PropertyType DWord -Value ([int]$hadPreviousShell) -Force | Out-Null

@@ -5,6 +5,20 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-OptionalRegistryValue {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $Name
+    )
+
+    $item = Get-ItemProperty -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return $null }
+
+    $property = $item.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 if (-not $PerUser) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -31,13 +45,13 @@ $winlogonPath = if ($PerUser) {
 }
 $statePath = if ($PerUser) { "HKCU:\SOFTWARE\AltDWM" } else { "HKLM:\SOFTWARE\AltDWM" }
 $destExe = Join-Path $InstallDir "alt-dwm.exe"
-$currentShell = Get-ItemPropertyValue -Path $winlogonPath -Name Shell -ErrorAction SilentlyContinue
+$currentShell = Get-OptionalRegistryValue -Path $winlogonPath -Name Shell
 $normalizedCurrent = if ($null -eq $currentShell) { "" } else { $currentShell.Trim().Trim('"') }
 
 Write-Host "Current Shell: $currentShell"
 if ($normalizedCurrent.Equals($destExe, [StringComparison]::OrdinalIgnoreCase)) {
-    $previousPresent = Get-ItemPropertyValue -Path $statePath -Name PreviousShellPresent -ErrorAction SilentlyContinue
-    $previousShell = Get-ItemPropertyValue -Path $statePath -Name PreviousShell -ErrorAction SilentlyContinue
+    $previousPresent = Get-OptionalRegistryValue -Path $statePath -Name PreviousShellPresent
+    $previousShell = Get-OptionalRegistryValue -Path $statePath -Name PreviousShell
     if ($previousPresent -eq 1 -and -not [string]::IsNullOrWhiteSpace($previousShell)) {
         Set-ItemProperty -Path $winlogonPath -Name Shell -Value $previousShell
         Write-Host "Restored previous Shell = $previousShell"
