@@ -134,13 +134,10 @@ fn build_engine() -> Engine {
         let _ = std::process::Command::new("cmd").args(["/C", cmd]).spawn();
     });
     eng.register_fn("window_count", || -> i64 {
-        let tb = crate::taskbar::get_taskbar_hwnd();
-        let wins = crate::manager::collect_windows(tb);
-        wins.len() as i64
+        crate::manager::collect_windows().len() as i64
     });
     eng.register_fn("tilable_count", || -> i64 {
-        let tb = crate::taskbar::get_taskbar_hwnd();
-        let mut wins = crate::manager::collect_windows(tb);
+        let mut wins = crate::manager::collect_windows();
         wins.retain(|w| !crate::rules::is_floating(*w));
         wins.retain(|w| crate::virtual_desktop::is_on_current_desktop(*w));
         wins.len() as i64

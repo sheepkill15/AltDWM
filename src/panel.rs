@@ -1,33 +1,42 @@
 //! Panel manager — turns `PanelConfig` + `WidgetConfig` into Win32 windows.
-//! Each panel is a `WS_POPUP | WS_EX_TOPMOST` with its own WNDCLASS and widget layout.
-//! For MVP, panels repaint on WM_PAINT and 1s WM_TIMER; custom widgets can request faster interval.
+//!
+//! Each panel is a `WS_POPUP | WS_EX_TOPMOST` window that owns its own widget
+//! strip. Geometry is expressed in device-independent pixels in configuration
+//! and scaled per monitor, so a bar is the same apparent size on a 100% and a
+//! 150% display and survives being dragged between them.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
-    DeleteObject, EndPaint, FillRect, GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW,
-    PAINTSTRUCT, SRCCOPY,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+    EndPaint, GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE,
 };
 
 use crate::config::{Config, PanelConfig};
-use crate::widgets::{self, PanelCtx, Widget};
+use crate::ui::{self, fill_rect, fill_round_rect, resolve_track_sizes};
+use crate::widgets::{self, HoverPaint, PanelCtx, Widget};
 
 type PanelCollection = Arc<Mutex<Vec<Panel>>>;
 
 static PANELS: std::sync::LazyLock<Mutex<Option<PanelCollection>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
-static HOVERED_WIDGETS: std::sync::LazyLock<Mutex<HashMap<isize, Option<usize>>>> =
+/// Pointer position per panel, in client coordinates, while the pointer is over
+/// it. Widgets use this to highlight only the item under the cursor.
+static POINTERS: std::sync::LazyLock<Mutex<HashMap<isize, (i32, i32)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 const WM_MOUSELEAVE_RAW: u32 = 0x02A3;
+const WM_DPICHANGED_RAW: u32 = 0x02E0;
+const TIMER_TICK: usize = 1;
+const TIMER_FAST: usize = 2;
 
 /// Schedule a repaint without blocking if a paint/config callback already owns
 /// the panel collection. WinEvent callbacks can be COM-reentrant on this thread.
@@ -60,22 +69,25 @@ pub struct Panel {
     pub hwnd: HWND,
     pub widgets: Vec<Box<dyn Widget>>,
     pub background: COLORREF,
+    /// Monitor this panel belongs to, kept so the panel can be re-placed after a
+    /// DPI or resolution change without rebuilding the whole configuration.
+    monitor: HMONITOR,
+    /// Stacking offset from its edge, in device-independent pixels.
+    edge_offset: i32,
 }
 unsafe impl Send for Panel {}
 unsafe impl Sync for Panel {}
 
 fn apply_panel_chrome(hwnd: HWND) {
-    use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
-    };
-    // DWMWA constants that may not be in Windows 0.61 as typed enums — use raw values
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR};
+    // A bar spans its monitor edge to edge. Rounding its corners left notches
+    // showing the desktop through them, and the Mica backdrop that used to be
+    // requested here was covered by the opaque background fill in WM_PAINT — so
+    // neither did anything but cost a DWM call. Square corners, explicit fill.
     const DWMWA_WINDOW_CORNER_PREFERENCE_RAW: u32 = 33;
-    const DWMWA_SYSTEMBACKDROP_TYPE_RAW: u32 = 38;
-    const DWMWCP_ROUND: u32 = 2;
-    const DWMSBT_MAINWINDOW: u32 = 2; // Mica
+    const DWMWCP_DONOTROUND: u32 = 1;
     unsafe {
-        // rounded corners
-        let corner: u32 = DWMWCP_ROUND;
+        let corner: u32 = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,
             windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(
@@ -84,15 +96,6 @@ fn apply_panel_chrome(hwnd: HWND) {
             &corner as *const _ as _,
             size_of_val(&corner) as u32,
         );
-        // Mica backdrop (Win11 22621+)
-        let backdrop: u32 = DWMSBT_MAINWINDOW;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_SYSTEMBACKDROP_TYPE_RAW as i32),
-            &backdrop as *const _ as _,
-            size_of_val(&backdrop) as u32,
-        );
-        // subtle border color from theme if available
         if let Ok(cfg) = crate::CURRENT_CONFIG.try_lock() {
             let border = cfg.theme.border_color();
             let _ = DwmSetWindowAttribute(
@@ -101,52 +104,117 @@ fn apply_panel_chrome(hwnd: HWND) {
                 &border.0 as *const _ as _,
                 size_of_val(&border) as u32,
             );
-            let caption = cfg.theme.panel_bg("bottom");
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_CAPTION_COLOR,
-                &caption.0 as *const _ as _,
-                size_of_val(&caption) as u32,
-            );
         }
     }
 }
 
-fn resolve_widget_layout(panel: &Panel, rect: RECT, hwnd: HWND) -> (PanelCtx, bool, Vec<i32>) {
+/// A copy of the panel configuration with every length converted from
+/// device-independent to physical pixels for `scale`.
+pub fn scaled_panel_config(cfg: &PanelConfig, scale: f32) -> PanelConfig {
+    let mut scaled = cfg.clone();
+    scaled.height = ui::px(cfg.height, scale).max(1);
+    scaled.margin = cfg
+        .margin
+        .map(|margin| margin.map(|value| ui::px(value, scale)));
+    scaled
+}
+
+fn build_ctx(panel: &Panel, rect: RECT, hwnd: HWND, windows: Vec<HWND>) -> PanelCtx {
     let vertical = matches!(panel.cfg.position.as_str(), "left" | "right");
-    let total_extent = if vertical {
-        rect.bottom - rect.top
-    } else {
-        rect.right - rect.left
-    };
-    let mut windows =
-        crate::manager::collect_windows_including_minimized(crate::taskbar::get_taskbar_hwnd());
-    windows.retain(|window| crate::virtual_desktop::is_on_current_desktop(*window));
-    let ctx = PanelCtx {
+    let theme = crate::CURRENT_CONFIG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .theme
+        .clone();
+    PanelCtx {
         panel_name: panel.cfg.name.clone(),
         monitor: panel.cfg.monitor.clone(),
-        width: total_extent,
+        width: if vertical {
+            rect.bottom - rect.top
+        } else {
+            rect.right - rect.left
+        },
         height: panel.cfg.height,
         hwnd,
         windows,
+        scale: ui::scale_for_window(hwnd),
+        vertical,
+        pointer: POINTERS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(hwnd.0 as isize))
+            .copied(),
+        theme,
+    }
+}
+
+/// Widget rectangles along the panel's long axis, in client coordinates.
+fn widget_rects(panel: &Panel, rect: RECT, ctx: &PanelCtx) -> Vec<RECT> {
+    let vertical = ctx.vertical;
+    let (start, extent) = if vertical {
+        (rect.top, rect.bottom - rect.top)
+    } else {
+        (rect.left, rect.right - rect.left)
     };
     let requested: Vec<i32> = panel
         .widgets
         .iter()
-        .map(|widget| widget.width(&ctx))
+        .map(|widget| {
+            let width = widget.width(ctx);
+            if width > 0 {
+                ctx.px(width)
+            } else {
+                0
+            }
+        })
         .collect();
-    let fixed: i32 = requested.iter().copied().filter(|width| *width != 0).sum();
-    let flex_count = requested.iter().filter(|width| **width == 0).count() as i32;
-    let flex_width = if flex_count > 0 {
-        (total_extent - fixed).max(0) / flex_count
-    } else {
-        0
-    };
-    let widths = requested
+    let sizes = resolve_track_sizes(&requested, extent, 0);
+    let mut offset = start;
+    sizes
         .into_iter()
-        .map(|width| if width == 0 { flex_width } else { width })
-        .collect();
-    (ctx, vertical, widths)
+        .map(|size| {
+            let item = if vertical {
+                RECT {
+                    left: rect.left,
+                    top: offset,
+                    right: rect.right,
+                    bottom: offset + size,
+                }
+            } else {
+                RECT {
+                    left: offset,
+                    top: rect.top,
+                    right: offset + size,
+                    bottom: rect.bottom,
+                }
+            };
+            offset += size;
+            item
+        })
+        .collect()
+}
+
+fn paint_panel(
+    panel: &Panel,
+    hwnd: HWND,
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    windows: Vec<HWND>,
+) {
+    let ctx = build_ctx(panel, rect, hwnd, windows);
+    fill_rect(hdc, &rect, panel.background);
+    let rects = widget_rects(panel, rect, &ctx);
+    for (widget, item) in panel.widgets.iter().zip(rects) {
+        if widget.hover_paint() == HoverPaint::Whole
+            && ctx
+                .pointer
+                .is_some_and(|(x, y)| ui::point_in_rect(x, y, &item))
+        {
+            let highlight = widgets::widget_content_rect(item, &ctx);
+            fill_round_rect(hdc, &highlight, ctx.radius(), ctx.theme.surface_hover_color());
+        }
+        widget.draw(hdc, item, &ctx);
+    }
 }
 
 unsafe extern "system" fn panel_wndproc(
@@ -157,211 +225,152 @@ unsafe extern "system" fn panel_wndproc(
 ) -> LRESULT {
     match msg {
         WM_CREATE => {
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 1000, None);
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                Some(hwnd),
+                TIMER_TICK,
+                1000,
+                None,
+            );
             LRESULT(0)
         }
         WM_TIMER => {
-            if wparam.0 == 1 || wparam.0 == 2 {
-                // The paint path fills every pixel itself. Asking Windows to erase
-                // first exposes a blank frame on every clock/widget tick.
+            if wparam.0 == TIMER_TICK || wparam.0 == TIMER_FAST {
+                // Widgets refresh here, never in WM_PAINT: a Rhai script or a
+                // file read in the paint handler stalled the whole shell.
+                if let Some(panel_arc) = panel_collection() {
+                    if let Ok(panels) = panel_arc.try_lock() {
+                        for panel in panels.iter().filter(|panel| panel.hwnd == hwnd) {
+                            for widget in &panel.widgets {
+                                widget.tick();
+                            }
+                        }
+                    }
+                }
+                // The paint path fills every pixel itself. Asking Windows to
+                // erase first exposes a blank frame on every widget tick.
                 let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
-            // find panel
-            let panels_guard = PANELS.lock().unwrap_or_else(|e| e.into_inner());
-            let panel_arc = panels_guard.as_ref().cloned();
-            drop(panels_guard);
-            if let Some(panel_arc) = panel_arc {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            let width = (rect.right - rect.left).max(1);
+            let height = (rect.bottom - rect.top).max(1);
+            let buffer_dc = CreateCompatibleDC(Some(hdc));
+            let buffer_bitmap = CreateCompatibleBitmap(hdc, width, height);
+            let buffered = !buffer_dc.0.is_null() && !buffer_bitmap.0.is_null();
+            let old_bitmap = if buffered {
+                Some(windows::Win32::Graphics::Gdi::SelectObject(
+                    buffer_dc,
+                    buffer_bitmap.into(),
+                ))
+            } else {
+                None
+            };
+            let draw_dc = if buffered { buffer_dc } else { hdc };
+            // Gathered before the lock: the shared snapshot can issue a COM
+            // virtual-desktop query, and COM may pump a paint message on this
+            // thread, which would then block on the lock we already hold.
+            let snapshot = crate::manager::window_snapshot();
+            if let Some(panel_arc) = panel_collection() {
                 let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
-                    let mut ps = PAINTSTRUCT::default();
-                    let hdc = BeginPaint(hwnd, &mut ps);
-                    let mut rect = RECT::default();
-                    let _ = GetClientRect(hwnd, &mut rect);
-                    let width = (rect.right - rect.left).max(1);
-                    let height = (rect.bottom - rect.top).max(1);
-                    let buffer_dc = CreateCompatibleDC(Some(hdc));
-                    let buffer_bitmap = CreateCompatibleBitmap(hdc, width, height);
-                    let buffered = !buffer_dc.0.is_null() && !buffer_bitmap.0.is_null();
-                    let old_bitmap = if buffered {
-                        Some(windows::Win32::Graphics::Gdi::SelectObject(
-                            buffer_dc,
-                            buffer_bitmap.into(),
-                        ))
-                    } else {
-                        None
-                    };
-                    let draw_dc = if buffered { buffer_dc } else { hdc };
-                    let brush = CreateSolidBrush(p.background);
-                    FillRect(draw_dc, &rect, brush);
-                    let _ = DeleteObject(brush.into());
-
-                    // Layout along the panel's long axis: horizontal bars and vertical docks.
-                    let (ctx, vertical, widths) = resolve_widget_layout(p, rect, hwnd);
-                    let mut x = if vertical { rect.top } else { rect.left };
-                    let hovered = HOVERED_WIDGETS
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .get(&(hwnd.0 as isize))
-                        .copied()
-                        .flatten();
-                    for (index, (widget, width)) in p.widgets.iter().zip(widths).enumerate() {
-                        let r = if vertical {
-                            RECT {
-                                left: rect.left,
-                                top: x,
-                                right: rect.right,
-                                bottom: x + width,
-                            }
-                        } else {
-                            RECT {
-                                left: x,
-                                top: rect.top,
-                                right: x + width,
-                                bottom: rect.bottom,
-                            }
-                        };
-                        if hovered == Some(index) && widget.name() != "spacer" {
-                            let inset = RECT {
-                                left: r.left + 3,
-                                top: r.top + 3,
-                                right: r.right - 3,
-                                bottom: r.bottom - 3,
-                            };
-                            let theme = crate::CURRENT_CONFIG
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .theme
-                                .clone();
-                            let region = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(
-                                inset.left,
-                                inset.top,
-                                inset.right,
-                                inset.bottom,
-                                theme.rounding.max(8),
-                                theme.rounding.max(8),
-                            );
-                            let brush = CreateSolidBrush(theme.surface_hover_color());
-                            let _ = windows::Win32::Graphics::Gdi::FillRgn(draw_dc, region, brush);
-                            let _ = DeleteObject(region.into());
-                            let _ = DeleteObject(brush.into());
-                        }
-                        widget.draw(draw_dc, r, &ctx);
-                        x += width;
-                    }
-                    if let Some(old_bitmap) = old_bitmap {
-                        let _ = BitBlt(hdc, 0, 0, width, height, Some(buffer_dc), 0, 0, SRCCOPY);
-                        let _ = windows::Win32::Graphics::Gdi::SelectObject(buffer_dc, old_bitmap);
-                    }
-                    if !buffer_bitmap.0.is_null() {
-                        let _ = DeleteObject(buffer_bitmap.into());
-                    }
-                    if !buffer_dc.0.is_null() {
-                        let _ = DeleteDC(buffer_dc);
-                    }
-                    let _ = EndPaint(hwnd, &ps);
-                    return LRESULT(0);
+                if let Some(panel) = panels.iter().find(|panel| panel.hwnd == hwnd) {
+                    paint_panel(panel, hwnd, draw_dc, rect, snapshot);
                 }
             }
-            let mut ps = PAINTSTRUCT::default();
-            let _hdc = BeginPaint(hwnd, &mut ps);
+            if let Some(old_bitmap) = old_bitmap {
+                let _ = BitBlt(hdc, 0, 0, width, height, Some(buffer_dc), 0, 0, SRCCOPY);
+                let _ = windows::Win32::Graphics::Gdi::SelectObject(buffer_dc, old_bitmap);
+            }
+            if !buffer_bitmap.0.is_null() {
+                let _ = DeleteObject(buffer_bitmap.into());
+            }
+            if !buffer_dc.0.is_null() {
+                let _ = DeleteDC(buffer_dc);
+            }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            let x = (lparam.0 & 0xFFFF) as i16 as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            // route to widget
-            let panels_guard = PANELS.lock().unwrap_or_else(|e| e.into_inner());
-            let panel_arc = panels_guard.as_ref().cloned();
-            drop(panels_guard);
-            if let Some(panel_arc) = panel_arc {
+            let point = client_point(lparam);
+            // The action is resolved under the lock and dispatched after it is
+            // released. Dispatching while holding the panel collection would
+            // deadlock the moment an action touched the panels themselves.
+            let mut pending: Option<(String, String, String)> = None;
+            let snapshot = crate::manager::window_snapshot();
+            if let Some(panel_arc) = panel_collection() {
                 let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
+                if let Some(panel) = panels.iter().find(|panel| panel.hwnd == hwnd) {
                     let mut rect = RECT::default();
                     let _ = GetClientRect(hwnd, &mut rect);
-                    let (ctx, vertical, widths) = resolve_widget_layout(p, rect, hwnd);
-                    let mut cur = 0;
-                    let click_main = if vertical { y } else { x };
-                    for (widget, width) in p.widgets.iter().zip(widths) {
-                        if click_main >= cur && click_main < cur + width {
-                            if let Some(action) = widget.on_click(
-                                click_main - cur,
-                                if vertical { x } else { y },
-                                &ctx,
-                            ) {
-                                println!(
-                                    "[panel {}] widget '{}' click -> {}",
-                                    p.cfg.name,
-                                    widget.name(),
-                                    action
-                                );
-                                crate::scripting::dispatch_action(&action);
-                            }
-                            break;
+                    let ctx = build_ctx(panel, rect, hwnd, snapshot);
+                    let rects = widget_rects(panel, rect, &ctx);
+                    for (widget, item) in panel.widgets.iter().zip(rects) {
+                        if !ui::point_in_rect(point.0, point.1, &item) {
+                            continue;
                         }
-                        cur += width;
+                        if let Some(action) = widget.on_click(point, item, &ctx) {
+                            pending = Some((
+                                panel.cfg.name.clone(),
+                                widget.name().to_string(),
+                                action,
+                            ));
+                        }
+                        break;
                     }
                 }
             }
+            if let Some((panel_name, widget_name, action)) = pending {
+                println!("[panel {panel_name}] widget '{widget_name}' click -> {action}");
+                crate::scripting::dispatch_action(&action);
+            }
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let x = (lparam.0 & 0xFFFF) as i16 as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let panels_guard = PANELS.lock().unwrap_or_else(|e| e.into_inner());
-            let panel_arc = panels_guard.as_ref().cloned();
-            drop(panels_guard);
-            if let Some(panel_arc) = panel_arc {
-                let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
-                    let mut rect = RECT::default();
-                    let _ = GetClientRect(hwnd, &mut rect);
-                    let (_, vertical, widths) = resolve_widget_layout(p, rect, hwnd);
-                    let point = if vertical { y } else { x };
-                    let mut edge = 0;
-                    let mut next = None;
-                    for (index, width) in widths.iter().enumerate() {
-                        if point >= edge && point < edge + *width {
-                            next = Some(index);
-                            break;
-                        }
-                        edge += *width;
-                    }
-                    let mut hovered = HOVERED_WIDGETS
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if hovered.get(&(hwnd.0 as isize)).copied().flatten() != next {
-                        hovered.insert(hwnd.0 as isize, next);
-                        let _ =
-                            windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
-                    }
-                    let mut tracking = TRACKMOUSEEVENT {
-                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut tracking);
-                }
+            let point = client_point(lparam);
+            let changed = {
+                let mut pointers = POINTERS.lock().unwrap_or_else(|error| error.into_inner());
+                pointers.insert(hwnd.0 as isize, point) != Some(point)
+            };
+            if changed {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
             }
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tracking);
             LRESULT(0)
         }
         WM_MOUSELEAVE_RAW => {
-            HOVERED_WIDGETS
+            POINTERS
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&(hwnd.0 as isize));
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
+        WM_DPICHANGED_RAW => {
+            // The manifest asks for PerMonitorV2, which obliges us to re-place
+            // and repaint at the new scale instead of being silently stretched.
+            reposition_panel(hwnd);
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
+            crate::request_retile();
+            LRESULT(0)
+        }
         WM_DESTROY => {
-            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 1);
-            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2);
-            HOVERED_WIDGETS
+            let _ =
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_TICK);
+            let _ =
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_FAST);
+            POINTERS
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&(hwnd.0 as isize));
@@ -372,8 +381,35 @@ unsafe extern "system" fn panel_wndproc(
     }
 }
 
+fn client_point(lparam: LPARAM) -> (i32, i32) {
+    (
+        (lparam.0 & 0xFFFF) as i16 as i32,
+        ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    )
+}
+
+fn panel_collection() -> Option<PanelCollection> {
+    PANELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned()
+}
+
 fn ensure_class() -> Result<(), String> {
     crate::util::register_window_class(w!("AltDWM_Panel"), panel_wndproc, "Panel")
+}
+
+fn monitor_rect(monitor: HMONITOR) -> Option<RECT> {
+    unsafe {
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(monitor, &mut mi as *mut _ as *mut _)
+            .as_bool()
+            .then_some(mi.rcMonitor)
+    }
 }
 
 fn resolve_panel_monitors(target: &str) -> Vec<(HMONITOR, RECT)> {
@@ -383,91 +419,48 @@ fn resolve_panel_monitors(target: &str) -> Vec<(HMONITOR, RECT)> {
     }
     let lower = target.to_lowercase();
     if lower == "all" {
-        let mut out = Vec::new();
-        for &h in &mons {
-            unsafe {
-                let mut mi = MONITORINFO {
-                    cbSize: size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                if GetMonitorInfoW(h, &mut mi as *mut _ as *mut _).as_bool() {
-                    out.push((h, mi.rcMonitor));
-                }
-            }
-        }
-        return out;
+        return mons
+            .iter()
+            .filter_map(|monitor| monitor_rect(*monitor).map(|rect| (*monitor, rect)))
+            .collect();
     }
-    // single monitor resolution - reuse manager logic but return rect
     let single: Option<HMONITOR> = if lower == "primary" || lower == "1" {
-        let mut prim = None;
-        for &h in &mons {
-            unsafe {
+        mons.iter()
+            .copied()
+            .find(|monitor| unsafe {
                 let mut mi = MONITORINFO {
                     cbSize: size_of::<MONITORINFO>() as u32,
                     ..Default::default()
                 };
-                if GetMonitorInfoW(h, &mut mi as *mut _ as *mut _).as_bool()
+                GetMonitorInfoW(*monitor, &mut mi as *mut _ as *mut _).as_bool()
                     && (mi.dwFlags & 1) != 0
-                {
-                    prim = Some(h);
-                    break;
-                }
-            }
-        }
-        prim.or(Some(mons[0]))
+            })
+            .or_else(|| mons.first().copied())
     } else if let Ok(idx) = lower.parse::<usize>() {
-        if idx >= 1 && idx <= mons.len() {
-            Some(mons[idx - 1])
-        } else {
-            None
-        }
+        (idx >= 1 && idx <= mons.len()).then(|| mons[idx - 1])
     } else {
-        // device name substring
-        let mut found = None;
-        for &h in &mons {
-            unsafe {
-                let mut ex = MONITORINFOEXW {
-                    monitorInfo: MONITORINFO {
-                        cbSize: size_of::<MONITORINFOEXW>() as u32,
-                        ..Default::default()
-                    },
-                    szDevice: [0; 32],
-                };
-                if GetMonitorInfoW(h, &mut ex as *mut _ as *mut _ as *mut MONITORINFO).as_bool() {
-                    let dev = String::from_utf16_lossy(&ex.szDevice)
-                        .trim_matches(char::from(0))
-                        .to_string();
-                    if dev.to_lowercase().contains(&lower) {
-                        found = Some(h);
-                        break;
-                    }
-                }
-            }
-        }
-        found
-    };
-    if let Some(h) = single {
-        unsafe {
-            let mut mi = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..Default::default()
+        mons.iter().copied().find(|monitor| unsafe {
+            let mut ex = MONITORINFOEXW {
+                monitorInfo: MONITORINFO {
+                    cbSize: size_of::<MONITORINFOEXW>() as u32,
+                    ..Default::default()
+                },
+                szDevice: [0; 32],
             };
-            if GetMonitorInfoW(h, &mut mi as *mut _ as *mut _).as_bool() {
-                return vec![(h, mi.rcMonitor)];
-            }
-        }
-    }
-    // fallback: primary
-    unsafe {
-        let mut mi = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if GetMonitorInfoW(mons[0], &mut mi as *mut _ as *mut _).as_bool() {
-            return vec![(mons[0], mi.rcMonitor)];
-        }
-    }
-    Vec::new()
+            GetMonitorInfoW(*monitor, &mut ex as *mut _ as *mut _ as *mut MONITORINFO).as_bool()
+                && String::from_utf16_lossy(&ex.szDevice)
+                    .trim_matches(char::from(0))
+                    .to_lowercase()
+                    .contains(&lower)
+        })
+    };
+    single
+        .and_then(|monitor| monitor_rect(monitor).map(|rect| vec![(monitor, rect)]))
+        .or_else(|| {
+            mons.first()
+                .and_then(|monitor| monitor_rect(*monitor).map(|rect| vec![(*monitor, rect)]))
+        })
+        .unwrap_or_default()
 }
 
 fn panel_rect(config: &PanelConfig, monitor: RECT, edge_offset: i32) -> RECT {
@@ -508,6 +501,54 @@ fn panel_rect(config: &PanelConfig, monitor: RECT, edge_offset: i32) -> RECT {
     }
 }
 
+/// Re-place one panel from its configuration at its monitor's current scale.
+fn reposition_panel(hwnd: HWND) {
+    let Some(panel_arc) = panel_collection() else {
+        return;
+    };
+    let Ok(panels) = panel_arc.try_lock() else {
+        return;
+    };
+    let Some(panel) = panels.iter().find(|panel| panel.hwnd == hwnd) else {
+        return;
+    };
+    let Some(area) = monitor_rect(panel.monitor) else {
+        return;
+    };
+    let scale = ui::scale_for_monitor(panel.monitor);
+    let scaled = scaled_panel_config(&panel.cfg, scale);
+    let rect = panel_rect(&scaled, area, ui::px(panel.edge_offset, scale));
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            rect.left,
+            rect.top,
+            (rect.right - rect.left).max(1),
+            (rect.bottom - rect.top).max(1),
+            SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Re-place every panel. Called after a resolution change, a monitor being
+/// attached or removed, or a DPI change on any display.
+pub fn reposition_all() {
+    let Some(panel_arc) = panel_collection() else {
+        return;
+    };
+    let handles: Vec<HWND> = {
+        let Ok(panels) = panel_arc.try_lock() else {
+            return;
+        };
+        panels.iter().map(|panel| panel.hwnd).collect()
+    };
+    for hwnd in handles {
+        reposition_panel(hwnd);
+    }
+    invalidate_all();
+}
+
 pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
     if cfg.panels.is_empty() {
         return Ok(vec![]);
@@ -516,7 +557,6 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
     ensure_class()?;
     let mut handles = Vec::new();
 
-    // Map widget names to configs for lookup
     let widget_map: HashMap<String, crate::config::WidgetConfig> = cfg
         .widgets
         .iter()
@@ -525,10 +565,18 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
 
     let panels_arc = Arc::new(Mutex::new(Vec::<Panel>::new()));
     *PANELS.lock().unwrap_or_else(|e| e.into_inner()) = Some(panels_arc.clone());
+    // Stacking offsets accumulate in device-independent pixels so the same
+    // configuration stacks identically on displays with different scales.
     let mut edge_offsets: HashMap<(isize, String), i32> = HashMap::new();
 
     for pc in &cfg.panels {
-        // position — per-monitor aware (fixes SM_CXSCREEN single-monitor bug)
+        if !["top", "right", "bottom", "left"].contains(&pc.position.as_str()) {
+            eprintln!(
+                "[panel] invalid position '{}' for '{}' — skipped",
+                pc.position, pc.name
+            );
+            continue;
+        }
         let targets = resolve_panel_monitors(&pc.monitor);
         if targets.is_empty() {
             eprintln!(
@@ -537,34 +585,27 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
             );
             continue;
         }
-        let theme = crate::CURRENT_CONFIG
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .theme
-            .clone();
         let bg = pc
             .background
             .as_deref()
-            .map(|s| theme.color(s))
-            .unwrap_or_else(|| theme.panel_bg(&pc.position));
+            .map(|s| cfg.theme.color(s))
+            .unwrap_or_else(|| cfg.theme.panel_bg(&pc.position));
 
         for (mon_idx, (hmon, mon_rect)) in targets.iter().enumerate() {
             let offset = edge_offsets
                 .entry((hmon.0 as isize, pc.position.clone()))
                 .or_default();
-            if !["top", "right", "bottom", "left"].contains(&pc.position.as_str()) {
-                eprintln!(
-                    "[panel] invalid position '{}' for '{}' — skipped",
-                    pc.position, pc.name
-                );
-                continue;
-            }
-            let rect = panel_rect(pc, *mon_rect, *offset);
+            let edge_offset = *offset;
+            *offset += pc.edge_consumption();
+
+            let scale = ui::scale_for_monitor(*hmon);
+            let scaled = scaled_panel_config(pc, scale);
+            let rect = panel_rect(&scaled, *mon_rect, ui::px(edge_offset, scale));
             let x = rect.left;
             let y = rect.top;
             let w = (rect.right - rect.left).max(1);
             let h = (rect.bottom - rect.top).max(1);
-            *offset += pc.edge_consumption();
+
             let mut widgets_inst: Vec<Box<dyn Widget>> = Vec::new();
             for wname in &pc.widgets {
                 if let Some(wcfg) = widget_map.get(wname) {
@@ -595,7 +636,9 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
             let hwnd = unsafe {
                 let hinstance = HINSTANCE(std::ptr::null_mut());
                 CreateWindowExW(
-                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                    // WS_EX_NOACTIVATE keeps clicking the bar from stealing
+                    // focus from the window the click is about to act on.
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                     w!("AltDWM_Panel"),
                     w!("AltDWM Panel"),
                     WS_POPUP | WS_VISIBLE,
@@ -622,7 +665,8 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
                 );
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 apply_panel_chrome(hwnd);
-                // Keep sub-second widgets responsive without polling every panel at 250 ms.
+                // Keep sub-second widgets responsive without polling every panel
+                // at that rate.
                 if let Some(interval) = widgets_inst
                     .iter()
                     .filter_map(|widget| widget.interval_ms())
@@ -631,14 +675,24 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
                 {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
                         Some(hwnd),
-                        2,
-                        interval,
+                        TIMER_FAST,
+                        interval.max(50),
                         None,
                     );
                 }
             }
+            // Populate widget state once up front so the first paint is not
+            // blank while waiting for the first timer tick.
+            for widget in &widgets_inst {
+                widget.tick();
+            }
+            let widget_summary = widgets_inst
+                .iter()
+                .map(|widget| format!("{}:{}", widget.name(), widget.kind()))
+                .collect::<Vec<_>>()
+                .join(",");
             println!(
-                "[panel] '{}' @ {},{} {}x{} monitor={} (target {}/{}) widgets={}",
+                "[panel] '{}' @ {},{} {}x{} monitor={} (target {}/{}) scale={:.2} widgets={}",
                 pc.name,
                 x,
                 y,
@@ -647,7 +701,8 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
                 pc.monitor,
                 mon_idx + 1,
                 targets.len(),
-                pc.widgets.join(",")
+                scale,
+                widget_summary
             );
             handles.push(hwnd);
             panels_arc
@@ -658,6 +713,8 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
                     hwnd,
                     widgets: widgets_inst,
                     background: bg,
+                    monitor: *hmon,
+                    edge_offset,
                 });
         }
     }
@@ -678,13 +735,24 @@ pub fn destroy_panels() {
             }
         }
     }
+    POINTERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::panel_rect;
+    use super::{panel_rect, scaled_panel_config};
     use crate::config::PanelConfig;
     use windows::Win32::Foundation::RECT;
+
+    const MONITOR: RECT = RECT {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+    };
 
     #[test]
     fn same_edge_panels_stack_instead_of_overlap() {
@@ -717,19 +785,41 @@ mod tests {
             margin: Some([3, 4, 5, 6]),
             ..PanelConfig::default()
         };
-        let rect = panel_rect(
-            &panel,
-            RECT {
-                left: 0,
-                top: 0,
-                right: 1920,
-                bottom: 1080,
-            },
-            0,
-        );
+        let rect = panel_rect(&panel, MONITOR, 0);
         assert_eq!(
             (rect.left, rect.top, rect.right, rect.bottom),
             (6, 3, 48, 1075)
         );
+    }
+
+    /// A bar configured as 40 device-independent pixels must occupy 60 physical
+    /// pixels on a 150% display, not 40.
+    #[test]
+    fn panel_geometry_scales_with_display_dpi() {
+        let panel = PanelConfig {
+            position: "bottom".into(),
+            height: 40,
+            margin: Some([0, 8, 8, 8]),
+            ..PanelConfig::default()
+        };
+        let scaled = scaled_panel_config(&panel, 1.5);
+        assert_eq!(scaled.height, 60);
+        assert_eq!(scaled.margins(), [0, 12, 12, 12]);
+        let rect = panel_rect(&scaled, MONITOR, 0);
+        assert_eq!(rect.bottom - rect.top, 60);
+        assert_eq!(rect.left, 12);
+        assert_eq!(MONITOR.bottom - rect.bottom, 12);
+    }
+
+    #[test]
+    fn unscaled_geometry_is_unchanged() {
+        let panel = PanelConfig {
+            height: 40,
+            margin: Some([1, 2, 3, 4]),
+            ..PanelConfig::default()
+        };
+        let scaled = scaled_panel_config(&panel, 1.0);
+        assert_eq!(scaled.height, 40);
+        assert_eq!(scaled.margins(), [1, 2, 3, 4]);
     }
 }

@@ -152,51 +152,38 @@ impl Theme {
     }
 }
 
-fn parse_hex(s: &str) -> COLORREF {
-    let s = s.trim().trim_start_matches('#');
-    // support #RRGGBB and #AARRGGBB (ignore alpha)
-    let hex = if s.len() == 8 { &s[2..] } else { s };
-    if let Ok(v) = u32::from_str_radix(hex, 16) {
-        // GDI COLORREF is 0x00BBGGRR, but CreateSolidBrush expects same layout as RGB macro
-        // For "#RRGGBB" we need to swap R and B: 0x00BBGGRR
-        let r = (v >> 16) & 0xFF;
-        let g = (v >> 8) & 0xFF;
-        let b = v & 0xFF;
-        COLORREF((r) | (g << 8) | (b << 16))
-    } else {
-        COLORREF(0x00202020)
-    }
-}
+/// Fallback used for any value that is not a colour we can read.
+const FALLBACK_COLOR: COLORREF = COLORREF(0x0020_2020);
 
-/// Helper to create a GDI font handle for Segoe UI with theme size (uncached, caller must DeleteObject)
-pub fn create_font(theme: &Theme) -> HFONT {
-    use windows::Win32::Graphics::Gdi::{
-        CreateFontW, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, FF_DONTCARE, FW_NORMAL,
-        OUT_DEFAULT_PRECIS, VARIABLE_PITCH,
-    };
-    let name_wide: Vec<u16> = theme
-        .font_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        CreateFontW(
-            -theme.font_size,
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            DEFAULT_QUALITY,
-            VARIABLE_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-            windows::core::PCWSTR(name_wide.as_ptr()),
-        )
+/// Parse `#RRGGBB` or `#AARRGGBB` (alpha ignored) into a GDI `COLORREF`.
+///
+/// The value comes straight from the user's TOML, so it is validated before it
+/// is indexed. The previous `&s[2..]` sliced by bytes on any eight-byte string
+/// and panicked on a multi-byte character — and with `panic = "abort"` in
+/// release, a typo in `[theme]` took the whole shell down with the native
+/// taskbar still hidden.
+pub fn parse_hex(s: &str) -> COLORREF {
+    let trimmed = s.trim().trim_start_matches('#');
+    if !trimmed.is_ascii() || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        eprintln!("[theme] '{s}' is not a hex colour — using the default");
+        return FALLBACK_COLOR;
     }
+    let hex = match trimmed.len() {
+        6 => trimmed,
+        8 => &trimmed[2..],
+        _ => {
+            eprintln!("[theme] '{s}' must be 6 or 8 hex digits — using the default");
+            return FALLBACK_COLOR;
+        }
+    };
+    let Ok(value) = u32::from_str_radix(hex, 16) else {
+        return FALLBACK_COLOR;
+    };
+    // GDI COLORREF is 0x00BBGGRR, so R and B swap relative to #RRGGBB.
+    let r = (value >> 16) & 0xFF;
+    let g = (value >> 8) & 0xFF;
+    let b = value & 0xFF;
+    COLORREF(r | (g << 8) | (b << 16))
 }
 
 use std::collections::HashMap;
@@ -205,15 +192,6 @@ use windows::Win32::Graphics::Gdi::HFONT;
 
 static FONT_CACHE: LazyLock<Mutex<HashMap<String, isize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Cached version — reuses HFONT per (font_name, size), leaked until exit to avoid GDI churn
-pub fn get_cached_font(theme: &Theme) -> HFONT {
-    get_cached_font_variant(
-        theme,
-        theme.font_size,
-        windows::Win32::Graphics::Gdi::FW_NORMAL.0 as i32,
-    )
-}
 
 /// Cached font variant used by richer shell surfaces without creating GDI
 /// objects during every paint.
@@ -252,4 +230,28 @@ pub fn get_cached_font_variant(theme: &Theme, size: i32, weight: i32) -> HFONT {
     };
     cache.insert(key, h.0 as isize);
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_hex, FALLBACK_COLOR};
+
+    #[test]
+    fn parses_six_and_eight_digit_colours() {
+        // #RRGGBB -> 0x00BBGGRR
+        assert_eq!(parse_hex("#8b5cf6").0, 0x00f6_5c8b);
+        assert_eq!(parse_hex("8b5cf6").0, 0x00f6_5c8b);
+        // Leading alpha pair is ignored.
+        assert_eq!(parse_hex("#ff8b5cf6").0, 0x00f6_5c8b);
+    }
+
+    #[test]
+    fn rejects_malformed_values_without_panicking() {
+        // Eight bytes of multi-byte UTF-8 used to panic on a char boundary.
+        assert_eq!(parse_hex("#ääää").0, FALLBACK_COLOR.0);
+        assert_eq!(parse_hex("#12345").0, FALLBACK_COLOR.0);
+        assert_eq!(parse_hex("not a colour").0, FALLBACK_COLOR.0);
+        assert_eq!(parse_hex("").0, FALLBACK_COLOR.0);
+        assert_eq!(parse_hex("#zzzzzz").0, FALLBACK_COLOR.0);
+    }
 }

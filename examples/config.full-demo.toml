@@ -1,8 +1,8 @@
 # RustRover full-demo configuration. This exercises the complete panel/widget,
 # scripting, layout, rule, hotkey, multi-monitor, and virtual-desktop paths.
 [general]
-gap = 10
-outer_gap = 6
+gap = 4
+outer_gap = 4
 layout = "spiral"
 taskbar = true
 taskbar_height = 40
@@ -42,14 +42,14 @@ surface_hover = "#353b49"
 font_name = "Segoe UI"
 font_size = 13
 rounding = 12
-gap = 10
+gap = 4
 
 # One coherent shell bar per display. The primary controls are deliberately
 # discoverable instead of split across developer-demo panels.
 [[panels]]
 name = "shell"
-position = "bottom"
-height = 58
+position = "top"
+height = 40
 monitor = "all"
 margin = [0, 8, 8, 8]
 widgets = [
@@ -96,6 +96,7 @@ script = "scripts/cpu.rhai"
 width = 150
 
 # Demonstrates class matching, floating rules, opacity, and on-create Rhai.
+# A regex matches anywhere by default; `match_class = "*Spotify*"` is equivalent.
 [[rules]]
 match_class_regex = "(?i)spotify"
 floating = true
@@ -181,4 +182,5 @@ description = "Move focused window to previous monitor"
 
 [layouts.spiral]
 script = "scripts/spiral.rhai"
-gap = 10
+gap = 4
+

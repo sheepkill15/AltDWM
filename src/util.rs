@@ -114,15 +114,10 @@ fn has_independent_app_presence(ex_style: u32, has_owner: bool) -> bool {
     (!has_owner || app_window) && (!tool_window || app_window)
 }
 
-fn is_manageable_impl(hwnd: HWND, taskbar_hwnd: Option<HWND>, include_minimized: bool) -> bool {
+fn is_manageable_impl(hwnd: HWND, include_minimized: bool) -> bool {
     unsafe {
         if hwnd.0.is_null() {
             return false;
-        }
-        if let Some(tb) = taskbar_hwnd {
-            if hwnd.0 == tb.0 {
-                return false;
-            }
         }
         if !IsWindowVisible(hwnd).as_bool() {
             return false;
@@ -176,30 +171,34 @@ fn is_manageable_impl(hwnd: HWND, taskbar_hwnd: Option<HWND>, include_minimized:
         if !title.is_empty() && crate::is_ignored_title(&title) {
             return false;
         }
-        let process = crate::rules::get_process_name(hwnd);
-        let ignored_process = {
+        // Resolving a process name costs an OpenProcess round trip, so it is
+        // only worth paying when the configuration actually filters on it.
+        let ignored_processes: Vec<String> = {
             let cfg = crate::CURRENT_CONFIG
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            cfg.ignore
-                .processes
+            cfg.ignore.processes.clone()
+        };
+        if !ignored_processes.is_empty() {
+            let process = crate::rules::get_process_name(hwnd);
+            if ignored_processes
                 .iter()
                 .any(|ignored| process.eq_ignore_ascii_case(ignored))
-        };
-        if ignored_process {
-            return false;
+            {
+                return false;
+            }
         }
 
         true
     }
 }
 
-pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
-    is_manageable_impl(hwnd, taskbar_hwnd, false)
+pub fn is_manageable(hwnd: HWND) -> bool {
+    is_manageable_impl(hwnd, false)
 }
 
-pub fn is_manageable_or_minimized(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
-    is_manageable_impl(hwnd, taskbar_hwnd, true)
+pub fn is_manageable_or_minimized(hwnd: HWND) -> bool {
+    is_manageable_impl(hwnd, true)
 }
 
 pub fn rect_to_string(r: &RECT) -> String {

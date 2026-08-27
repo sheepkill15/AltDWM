@@ -458,6 +458,27 @@ impl Config {
 
     pub fn validate(&self) -> Vec<String> {
         let mut warns = Vec::new();
+        if self.general.gap < 0 {
+            warns.push(format!("general.gap cannot be negative ({})", self.general.gap));
+        }
+        if self.general.outer_gap.is_some_and(|gap| gap < 0) {
+            warns.push("general.outer_gap cannot be negative".to_string());
+        }
+        if self.general.taskbar_height <= 0 {
+            warns.push(format!(
+                "general.taskbar_height must be positive ({})",
+                self.general.taskbar_height
+            ));
+        }
+        if self.theme.font_size <= 0 {
+            warns.push(format!(
+                "theme.font_size must be positive ({})",
+                self.theme.font_size
+            ));
+        }
+        if self.theme.rounding < 0 {
+            warns.push("theme.rounding cannot be negative".to_string());
+        }
         let mut panel_names = std::collections::HashSet::new();
         for p in &self.panels {
             if p.name.trim().is_empty() {
@@ -470,6 +491,18 @@ impl Config {
                     "panel '{}' invalid position '{}'",
                     p.name, p.position
                 ));
+            }
+            if p.height <= 0 {
+                warns.push(format!(
+                    "panel '{}' height must be positive ({})",
+                    p.name, p.height
+                ));
+            }
+            if p.margins().iter().any(|margin| *margin < 0) {
+                warns.push(format!("panel '{}' has a negative margin", p.name));
+            }
+            if p.widgets.is_empty() {
+                warns.push(format!("panel '{}' declares no widgets", p.name));
             }
             for w in &p.widgets {
                 if self.widget_by_name(w).is_none() && !is_builtin_widget(w) {
@@ -514,7 +547,7 @@ impl Config {
                 warns.push(format!("keybind '{}' has an empty action", keybind.keys));
             }
         }
-        for rule in &self.rules {
+        for (index, rule) in self.rules.iter().enumerate() {
             if let Some(pattern) = &rule.match_class_regex {
                 if let Err(error) = Regex::new(pattern) {
                     warns.push(format!("invalid class regex '{}': {}", pattern, error));
@@ -525,6 +558,25 @@ impl Config {
                     warns.push(format!("invalid title regex '{}': {}", pattern, error));
                 }
             }
+            // A rule with no conditions can never match, so it silently does
+            // nothing — which reads as a rule engine that ignores the config.
+            let has_condition = rule.match_class.is_some()
+                || rule.match_class_regex.is_some()
+                || rule.match_title.is_some()
+                || rule.match_title_regex.is_some()
+                || rule.match_process.is_some();
+            if !has_condition {
+                warns.push(format!(
+                    "rule #{} has no match_class/match_title/match_process condition, so it matches nothing",
+                    index + 1
+                ));
+            }
+            if rule.opacity.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+                warns.push(format!(
+                    "rule #{} opacity must be between 0.0 and 1.0",
+                    index + 1
+                ));
+            }
         }
         for (name, layout) in &self.layouts {
             if layout.script.as_deref().is_none_or(str::is_empty) {
@@ -533,6 +585,32 @@ impl Config {
         }
         warns
     }
+}
+
+/// `general.taskbar = true` with no `[[panels]]` declared is a request for a
+/// bar, not a request for a second bar implementation. Synthesising a panel
+/// here means the default shell goes through the same per-monitor placement,
+/// DPI scaling, and widget pipeline as a hand-written one.
+pub fn ensure_default_bar(cfg: &mut Config) {
+    if !cfg.general.taskbar || !cfg.panels.is_empty() {
+        return;
+    }
+    cfg.panels.push(PanelConfig {
+        name: "taskbar".into(),
+        position: "bottom".into(),
+        height: cfg.general.taskbar_height.max(24),
+        monitor: "all".into(),
+        margin: None,
+        background: None,
+        widgets: vec![
+            "launcher".into(),
+            "layout".into(),
+            "window_list".into(),
+            "tray".into(),
+            "clock".into(),
+        ],
+        extra: HashMap::new(),
+    });
 }
 
 pub fn builtin_widget_config(name: &str) -> Option<WidgetConfig> {
@@ -761,7 +839,9 @@ pub fn example_config_with_panels() -> Config {
     ];
     cfg.rules = vec![
         RuleConfig {
-            match_class: Some("Spotify".into()),
+            // match_class is exact; the wildcard is what makes this fire against
+            // Spotify's real class (SpotifyMainWindow).
+            match_class: Some("*Spotify*".into()),
             match_title: None,
             match_process: None,
             match_class_regex: None,

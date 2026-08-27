@@ -30,8 +30,8 @@ Tested on Windows 11, 2 monitors, Rust 1.98 + `windows` 0.61.
 ```powershell
 $env:PATH += ";$HOME\.cargo\bin"
 cargo run -- --help
-cargo run                                           # default taskbar 40px
-cargo run -- --no-taskbar --gap 12 --layout grid
+cargo run                                           # synthesises a 40px bottom bar
+cargo run -- --no-taskbar --gap 12 --layout grid     # tiling only, no bar
 cargo run -- --config ./examples/config.example.toml  # panels DSL demo
 cargo run -- --generate-config   # writes %APPDATA%/AltDWM/config.toml
 cargo run -- --check-config      # validate
@@ -83,7 +83,7 @@ script = "scripts/cpu.rhai"
 interval = 2000
 
 [[rules]]
-match_class = "Spotify"
+match_class = "*Spotify*"   # exact by default; `*` opts into partial matching
 floating = true
 
 [[keybinds]]
@@ -91,7 +91,7 @@ keys = "Alt+Shift+Return"
 action = "launch('wt.exe')"
 ```
 
-Panels reserve their own monitor's `top`+`bottom` heights before tiling. `monitor="all"` creates one bar per display; `primary`, indices, and device-name substrings select one display. Widgets implement `trait Widget` (`src/widgets.rs:21`) — add a Rust widget through `create_widget` or a Rhai text widget.
+Panels reserve their own monitor's `top`+`bottom` heights before tiling. `monitor="all"` creates one bar per display; `primary`, indices, and device-name substrings select one display. Widgets implement `trait Widget` (`src/widgets.rs`) — add a Rust widget through `create_widget` or a Rhai text widget. Draw through `src/ui.rs` so text is measured and every length scales with the display's DPI.
 
 ## Project layout
 
@@ -100,10 +100,10 @@ Cargo.toml  # windows 0.62 + serde/toml/dirs + rhai + regex + notify
 src/main.rs      # host window, WinEventHook, message loop, config hot-reload, hotkeys (public statics for crate::)
 src/command_center.rs # searchable keyboard/mouse command surface
 src/config.rs    # Config{general,ignore,panels,widgets,rules,keybinds,layouts} + find/load/validate
-src/manager.rs   # collect_windows, tile_windows_reserved(top,bottom), per-monitor DeferWindowPos
+src/manager.rs   # collect_windows, tile_windows_reserved(top,bottom), fit-aware slot assignment
 src/layout.rs    # MasterStack/Grid/Monocle/Floating + compute_layout
-src/taskbar.rs   # legacy AltDWM_Taskbar (fallback when no panels)
-src/panel.rs     # AltDWM_Panel — declarative panels from config
+src/panel.rs     # AltDWM_Panel — declarative panels from config, per-monitor DPI
+src/ui.rs        # shared drawing: DPI scale, measured text, tokens
 src/widgets.rs   # Widget trait + clock/layout/tasklist/tray/launcher/custom
 src/shell.rs     # reversible Explorer taskbar ownership
 src/tray.rs      # Explorer notification-area discovery/invocation bridge
@@ -123,7 +123,14 @@ scripts/cpu.rhai, spiral.rhai
 [main] message loop — Alt+Shift+Q quit, Alt+Shift+C reload
 ```
 
-Fallback (no panels) → `[taskbar] 1920x40 @ 0,1040` + `"(0,0 1920x992)"`.
+`general.taskbar = true` with no `[[panels]]` synthesises a bottom bar and runs
+it through the same panel pipeline, so it gets per-monitor placement, DPI
+scaling, and the full widget set. `general.taskbar_height` sets its height.
+
+All panel geometry — `height`, `margin`, `theme.font_size`, `theme.rounding` —
+is in device-independent pixels at 96 DPI and scaled per display, so a 40px bar
+occupies 60 physical pixels at 150% and reserves 60 pixels from the tiling area.
+Panels re-place themselves on `WM_DPICHANGED` and `WM_DISPLAYCHANGE`.
 
 ## Why DWM is not replaceable
 

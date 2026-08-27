@@ -9,9 +9,8 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
-    InvalidateRect, MonitorFromWindow, RoundRect, SelectObject, SetBkMode, SetTextColor, TextOutW,
-    HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, HDC, HFONT,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SetFocus, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
@@ -23,10 +22,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
+// All measurements below are device-independent pixels at 96 DPI, scaled for
+// the display the window opens on. They used to be raw pixels, so the panel was
+// physically half-size on a 200% display and its text did not fit its rows.
 const WIDTH: i32 = 520;
 const HEIGHT: i32 = 548;
 const ITEM_TOP: i32 = 178;
 const ITEM_HEIGHT: i32 = 58;
+const EDGE: i32 = 26;
+const HEADER_TOP: i32 = 18;
+const SEARCH_TOP: i32 = 88;
+const SEARCH_HEIGHT: i32 = 54;
+const FOOTER_HEIGHT: i32 = 42;
+
+/// DPI scale of the display this window is on.
+fn scale(hwnd: HWND) -> f32 {
+    crate::ui::scale_for_window(hwnd)
+}
 const MAX_VISIBLE_ITEMS: usize = 5;
 const KEY_BACK: u16 = VK_BACK.0;
 const KEY_DOWN: u16 = VK_DOWN.0;
@@ -151,43 +163,20 @@ fn matching_indices(query: &str) -> Vec<usize> {
         .collect()
 }
 
-fn compact_label(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let mut compact: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        compact.pop();
-        compact.push('…');
-    }
-    compact
+fn fill_rect(hdc: HDC, rect: RECT, color: COLORREF) {
+    crate::ui::fill_rect(hdc, &rect, color);
 }
 
-unsafe fn fill_rect(hdc: HDC, rect: RECT, color: COLORREF) {
-    let brush = CreateSolidBrush(color);
-    FillRect(hdc, &rect, brush);
-    let _ = DeleteObject(brush.into());
+fn fill_round_rect(hdc: HDC, rect: RECT, radius: i32, color: COLORREF) {
+    crate::ui::fill_round_rect(hdc, &rect, radius, color);
 }
 
-unsafe fn fill_round_rect(hdc: HDC, rect: RECT, radius: i32, color: COLORREF) {
-    let brush = CreateSolidBrush(color);
-    let old = SelectObject(hdc, brush.into());
-    let _ = RoundRect(
-        hdc,
-        rect.left,
-        rect.top,
-        rect.right,
-        rect.bottom,
-        radius,
-        radius,
-    );
-    let _ = SelectObject(hdc, old);
-    let _ = DeleteObject(brush.into());
-}
-
-unsafe fn text(hdc: HDC, value: &str, x: i32, y: i32, color: COLORREF) {
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, color);
-    let wide: Vec<u16> = value.encode_utf16().collect();
-    let _ = TextOutW(hdc, x, y, &wide);
+/// One line, vertically centred in `rect` and ellipsised to fit. Every label in
+/// this window goes through here, which is what keeps the rows aligned; they
+/// were previously placed with per-call constants like `top + 9`, `top + 19`,
+/// and `top + 31`.
+fn label(hdc: HDC, rect: RECT, value: &str, font: HFONT, color: COLORREF) {
+    crate::ui::draw_label(hdc, &rect, value, font, color);
 }
 
 unsafe fn paint(hwnd: HWND) {
@@ -200,33 +189,47 @@ unsafe fn paint(hwnd: HWND) {
         .unwrap_or_else(|error| error.into_inner())
         .theme
         .clone();
+    let scale = scale(hwnd);
+    let px = |value: i32| crate::ui::px(value, scale);
+    let font = |size: i32, weight: i32| {
+        crate::theme::get_cached_font_variant(&theme, px(size), weight)
+    };
 
     fill_rect(hdc, client, theme.panel_bg("top"));
 
-    let title_font = crate::theme::get_cached_font_variant(&theme, 23, 600);
-    let body_font = crate::theme::get_cached_font_variant(&theme, 14, 400);
-    let small_font = crate::theme::get_cached_font_variant(&theme, 12, 400);
-    let badge_font = crate::theme::get_cached_font_variant(&theme, 12, 600);
+    let title_font = font(23, 600);
+    let body_font = font(14, 400);
+    let small_font = font(12, 400);
+    let badge_font = font(12, 600);
 
-    let previous = SelectObject(hdc, title_font.into());
-    text(hdc, "AltDWM", 28, 22, theme.text_color());
-    let _ = SelectObject(hdc, small_font.into());
+    let edge = px(EDGE);
+    let header = RECT {
+        left: edge,
+        top: px(HEADER_TOP),
+        right: client.right - edge,
+        bottom: px(HEADER_TOP) + px(34),
+    };
+    label(hdc, header, "AltDWM", title_font, theme.text_color());
     let view = STATE.lock().unwrap_or_else(|error| error.into_inner()).view;
-    text(
+    let subtitle = RECT {
+        top: header.bottom,
+        bottom: header.bottom + px(22),
+        ..header
+    };
+    label(
         hdc,
+        subtitle,
         if view == CenterView::Shortcuts {
             "ACTIVE SHORTCUTS"
         } else {
             "COMMAND CENTER  •  TYPE TO FILTER"
         },
-        29,
-        54,
+        small_font,
         theme.text_dim_color(),
     );
 
     if view == CenterView::Shortcuts {
-        paint_shortcuts(hdc, client, &theme, body_font, small_font);
-        let _ = SelectObject(hdc, previous);
+        paint_shortcuts(hdc, client, &theme, scale, body_font, small_font);
         let _ = EndPaint(hwnd, &ps);
         return;
     }
@@ -237,14 +240,24 @@ unsafe fn paint(hwnd: HWND) {
         .query
         .clone();
     let search_rect = RECT {
-        left: 26,
-        top: 88,
-        right: client.right - 26,
-        bottom: 142,
+        left: edge,
+        top: px(SEARCH_TOP),
+        right: client.right - edge,
+        bottom: px(SEARCH_TOP) + px(SEARCH_HEIGHT),
     };
-    fill_round_rect(hdc, search_rect, 14, theme.surface_color());
-    let _ = SelectObject(hdc, body_font.into());
-    text(hdc, "⌕", 44, 105, theme.accent_active_color());
+    fill_round_rect(hdc, search_rect, px(14), theme.surface_color());
+    // A small drawn caret instead of `⌕`, which is not in Segoe UI and rendered
+    // as a fallback glyph or a missing-character box.
+    let caret_side = px(9);
+    let caret_left = search_rect.left + px(18);
+    let caret_top = search_rect.top + (search_rect.bottom - search_rect.top - caret_side) / 2;
+    let caret = RECT {
+        left: caret_left,
+        top: caret_top,
+        right: caret_left + caret_side,
+        bottom: caret_top + caret_side,
+    };
+    fill_round_rect(hdc, caret, caret_side / 2, theme.accent_active_color());
     let search_text = if query.is_empty() {
         "Search apps, layouts, and actions…"
     } else {
@@ -255,95 +268,169 @@ unsafe fn paint(hwnd: HWND) {
     } else {
         theme.text_color()
     };
-    text(hdc, search_text, 76, 105, search_color);
+    label(
+        hdc,
+        RECT {
+            left: caret.right + px(12),
+            right: search_rect.right - px(12),
+            ..search_rect
+        },
+        search_text,
+        body_font,
+        search_color,
+    );
 
     let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     let matches = matching_indices(&state.query);
     let selected = state.selected.min(matches.len().saturating_sub(1));
     drop(state);
 
+    let item_height = px(ITEM_HEIGHT);
     let visible = matches.iter().take(MAX_VISIBLE_ITEMS);
     for (row, item_index) in visible.enumerate() {
         let item = ITEMS[*item_index];
-        let top = ITEM_TOP + row as i32 * ITEM_HEIGHT;
+        let top = px(ITEM_TOP) + row as i32 * item_height;
         let row_rect = RECT {
-            left: 18,
+            left: px(18),
             top,
-            right: client.right - 18,
-            bottom: top + ITEM_HEIGHT - 6,
+            right: client.right - px(18),
+            bottom: top + item_height - px(6),
         };
         if row == selected {
-            fill_round_rect(hdc, row_rect, 12, theme.surface_hover_color());
+            fill_round_rect(hdc, row_rect, px(12), theme.surface_hover_color());
         }
+        let badge_side = row_rect.bottom - row_rect.top - px(8);
         let badge_rect = RECT {
-            left: 30,
-            top: top + 8,
-            right: 68,
-            bottom: top + 46,
+            left: row_rect.left + px(12),
+            top: row_rect.top + px(4),
+            right: row_rect.left + px(12) + badge_side,
+            bottom: row_rect.top + px(4) + badge_side,
         };
         fill_round_rect(
             hdc,
             badge_rect,
-            12,
+            px(12),
             if row == selected {
                 theme.accent_active_color()
             } else {
                 theme.surface_color()
             },
         );
-        let _ = SelectObject(hdc, badge_font.into());
-        text(hdc, item.badge, 40, top + 19, theme.text_color());
-        let _ = SelectObject(hdc, body_font.into());
-        text(hdc, item.title, 82, top + 9, theme.text_color());
-        let _ = SelectObject(hdc, small_font.into());
-        text(hdc, item.description, 82, top + 31, theme.text_dim_color());
-    }
-
-    if matches.is_empty() {
-        let _ = SelectObject(hdc, body_font.into());
-        text(
+        label(
             hdc,
-            "No matching commands",
-            30,
-            ITEM_TOP + 18,
+            RECT {
+                left: badge_rect.left + px(10),
+                ..badge_rect
+            },
+            item.badge,
+            badge_font,
             theme.text_color(),
         );
-        let _ = SelectObject(hdc, small_font.into());
-        text(
+        let text_left = badge_rect.right + px(14);
+        let split = row_rect.top + (row_rect.bottom - row_rect.top) / 2;
+        label(
             hdc,
-            "Try “files”, “layout”, or “reload”.",
-            30,
-            ITEM_TOP + 46,
+            RECT {
+                left: text_left,
+                top: row_rect.top + px(4),
+                right: row_rect.right - px(12),
+                bottom: split,
+            },
+            item.title,
+            body_font,
+            theme.text_color(),
+        );
+        label(
+            hdc,
+            RECT {
+                left: text_left,
+                top: split,
+                right: row_rect.right - px(12),
+                bottom: row_rect.bottom - px(4),
+            },
+            item.description,
+            small_font,
             theme.text_dim_color(),
         );
     }
 
+    if matches.is_empty() {
+        let empty = RECT {
+            left: px(30),
+            top: px(ITEM_TOP),
+            right: client.right - px(30),
+            bottom: px(ITEM_TOP) + px(28),
+        };
+        label(
+            hdc,
+            empty,
+            "No matching commands",
+            body_font,
+            theme.text_color(),
+        );
+        label(
+            hdc,
+            RECT {
+                top: empty.bottom,
+                bottom: empty.bottom + px(24),
+                ..empty
+            },
+            "Try “files”, “layout”, or “reload”.",
+            small_font,
+            theme.text_dim_color(),
+        );
+    }
+
+    paint_footer(
+        hdc,
+        client,
+        &theme,
+        scale,
+        small_font,
+        "↑ ↓  SELECT     ENTER  OPEN     ESC  CLOSE",
+    );
+    let _ = EndPaint(hwnd, &ps);
+}
+
+/// Footer strip, shared by both views.
+fn paint_footer(
+    hdc: HDC,
+    client: RECT,
+    theme: &crate::theme::Theme,
+    scale: f32,
+    font: HFONT,
+    hint: &str,
+) {
+    let height = crate::ui::px(FOOTER_HEIGHT, scale);
     let footer = RECT {
         left: 0,
-        top: client.bottom - 42,
+        top: client.bottom - height,
         right: client.right,
         bottom: client.bottom,
     };
     fill_rect(hdc, footer, theme.surface_color());
-    let _ = SelectObject(hdc, small_font.into());
-    text(
+    label(
         hdc,
-        "↑ ↓  SELECT     ENTER  OPEN     ESC  CLOSE",
-        28,
-        client.bottom - 27,
+        RECT {
+            left: crate::ui::px(EDGE, scale),
+            right: client.right - crate::ui::px(EDGE, scale),
+            ..footer
+        },
+        hint,
+        font,
         theme.text_dim_color(),
     );
-    let _ = SelectObject(hdc, previous);
-    let _ = EndPaint(hwnd, &ps);
 }
 
-unsafe fn paint_shortcuts(
+fn paint_shortcuts(
     hdc: HDC,
     client: RECT,
     theme: &crate::theme::Theme,
-    body_font: windows::Win32::Graphics::Gdi::HFONT,
-    small_font: windows::Win32::Graphics::Gdi::HFONT,
+    scale: f32,
+    body_font: HFONT,
+    small_font: HFONT,
 ) {
+    let px = |value: i32| crate::ui::px(value, scale);
     let keybinds = crate::ACTIVE_KEYBINDS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -351,65 +438,75 @@ unsafe fn paint_shortcuts(
     let count = keybinds.len();
     let columns = if count > 7 { 2 } else { 1 };
     let rows = count.div_ceil(columns).max(1);
-    let column_width = (client.right - 52) / columns as i32;
+    let edge = px(EDGE);
+    let column_width = (client.right - edge * 2) / columns as i32;
+    let card_height = px(46);
 
     if keybinds.is_empty() {
-        let _ = SelectObject(hdc, body_font.into());
-        text(
+        label(
             hdc,
+            RECT {
+                left: edge,
+                top: px(92),
+                right: client.right - edge,
+                bottom: px(92) + px(28),
+            },
             "No shortcuts are currently registered.",
-            28,
-            104,
+            body_font,
             theme.text_color(),
         );
     } else {
         for (index, keybind) in keybinds.iter().enumerate() {
             let column = index / rows;
             let row = index % rows;
-            let left = 26 + column as i32 * column_width;
-            let top = 92 + row as i32 * 54;
+            let left = edge + column as i32 * column_width;
+            let top = px(92) + row as i32 * (card_height + px(8));
+            if top + card_height > client.bottom - px(FOOTER_HEIGHT) {
+                continue;
+            }
             let card = RECT {
                 left,
                 top,
-                right: left + column_width - 10,
-                bottom: top + 46,
+                right: left + column_width - px(10),
+                bottom: top + card_height,
             };
-            fill_round_rect(hdc, card, 10, theme.surface_color());
-            let _ = SelectObject(hdc, body_font.into());
-            text(
+            fill_round_rect(hdc, card, px(10), theme.surface_color());
+            let split = card.top + (card.bottom - card.top) / 2;
+            label(
                 hdc,
+                RECT {
+                    left: card.left + px(12),
+                    right: card.right - px(10),
+                    top: card.top + px(3),
+                    bottom: split,
+                },
                 &keybind.keys,
-                left + 12,
-                top + 7,
+                body_font,
                 theme.accent_active_color(),
             );
-            let _ = SelectObject(hdc, small_font.into());
             let description = keybind.description.as_deref().unwrap_or(&keybind.action);
-            let description = compact_label(description, 31);
-            text(
+            label(
                 hdc,
-                &description,
-                left + 12,
-                top + 27,
+                RECT {
+                    left: card.left + px(12),
+                    right: card.right - px(10),
+                    top: split,
+                    bottom: card.bottom - px(3),
+                },
+                description,
+                small_font,
                 theme.text_dim_color(),
             );
         }
     }
 
-    let footer = RECT {
-        left: 0,
-        top: client.bottom - 42,
-        right: client.right,
-        bottom: client.bottom,
-    };
-    fill_rect(hdc, footer, theme.surface_color());
-    let _ = SelectObject(hdc, small_font.into());
-    text(
+    paint_footer(
         hdc,
+        client,
+        theme,
+        scale,
+        small_font,
         "ESC / BACKSPACE  BACK TO COMMANDS",
-        28,
-        client.bottom - 27,
-        theme.text_dim_color(),
     );
 }
 
@@ -537,8 +634,14 @@ unsafe extern "system" fn wndproc(
                 return LRESULT(0);
             }
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-            if y >= ITEM_TOP {
-                let row = ((y - ITEM_TOP) / ITEM_HEIGHT) as usize;
+            // Row geometry is scaled when painted, so hit-testing has to scale
+            // identically or a click lands on a different row than the one under
+            // the pointer on any display above 100%.
+            let scale = scale(hwnd);
+            let item_top = crate::ui::px(ITEM_TOP, scale);
+            let item_height = crate::ui::px(ITEM_HEIGHT, scale).max(1);
+            if y >= item_top {
+                let row = ((y - item_top) / item_height) as usize;
                 let count = {
                     let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
                     matching_indices(&state.query).len().min(MAX_VISIBLE_ITEMS)
@@ -575,7 +678,7 @@ fn ensure_class() -> Result<(), String> {
     crate::util::register_window_class(w!("AltDWM_CommandCenter"), wndproc, "Command center")
 }
 
-fn place_near(anchor: HWND) -> (i32, i32) {
+fn place_near(anchor: HWND) -> Placement {
     unsafe {
         let monitor = MonitorFromWindow(anchor, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
@@ -585,24 +688,41 @@ fn place_near(anchor: HWND) -> (i32, i32) {
         let _ = GetMonitorInfoW(monitor, &mut info);
         let mut anchor_rect = RECT::default();
         let _ = GetWindowRect(anchor, &mut anchor_rect);
+        // Physical size for the display the panel will appear on, so the window
+        // is the same apparent size everywhere instead of shrinking as scaling
+        // rises.
+        let scale = crate::ui::scale_for_monitor(monitor);
+        let width = crate::ui::px(WIDTH, scale);
+        let height = crate::ui::px(HEIGHT, scale);
+        let margin = crate::ui::px(12, scale);
         let monitor_width = info.rcWork.right - info.rcWork.left;
-        let x = (anchor_rect.left + 8)
-            .max(info.rcWork.left + 12)
-            .min(info.rcWork.right - WIDTH - 12)
-            .min(info.rcWork.left + monitor_width - WIDTH - 12);
+        let x = (anchor_rect.left + crate::ui::px(8, scale))
+            .max(info.rcWork.left + margin)
+            .min(info.rcWork.right - width - margin)
+            .min(info.rcWork.left + monitor_width - width - margin);
         let anchor_center = (anchor_rect.top + anchor_rect.bottom) / 2;
         let monitor_center = (info.rcMonitor.top + info.rcMonitor.bottom) / 2;
         let y = if anchor_center > monitor_center {
-            anchor_rect.top - HEIGHT - 10
+            anchor_rect.top - height - crate::ui::px(10, scale)
         } else {
-            anchor_rect.bottom + 10
+            anchor_rect.bottom + crate::ui::px(10, scale)
         };
-        (
+        Placement {
             x,
-            y.max(info.rcWork.top + 12)
-                .min(info.rcWork.bottom - HEIGHT - 12),
-        )
+            y: y.max(info.rcWork.top + margin)
+                .min(info.rcWork.bottom - height - margin),
+            width,
+            height,
+        }
     }
+}
+
+/// Where and how large the command center should open.
+struct Placement {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
 }
 
 pub fn toggle(anchor: HWND) {
@@ -617,17 +737,17 @@ pub fn toggle(anchor: HWND) {
         eprintln!("[command-center] {error}");
         return;
     }
-    let (x, y) = place_near(anchor);
+    let placement = place_near(anchor);
     let created = unsafe {
         CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_APPWINDOW,
             w!("AltDWM_CommandCenter"),
             w!("AltDWM Command Center"),
             WS_POPUP | WS_VISIBLE,
-            x,
-            y,
-            WIDTH,
-            HEIGHT,
+            placement.x,
+            placement.y,
+            placement.width,
+            placement.height,
             Some(anchor),
             Some(HMENU(std::ptr::null_mut())),
             Some(HINSTANCE(std::ptr::null_mut())),
@@ -666,10 +786,10 @@ pub fn toggle(anchor: HWND) {
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
-            x,
-            y,
-            WIDTH,
-            HEIGHT,
+            placement.x,
+            placement.y,
+            placement.width,
+            placement.height,
             SWP_SHOWWINDOW,
         );
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -698,7 +818,7 @@ pub fn close() {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_label, matching_indices};
+    use super::matching_indices;
 
     #[test]
     fn command_search_matches_titles_descriptions_and_keywords() {
@@ -707,12 +827,5 @@ mod tests {
         assert!(!matching_indices("settings").is_empty());
         assert!(!matching_indices("balanced").is_empty());
         assert!(matching_indices("definitely-not-a-command").is_empty());
-    }
-
-    #[test]
-    fn shortcut_labels_are_compacted_on_character_boundaries() {
-        assert_eq!(compact_label("Focus next window", 31), "Focus next window");
-        assert_eq!(compact_label("1234567890", 5), "1234…");
-        assert_eq!(compact_label("éééééé", 5), "éééé…");
     }
 }

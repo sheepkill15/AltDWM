@@ -94,8 +94,10 @@ interval = 2000
 script = "scripts/cpu.rhai"
 width = 150
 
+# match_class is exact; `*` opts into partial matching. Spotify's real window
+# class is SpotifyMainWindow, so the wildcard is what makes this rule fire.
 [[rules]]
-match_class = "Spotify"
+match_class = "*Spotify*"
 floating = true
 
 [[rules]]

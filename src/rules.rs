@@ -1,91 +1,241 @@
 //! Rule engine — matches windows against `[[rules]]` in config.toml
-//! See docs/EXTENSIBILITY.md §3. Supports class/title/process with exact or regex.
-use regex::Regex;
+//! See docs/EXTENSIBILITY.md §3.
+//!
+//! Matching semantics, which used to be undocumented and surprising:
+//!
+//! * `match_class` and `match_process` are **exact**, case-insensitive. Wrap the
+//!   pattern in `*` to match partially (`match_class = "*Chrome*"`). They used to
+//!   fall back to a substring test, so a rule written for one application quietly
+//!   captured every window whose class or executable merely contained the text —
+//!   which presented as windows randomly refusing to tile.
+//! * `match_title` is a case-insensitive **substring** test, because window
+//!   titles are long and change at runtime. `*` wildcards work here too.
+//! * `match_*_regex` variants are full regular expressions.
+//!
+//! Every condition present on a rule must match for the rule to apply.
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use windows::Win32::Foundation::HWND;
 
 use crate::config::RuleConfig;
 use crate::util::{get_class_name, get_window_title};
 
-fn matches_pattern(
-    text: &str,
-    pattern: &str,
-    compiled: Option<&Regex>,
-    regex_pattern: Option<&String>,
-) -> bool {
-    if let Some(re) = compiled {
-        return re.is_match(text);
+
+
+/// Class name and executable name never change for a live window, so they are
+/// resolved once. Process resolution in particular costs an `OpenProcess` round
+/// trip that used to be paid for every window on every rule evaluation, several
+/// times per tiling pass.
+static CLASS_CACHE: LazyLock<Mutex<HashMap<isize, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PROCESS_CACHE: LazyLock<Mutex<HashMap<isize, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cached_class_name(hwnd: HWND) -> String {
+    let key = hwnd.0 as isize;
+    if let Some(cached) = CLASS_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return cached;
     }
-    if regex_pattern.is_some() {
-        // regex present but not compiled -> invalid, already warned in compile_regexes
-        return false;
+    let class = get_class_name(hwnd);
+    if !class.is_empty() {
+        CLASS_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, class.clone());
     }
+    class
+}
+
+/// Case-insensitive glob supporting `*` (any run of characters) and `?` (one
+/// character). Anchored at both ends.
+fn glob_matches(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.to_lowercase().chars().collect();
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    // Classic two-pointer glob with backtracking on the most recent `*`.
+    let mut t = 0;
+    let mut p = 0;
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            t += 1;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((star_p, star_t)) = star {
+            p = star_p + 1;
+            t = star_t + 1;
+            star = Some((star_p, star_t + 1));
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn has_wildcard(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+/// Exact by default, glob when the pattern says so.
+fn matches_identifier(text: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
-    text.to_lowercase().contains(&pattern.to_lowercase())
+    if has_wildcard(pattern) {
+        glob_matches(text, pattern)
+    } else {
+        text.eq_ignore_ascii_case(pattern)
+    }
 }
 
-fn matches_exact(text: &str, pattern: &str) -> bool {
-    text == pattern
+/// Substring by default, glob when the pattern says so. Titles are long and
+/// mutable, so a substring test is the useful default here.
+fn matches_title(text: &str, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    if has_wildcard(pattern) {
+        glob_matches(text, pattern)
+    } else {
+        text.to_lowercase().contains(&pattern.to_lowercase())
+    }
 }
 
-pub fn rule_matches(hwnd: HWND, rule: &RuleConfig) -> bool {
-    // if any match_* is set, it must match; if none set, rule matches nothing
+/// The window facts a rule can be tested against, gathered once per evaluation.
+struct WindowFacts {
+    class: String,
+    title: String,
+    process: Option<String>,
+}
+
+impl WindowFacts {
+    fn gather(hwnd: HWND, needs_process: bool) -> Self {
+        Self {
+            class: cached_class_name(hwnd),
+            title: get_window_title(hwnd),
+            process: needs_process.then(|| get_process_name(hwnd)),
+        }
+    }
+}
+
+fn rule_needs_process(rule: &RuleConfig) -> bool {
+    rule.match_process.is_some()
+}
+
+fn rule_matches_facts(facts: &WindowFacts, rule: &RuleConfig) -> bool {
     let mut has_condition = false;
     let mut matched = true;
 
-    let class = get_class_name(hwnd);
-    let title = get_window_title(hwnd);
-
-    if let Some(pat) = &rule.match_class {
+    if let Some(pattern) = &rule.match_class {
         has_condition = true;
-        let ok = matches_exact(&class, pat)
-            || matches_pattern(
-                &class,
-                pat,
-                rule.compiled_class_regex.as_ref(),
-                rule.match_class_regex.as_ref(),
-            );
-        matched &= ok;
+        matched &= matches_identifier(&facts.class, pattern);
     } else if rule.match_class_regex.is_some() {
         has_condition = true;
-        if let Some(re) = rule.compiled_class_regex.as_ref() {
-            matched &= re.is_match(&class);
-        } else {
-            matched = false;
-        }
+        matched &= rule
+            .compiled_class_regex
+            .as_ref()
+            .is_some_and(|re| re.is_match(&facts.class));
     }
 
-    if let Some(pat) = &rule.match_title {
+    if let Some(pattern) = &rule.match_title {
         has_condition = true;
-        let ok = matches_pattern(
-            &title,
-            pat,
-            rule.compiled_title_regex.as_ref(),
-            rule.match_title_regex.as_ref(),
-        );
-        matched &= ok;
+        matched &= matches_title(&facts.title, pattern);
     } else if rule.match_title_regex.is_some() {
         has_condition = true;
-        if let Some(re) = rule.compiled_title_regex.as_ref() {
-            matched &= re.is_match(&title);
-        } else {
-            matched = false;
-        }
+        matched &= rule
+            .compiled_title_regex
+            .as_ref()
+            .is_some_and(|re| re.is_match(&facts.title));
     }
 
-    if let Some(pat) = &rule.match_process {
+    if let Some(pattern) = &rule.match_process {
         has_condition = true;
-        // process name: try GetWindowThreadProcessId + OpenProcess + GetModuleBaseName
-        let proc_name = get_process_name(hwnd);
-        let ok = matches_pattern(&proc_name, pat, None, None);
-        matched &= ok;
+        let process = facts.process.as_deref().unwrap_or_default();
+        matched &= matches_identifier(process, pattern);
     }
 
+    // A rule with no conditions matches nothing. `validate` warns about these.
     has_condition && matched
 }
 
+/// Everything the configuration has to say about one window.
+///
+/// Resolving these together means the rule list is walked once per window per
+/// tiling pass instead of once per property — each walk previously re-read the
+/// class name, the title, and sometimes the executable name.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedRules {
+    pub floating: Option<bool>,
+    pub monitor: Option<String>,
+    pub opacity: Option<f32>,
+    pub layout: Option<String>,
+    pub on_create: Vec<String>,
+}
+
+pub fn resolve(hwnd: HWND) -> ResolvedRules {
+    let cfg = crate::CURRENT_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cfg.rules.is_empty() {
+        return ResolvedRules::default();
+    }
+    let needs_process = cfg.rules.iter().any(rule_needs_process);
+    let facts = WindowFacts::gather(hwnd, needs_process);
+    let mut resolved = ResolvedRules::default();
+    for rule in &cfg.rules {
+        if !rule_matches_facts(&facts, rule) {
+            continue;
+        }
+        // First matching rule wins per property, so config order is meaningful.
+        if resolved.floating.is_none() {
+            resolved.floating = rule.floating;
+        }
+        if resolved.monitor.is_none() {
+            resolved.monitor = rule.monitor.clone();
+        }
+        if resolved.opacity.is_none() {
+            resolved.opacity = rule.opacity.map(|value| value.clamp(0.0, 1.0));
+        }
+        if resolved.layout.is_none() {
+            resolved.layout = rule.layout.clone();
+        }
+        if let Some(action) = &rule.on_create {
+            resolved.on_create.push(action.clone());
+        }
+    }
+    resolved
+}
+
 pub fn get_process_name(hwnd: HWND) -> String {
+    let key = hwnd.0 as isize;
+    if let Some(cached) = PROCESS_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return cached;
+    }
+    let name = query_process_name(hwnd);
+    if !name.is_empty() {
+        PROCESS_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, name.clone());
+    }
+    name
+}
+
+fn query_process_name(hwnd: HWND) -> String {
     unsafe {
         let mut pid: u32 = 0;
         windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, Some(&mut pid));
@@ -97,30 +247,26 @@ pub fn get_process_name(hwnd: HWND) -> String {
             false,
             pid,
         );
-        if let Ok(h) = handle {
-            let mut buf = [0u16; 260];
-            let mut len = buf.len() as u32;
-            // QueryFullProcessImageNameW
-            let ok = windows::Win32::System::Threading::QueryFullProcessImageNameW(
-                h,
-                windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
-                windows::core::PWSTR(buf.as_mut_ptr()),
-                &mut len,
-            );
-            let _ = windows::Win32::Foundation::CloseHandle(h);
-            if ok.is_ok() {
-                let s = String::from_utf16_lossy(&buf[..len as usize]);
-                // extract basename
-                if let Some(pos) = s.rfind('\\') {
-                    return s[pos + 1..].to_string();
-                }
-                if let Some(pos) = s.rfind('/') {
-                    return s[pos + 1..].to_string();
-                }
-                return s;
-            }
+        let Ok(h) = handle else {
+            return String::new();
+        };
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = windows::Win32::System::Threading::QueryFullProcessImageNameW(
+            h,
+            windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = windows::Win32::Foundation::CloseHandle(h);
+        if ok.is_err() {
+            return String::new();
         }
-        String::new()
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&path)
+            .to_string()
     }
 }
 
@@ -128,17 +274,7 @@ pub fn get_process_name(hwnd: HWND) -> String {
 /// to opt a window back into tiling even when automatic utility/constraint
 /// heuristics would otherwise float it.
 pub fn floating_decision(hwnd: HWND) -> Option<bool> {
-    let cfg = crate::CURRENT_CONFIG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for rule in &cfg.rules {
-        if rule_matches(hwnd, rule) {
-            if let Some(floating) = rule.floating {
-                return Some(floating);
-            }
-        }
-    }
-    None
+    resolve(hwnd).floating
 }
 
 /// Returns true if a window is explicitly configured to float.
@@ -147,83 +283,69 @@ pub fn is_floating(hwnd: HWND) -> bool {
 }
 
 /// Get monitor target from rule, if any (e.g. rule monitor=2)
-pub fn rule_monitor(_hwnd: HWND) -> Option<String> {
-    let cfg = crate::CURRENT_CONFIG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for rule in &cfg.rules {
-        if rule_matches(_hwnd, rule) {
-            if let Some(m) = &rule.monitor {
-                return Some(m.clone());
-            }
-        }
-    }
-    None
+pub fn rule_monitor(hwnd: HWND) -> Option<String> {
+    resolve(hwnd).monitor
 }
 
-/// Get a per-monitor layout override. Config rule order is authoritative.
+/// A per-monitor layout override, taken from the monitor's master window.
+///
+/// This used to apply if *any* window on the display matched, so one incidental
+/// match re-laid out every other window there. Tying it to the master window
+/// makes the intent expressible and the result predictable: "when this
+/// application holds the master slot, use this layout".
 pub fn layout_for_windows(windows: &[HWND]) -> Option<String> {
-    let cfg = crate::CURRENT_CONFIG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    cfg.rules
+    windows.first().and_then(|hwnd| resolve(*hwnd).layout)
+}
+
+/// Windows AltDWM has made layered, with the ex-style to put back.
+///
+/// `WS_EX_LAYERED` changes the compositing path for the target application, so
+/// leaving it set after a rule stops matching — or after AltDWM exits — is a
+/// change to someone else's window that outlives the reason for it.
+static LAYERED: LazyLock<Mutex<HashMap<isize, (u8, isize)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Bring every window's opacity in line with the rules, restoring any window
+/// AltDWM previously made translucent that no longer has a rule.
+pub fn sync_opacity(desired: &[(HWND, Option<f32>)]) {
+    let wanted: HashMap<isize, u8> = desired
         .iter()
-        .find(|rule| rule.layout.is_some() && windows.iter().any(|hwnd| rule_matches(*hwnd, rule)))
-        .and_then(|rule| rule.layout.clone())
-}
-
-/// Get opacity from rule, if any (0.0-1.0)
-pub fn rule_opacity(hwnd: HWND) -> Option<f32> {
-    let cfg = crate::CURRENT_CONFIG
+        .filter_map(|(hwnd, opacity)| {
+            opacity.map(|value| (hwnd.0 as isize, (value.clamp(0.0, 1.0) * 255.0) as u8))
+        })
+        .collect();
+    let stale: Vec<isize> = LAYERED
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for rule in &cfg.rules {
-        if rule_matches(hwnd, rule) {
-            if let Some(o) = rule.opacity {
-                return Some(o.clamp(0.0, 1.0));
-            }
-        }
+        .unwrap_or_else(|error| error.into_inner())
+        .keys()
+        .copied()
+        .filter(|key| !wanted.contains_key(key))
+        .collect();
+    for key in stale {
+        restore_opacity(HWND(key as *mut std::ffi::c_void));
     }
-    None
+    for (key, alpha) in wanted {
+        apply_alpha(HWND(key as *mut std::ffi::c_void), alpha);
+    }
 }
 
-static OPACITY_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<isize, u8>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-pub fn apply_opacity(hwnd: HWND, opacity: f32) {
+fn apply_alpha(hwnd: HWND, alpha: u8) {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,
         WS_EX_LAYERED,
     };
-    let alpha = (opacity.clamp(0.0, 1.0) * 255.0) as u8;
+    let key = hwnd.0 as isize;
     {
-        let mut cache = OPACITY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&prev) = cache.get(&(hwnd.0 as isize)) {
-            if prev == alpha {
-                return;
-            }
-        }
-        cache.insert(hwnd.0 as isize, alpha);
-        // prune destroyed windows lazily
-        if cache.len() > 512 {
-            let mut dead = Vec::new();
-            for k in cache.keys() {
-                let h = HWND(*k as *mut std::ffi::c_void);
-                unsafe {
-                    if !windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(h)).as_bool() {
-                        dead.push(*k);
-                    }
-                }
-            }
-            for k in dead {
-                cache.remove(&k);
-            }
+        let layered = LAYERED.lock().unwrap_or_else(|e| e.into_inner());
+        if layered.get(&key).is_some_and(|(previous, _)| *previous == alpha) {
+            return;
         }
     }
     unsafe {
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        if (ex & WS_EX_LAYERED.0) == 0 {
-            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex | WS_EX_LAYERED.0) as isize);
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let already_layered = (ex as u32 & WS_EX_LAYERED.0) != 0;
+        if !already_layered {
+            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
         }
         let _ = SetLayeredWindowAttributes(
             hwnd,
@@ -231,21 +353,57 @@ pub fn apply_opacity(hwnd: HWND, opacity: f32) {
             alpha,
             LWA_ALPHA,
         );
+        LAYERED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (alpha, ex));
+    }
+}
+
+fn restore_opacity(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,
+    };
+    let entry = LAYERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(hwnd.0 as isize));
+    let Some((_, original_ex_style)) = entry else {
+        return;
+    };
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return;
+        }
+        let _ = SetLayeredWindowAttributes(
+            hwnd,
+            windows::Win32::Foundation::COLORREF(0),
+            255,
+            LWA_ALPHA,
+        );
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, original_ex_style);
+    }
+}
+
+/// Put every window AltDWM made translucent back the way it was found.
+pub fn restore_all_opacity() {
+    let keys: Vec<isize> = LAYERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .collect();
+    for key in keys {
+        restore_opacity(HWND(key as *mut std::ffi::c_void));
     }
 }
 
 /// Execute on_create action if rule matches (rhai)
 pub fn maybe_run_on_create(hwnd: HWND) {
-    let actions: Vec<String> = {
-        let cfg = crate::CURRENT_CONFIG
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        cfg.rules
-            .iter()
-            .filter(|r| rule_matches(hwnd, r))
-            .filter_map(|r| r.on_create.clone())
-            .collect()
-    };
+    let actions = resolve(hwnd).on_create;
+    if actions.is_empty() {
+        return;
+    }
     let actions: Vec<String> = {
         let mut seen = ON_CREATE_SEEN.lock().unwrap_or_else(|e| e.into_inner());
         actions
@@ -259,13 +417,69 @@ pub fn maybe_run_on_create(hwnd: HWND) {
     }
 }
 
-static ON_CREATE_SEEN: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<(isize, String)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static ON_CREATE_SEEN: LazyLock<Mutex<std::collections::HashSet<(isize, String)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 pub fn forget_window(hwnd: HWND) {
+    let key = hwnd.0 as isize;
     ON_CREATE_SEEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|(handle, _)| *handle != hwnd.0 as isize);
+        .retain(|(handle, _)| *handle != key);
+    CLASS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    PROCESS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    LAYERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{glob_matches, matches_identifier, matches_title};
+
+    #[test]
+    fn identifiers_match_exactly_by_default() {
+        assert!(matches_identifier("Chrome_WidgetWin_1", "chrome_widgetwin_1"));
+        // The old substring fallback made this true, so a rule for "Chrome"
+        // captured every class containing it.
+        assert!(!matches_identifier("Chrome_WidgetWin_1", "Chrome"));
+    }
+
+    #[test]
+    fn wildcards_opt_into_partial_matching() {
+        assert!(matches_identifier("Chrome_WidgetWin_1", "*Chrome*"));
+        assert!(matches_identifier("steamwebhelper.exe", "steam*"));
+        assert!(!matches_identifier("notepad.exe", "steam*"));
+        assert!(matches_identifier("code.exe", "cod?.exe"));
+    }
+
+    #[test]
+    fn titles_still_match_on_substrings() {
+        assert!(matches_title("Inbox — Mail", "inbox"));
+        assert!(!matches_title("Inbox — Mail", "outbox"));
+        assert!(matches_title("Inbox — Mail", "*mail"));
+    }
+
+    #[test]
+    fn glob_handles_backtracking_and_anchoring() {
+        assert!(glob_matches("aaa", "a*a"));
+        assert!(glob_matches("abcabc", "*abc"));
+        assert!(glob_matches("anything", "*"));
+        assert!(!glob_matches("abc", "*d"));
+        assert!(!glob_matches("abcd", "abc"));
+        assert!(glob_matches("", "*"));
+    }
+
+    #[test]
+    fn empty_patterns_never_match() {
+        assert!(!matches_identifier("anything", ""));
+        assert!(!matches_title("anything", ""));
+    }
 }

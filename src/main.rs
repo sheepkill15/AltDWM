@@ -7,9 +7,9 @@ mod panel;
 mod rules;
 mod scripting;
 mod shell;
-mod taskbar;
 mod theme;
 mod tray;
+mod ui;
 mod util;
 mod virtual_desktop;
 mod watcher;
@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
     EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
     EVENT_SYSTEM_MOVESIZESTART, HMENU, HWND_MESSAGE, MSG, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_TIMER,
+    WINEVENT_SKIPOWNPROCESS, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_TIMER,
 };
 
 use layout::Layout;
@@ -45,7 +45,6 @@ use windows::core::w;
 pub static RETILE_PENDING: AtomicBool = AtomicBool::new(false);
 pub static CONFIG_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 pub static TILING_ENABLED: AtomicBool = AtomicBool::new(true);
-pub static TASKBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub static CURRENT_LAYOUT: LazyLock<Mutex<Layout>> =
     LazyLock::new(|| Mutex::new(Layout::MasterStack));
@@ -143,23 +142,17 @@ pub fn is_ignored_title(title: &str) -> bool {
     cfg.ignore.titles.iter().any(|t| title.contains(t))
 }
 
+/// Top and bottom reserves used only as a fallback when a monitor cannot be
+/// resolved. Real placement asks `panel_reserves_for_monitor` per display.
 fn bar_reserves(cfg: &config::Config) -> (i32, i32) {
-    if cfg.panels.is_empty() {
-        if TASKBAR_ENABLED.load(Ordering::SeqCst) {
-            (0, taskbar::TASKBAR_HEIGHT)
-        } else {
-            (0, 0)
-        }
-    } else {
-        let reserved = |position: &str| {
-            cfg.panels
-                .iter()
-                .filter(|panel| panel.position == position)
-                .map(config::PanelConfig::edge_consumption)
-                .sum()
-        };
-        (reserved("top"), reserved("bottom"))
-    }
+    let reserved = |position: &str| {
+        cfg.panels
+            .iter()
+            .filter(|panel| panel.position == position)
+            .map(config::PanelConfig::edge_consumption)
+            .sum()
+    };
+    (reserved("top"), reserved("bottom"))
 }
 
 fn tile_current_layout_now() {
@@ -168,14 +161,7 @@ fn tile_current_layout_now() {
         .unwrap_or_else(|error| error.into_inner())
         .clone();
     let (top_reserve, bottom_reserve) = bar_reserves(&cfg);
-    let taskbar_hwnd = taskbar::get_taskbar_hwnd();
-    let reserve = if cfg.panels.is_empty() {
-        taskbar_hwnd
-    } else {
-        None
-    };
     manager::tile_windows_reserved(
-        reserve,
         top_reserve,
         bottom_reserve,
         cfg.layout_enum(),
@@ -184,8 +170,7 @@ fn tile_current_layout_now() {
 }
 
 fn place_new_window_immediately(hwnd: HWND) {
-    let taskbar_hwnd = taskbar::get_taskbar_hwnd();
-    let mut windows = manager::collect_windows(taskbar_hwnd);
+    let mut windows = manager::collect_windows();
     if !windows.contains(&hwnd) {
         windows.push(hwnd);
     }
@@ -402,6 +387,7 @@ unsafe extern "system" fn win_event_proc(
     }
     if event == EVENT_OBJECT_DESTROY {
         rules::forget_window(hwnd);
+        widgets::forget_icon(hwnd);
         TRANSITIONS_TO_RESTORE
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -418,10 +404,23 @@ unsafe extern "system" fn win_event_proc(
     if event == EVENT_SYSTEM_MOVESIZEEND {
         manager::finish_interactive_move(hwnd);
     }
-    // Foreground changes only affect panel state (active window/title). A full
-    // layout pass here made window-list feedback laggy and needlessly moved every
-    // HWND on each focus change.
-    panel::invalidate_all();
+    // Only events that change what a panel displays are worth a repaint.
+    // Repainting on every LOCATIONCHANGE meant dragging one window redrew every
+    // bar at event rate, and each redraw re-enumerated every top-level window.
+    let changes_panel_contents = matches!(
+        event,
+        EVENT_SYSTEM_FOREGROUND
+            | EVENT_OBJECT_CREATE
+            | EVENT_OBJECT_DESTROY
+            | EVENT_OBJECT_SHOW
+            | EVENT_OBJECT_HIDE
+            | EVENT_SYSTEM_MINIMIZESTART
+            | EVENT_SYSTEM_MINIMIZEEND
+    );
+    if changes_panel_contents {
+        manager::invalidate_window_snapshot();
+        panel::invalidate_all();
+    }
     if event == EVENT_SYSTEM_FOREGROUND {
         manager::refresh_window_borders();
     }
@@ -444,7 +443,7 @@ unsafe extern "system" fn win_event_proc(
     // Accessibility and shell UI can emit window-object events too. Only a
     // newly manageable HWND or one already known to the manager can affect the
     // layout; ignoring the rest prevents tray/UIA activity from causing retiles.
-    let affects_layout = was_tracked || util::is_manageable(hwnd, taskbar::get_taskbar_hwnd());
+    let affects_layout = was_tracked || util::is_manageable(hwnd);
     if !affects_layout {
         return;
     }
@@ -491,6 +490,17 @@ unsafe extern "system" fn host_wndproc(
                     tile_current_layout_now();
                 }
             }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            // Resolution changes, docking, and monitor hotplug all arrive here.
+            // Panels were previously left at their stale positions until the
+            // configuration happened to be reloaded.
+            println!("[host] display configuration changed — re-placing panels");
+            manager::clear_layout_overrides();
+            manager::invalidate_window_snapshot();
+            panel::reposition_all();
+            request_retile();
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -583,13 +593,16 @@ fn do_generate_config(explicit: Option<&std::path::Path>) {
 }
 
 fn do_check_config(explicit: Option<&std::path::Path>) {
-    let (cfg, path) = match config::load_existing(explicit) {
+    let (mut cfg, path) = match config::load_existing(explicit) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("Config validation failed: {error}");
             std::process::exit(1);
         }
     };
+    // Report the configuration the runtime will actually build, including the
+    // bar synthesised for `taskbar = true` with no [[panels]] declared.
+    config::ensure_default_bar(&mut cfg);
     println!("Config: {}", path.display());
     println!(
         "general: gap={} layout={} taskbar={}",
@@ -662,9 +675,9 @@ fn apply_config_reload(
     mut new_cfg: config::Config,
     new_path: Option<PathBuf>,
     panel_handles: &mut Vec<HWND>,
-    taskbar_hwnd: &mut Option<HWND>,
 ) {
     command_center::close();
+    config::ensure_default_bar(&mut new_cfg);
     manager::clear_layout_overrides();
     for w in new_cfg.validate() {
         eprintln!("[config] warn: {}", w);
@@ -680,15 +693,6 @@ fn apply_config_reload(
     register_keybinds(&new_cfg);
     panel::destroy_panels();
     panel_handles.clear();
-    // destroy legacy taskbar if panels now exist or taskbar disabled
-    if !new_cfg.panels.is_empty() || !new_cfg.general.taskbar {
-        if let Some(h) = taskbar_hwnd.take() {
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(h);
-            }
-            TASKBAR_ENABLED.store(false, Ordering::SeqCst);
-        }
-    }
     if !new_cfg.panels.is_empty() {
         match panel::create_panels(&new_cfg) {
             Ok(hs) => *panel_handles = hs,
@@ -701,33 +705,16 @@ fn apply_config_reload(
                     .unwrap_or_else(|error| error.into_inner()) = new_cfg.clone();
             }
         }
-        TASKBAR_ENABLED.store(false, Ordering::SeqCst);
-    }
-    if new_cfg.panels.is_empty() && new_cfg.general.taskbar && taskbar_hwnd.is_none() {
-        match taskbar::create_taskbar() {
-            Ok(h) => {
-                *taskbar_hwnd = Some(h);
-                TASKBAR_ENABLED.store(true, Ordering::SeqCst);
-            }
-            Err(e) => {
-                eprintln!("[taskbar] recreate failed: {}", e);
-                TASKBAR_ENABLED.store(false, Ordering::SeqCst);
-            }
-        }
     }
     if let Some(p) = new_path {
         watcher::spawn_watcher(p);
     }
 }
 
-fn reload_and_apply_config(
-    overrides: &[(String, String)],
-    panel_handles: &mut Vec<HWND>,
-    taskbar_hwnd: &mut Option<HWND>,
-) {
+fn reload_and_apply_config(overrides: &[(String, String)], panel_handles: &mut Vec<HWND>) {
     match reload_existing_config(overrides) {
         Ok((new_cfg, new_path)) => {
-            apply_config_reload(new_cfg, Some(new_path), panel_handles, taskbar_hwnd);
+            apply_config_reload(new_cfg, Some(new_path), panel_handles);
             request_retile();
         }
         Err(error) => {
@@ -736,8 +723,70 @@ fn reload_and_apply_config(
     }
 }
 
+/// Put back everything AltDWM borrowed from the system: the native taskbar it
+/// hid and any window it made translucent.
+///
+/// Safe to call more than once, and safe to call from a panic hook: the guard
+/// stops a panic raised *inside* this work from re-entering it and deadlocking
+/// on a lock the unwinding thread already holds.
+fn release_borrowed_system_state() {
+    static RELEASING: AtomicBool = AtomicBool::new(false);
+    if RELEASING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    rules::restore_all_opacity();
+    shell::restore_native_taskbars();
+    RELEASING.store(false, Ordering::SeqCst);
+}
+
+/// The native taskbar is hidden by forcing a zero-alpha layered style on
+/// Explorer's own window, and released on the normal shutdown path. With
+/// `panic = "abort"` in the release profile there is no unwinding, so without
+/// these handlers a crash or a Ctrl+C left the user with no taskbar and no
+/// obvious way to get it back.
+fn install_crash_safety() {
+    use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT,
+        CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+    use windows::Win32::System::Diagnostics::Debug::{
+        SetUnhandledExceptionFilter, EXCEPTION_POINTERS,
+    };
+
+    unsafe extern "system" fn on_console_ctrl(event: u32) -> windows::core::BOOL {
+        if matches!(
+            event,
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+                | CTRL_SHUTDOWN_EVENT
+        ) {
+            eprintln!("[main] console signal {event} — restoring shell chrome");
+            release_borrowed_system_state();
+        }
+        // Report as unhandled so the default terminate behaviour still runs.
+        windows::core::BOOL(0)
+    }
+
+    unsafe extern "system" fn on_unhandled_exception(_info: *const EXCEPTION_POINTERS) -> i32 {
+        eprintln!("[main] unhandled exception — restoring shell chrome before exit");
+        release_borrowed_system_state();
+        // EXCEPTION_CONTINUE_SEARCH: let the default handler report the crash.
+        0
+    }
+
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(on_console_ctrl), true);
+        SetUnhandledExceptionFilter(Some(on_unhandled_exception));
+    }
+    // A Rust panic in debug builds unwinds instead of aborting, so cover that
+    // path too rather than relying on the exception filter.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        release_borrowed_system_state();
+        previous(info);
+    }));
+}
+
 fn main() {
     let _ = MAIN_TID.set(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
+    install_crash_safety();
     print_banner();
     virtual_desktop::init();
 
@@ -802,14 +851,14 @@ fn main() {
         eprintln!("[config] warn: {}", w);
     }
 
+    // `general.taskbar = true` with no panels declared means "give me a bar";
+    // synthesise one rather than running a second, less capable bar implementation.
+    config::ensure_default_bar(&mut cfg);
+
     // push to globals
     *CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
     *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()) = cfg.general.gap;
     *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = cfg.layout_enum();
-    TASKBAR_ENABLED.store(
-        cfg.general.taskbar && cfg.panels.is_empty(),
-        Ordering::SeqCst,
-    );
     TILING_ENABLED.store(true, Ordering::SeqCst);
 
     // spawn file watcher for auto-reload (config.toml -> hot-reload without restart)
@@ -842,37 +891,17 @@ fn main() {
     }
     shell::set_native_taskbars_hidden(cfg.general.hide_native_taskbar);
 
-    // --- panels vs legacy taskbar
     let mut panel_handles: Vec<HWND> = Vec::new();
-    let mut taskbar_hwnd: Option<HWND> = if !cfg.panels.is_empty() {
+    if !cfg.panels.is_empty() {
         match panel::create_panels(&cfg) {
-            Ok(hs) => {
-                panel_handles = hs;
-                None
-            }
+            Ok(hs) => panel_handles = hs,
             Err(e) => {
-                eprintln!("[panel] failed: {} -> fallback to taskbar", e);
+                eprintln!("[panel] failed: {} — continuing without a bar", e);
                 panel::destroy_panels();
                 cfg.panels.clear();
                 *CURRENT_CONFIG
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = cfg.clone();
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    if taskbar_hwnd.is_none() && cfg.general.taskbar && cfg.panels.is_empty() {
-        match taskbar::create_taskbar() {
-            Ok(h) => {
-                taskbar_hwnd = Some(h);
-                TASKBAR_ENABLED.store(true, Ordering::SeqCst);
-            }
-            Err(e) => {
-                eprintln!("[taskbar] failed: {} - continuing without bar", e);
-                TASKBAR_ENABLED.store(false, Ordering::SeqCst);
             }
         }
     }
@@ -939,13 +968,27 @@ fn main() {
 
     if TILING_ENABLED.load(Ordering::SeqCst) {
         let (top, bottom) = bar_reserves(&cfg);
-        manager::tile_windows_reserved(taskbar_hwnd, top, bottom, layout, gap);
+        manager::tile_windows_reserved(top, bottom, layout, gap);
     }
 
     println!("[main] message loop — Alt+Shift+Q quit, Alt+Shift+C reload");
     let mut msg = MSG::default();
     unsafe {
         loop {
+            // Checked before dispatch so a pending reload cannot be stranded by
+            // the WM_HOTKEY path, which skips the tail of the loop body.
+            let watcher_reload = watcher::should_reload();
+            if watcher_reload || CONFIG_RELOAD_PENDING.swap(false, Ordering::SeqCst) {
+                println!(
+                    "[config] {} -> reloading",
+                    if watcher_reload {
+                        "file changed"
+                    } else {
+                        "action requested"
+                    }
+                );
+                reload_and_apply_config(&cli_overrides, &mut panel_handles);
+            }
             let ret = GetMessageW(&mut msg, None, 0, 0);
             if ret.0 == 0 {
                 println!("[main] WM_QUIT");
@@ -973,11 +1016,7 @@ fn main() {
                         break;
                     } else if act == "reload_config" {
                         println!("[hotkey] reload config");
-                        reload_and_apply_config(
-                            &cli_overrides,
-                            &mut panel_handles,
-                            &mut taskbar_hwnd,
-                        );
+                        reload_and_apply_config(&cli_overrides, &mut panel_handles);
                     } else if act == "retile" {
                         let l = *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
                         let g = *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner());
@@ -986,7 +1025,7 @@ fn main() {
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
                         let (top, bottom) = bar_reserves(&cfg);
-                        manager::tile_windows_reserved(taskbar_hwnd, top, bottom, l, g);
+                        manager::tile_windows_reserved(top, bottom, l, g);
                     } else {
                         // delegate to scripting engine (handles toggle_tiling, set_layout, launch, rhai: ...)
                         scripting::dispatch_action(&act);
@@ -998,19 +1037,6 @@ fn main() {
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
-            // Reload requests can originate from a file-watch event, a widget action, or Rhai.
-            let watcher_reload = watcher::should_reload();
-            if watcher_reload || CONFIG_RELOAD_PENDING.swap(false, Ordering::SeqCst) {
-                println!(
-                    "[config] {} -> reloading",
-                    if watcher_reload {
-                        "file changed"
-                    } else {
-                        "action requested"
-                    }
-                );
-                reload_and_apply_config(&cli_overrides, &mut panel_handles, &mut taskbar_hwnd);
-            }
         }
         unregister_all_hotkeys();
         for h in hooks {
@@ -1018,7 +1044,7 @@ fn main() {
         }
         panel::destroy_panels();
         command_center::close();
-        shell::restore_native_taskbars();
+        release_borrowed_system_state();
         let _ = host_hwnd;
         let _ = panel_handles;
     }

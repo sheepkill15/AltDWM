@@ -14,7 +14,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::manager::collect_windows;
-use crate::taskbar;
 
 static RUNTIME_FLOATING: LazyLock<Mutex<HashSet<isize>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -113,8 +112,7 @@ pub fn move_focused_to_monitor(dir: &str) {
 /// Get tilable windows in tiling order (same as manager)
 fn tilable_windows() -> Vec<HWND> {
     prune_stale_floating();
-    let tb = taskbar::get_taskbar_hwnd();
-    let mut wins = collect_windows(tb);
+    let mut wins = collect_windows();
     wins.retain(|hwnd| {
         !crate::rules::is_floating(*hwnd)
             && !is_runtime_floating(*hwnd)
@@ -152,31 +150,39 @@ fn set_foreground(hwnd: HWND) {
     }
 }
 
-pub fn focus_next() {
+/// Index of the focused window within the tilable list.
+///
+/// `focus_next` and `focus_prev` used to disagree about the not-found case: one
+/// fell back to `usize::MAX` and jumped to the first window, the other to `0`
+/// and jumped to the last. Sharing the lookup keeps the two keys symmetric.
+fn focused_index(wins: &[HWND]) -> Option<usize> {
+    let foreground = unsafe { GetForegroundWindow() };
+    wins.iter().position(|hwnd| hwnd.0 == foreground.0)
+}
+
+/// Step `delta` places through the tilable windows, wrapping. With no focused
+/// tilable window, stepping forward starts at the first and backward at the
+/// last.
+fn focus_step(delta: isize) {
     let wins = tilable_windows();
     if wins.is_empty() {
         return;
     }
-    let fg = unsafe { GetForegroundWindow() };
-    // find current index
-    let idx = wins.iter().position(|w| w.0 == fg.0).unwrap_or(usize::MAX);
-    let next = if idx == usize::MAX || idx + 1 >= wins.len() {
-        0
-    } else {
-        idx + 1
+    let len = wins.len() as isize;
+    let target = match focused_index(&wins) {
+        Some(current) => (current as isize + delta).rem_euclid(len),
+        None if delta >= 0 => 0,
+        None => len - 1,
     };
-    set_foreground(wins[next]);
+    set_foreground(wins[target as usize]);
+}
+
+pub fn focus_next() {
+    focus_step(1);
 }
 
 pub fn focus_prev() {
-    let wins = tilable_windows();
-    if wins.is_empty() {
-        return;
-    }
-    let fg = unsafe { GetForegroundWindow() };
-    let idx = wins.iter().position(|w| w.0 == fg.0).unwrap_or(0);
-    let prev = if idx == 0 { wins.len() - 1 } else { idx - 1 };
-    set_foreground(wins[prev]);
+    focus_step(-1);
 }
 
 /// Task-list behavior: restore minimized windows, minimize the active window,

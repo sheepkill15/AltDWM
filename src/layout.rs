@@ -4,6 +4,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 use windows::Win32::Foundation::RECT;
 
+use crate::ui::split_span;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Layout {
     /// Master on left 60%, stack on right
@@ -41,10 +43,29 @@ pub fn compute_layout(n: usize, area: RECT, gap: i32, layout: Layout) -> Vec<REC
     }
 }
 
-type LayoutCacheEntry = (SystemTime, rhai::AST, PathBuf);
+/// The script body is evaluated once when the AST is compiled and the resulting
+/// scope is cached with it. Re-evaluating the whole body on every retile, for
+/// every monitor, was pure overhead.
+type LayoutCacheEntry = (SystemTime, rhai::AST, PathBuf, rhai::Scope<'static>);
 type LayoutCache = HashMap<String, LayoutCacheEntry>;
 
 static LAYOUT_CACHE: LazyLock<Mutex<LayoutCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// True when `general.layout` names an entry in `[layouts]` that carries a
+/// script. Callers need this to tell "no layout" apart from "a custom layout
+/// that happens to share a built-in name".
+pub fn has_custom_layout(cfg: &crate::config::Config) -> bool {
+    let name = cfg.general.layout.as_str();
+    cfg.layouts
+        .get(name)
+        .or_else(|| {
+            cfg.layouts
+                .iter()
+                .find(|(layout_name, _)| layout_name.eq_ignore_ascii_case(name))
+                .map(|(_, layout)| layout)
+        })
+        .is_some_and(|layout| layout.script.as_deref().is_some_and(|s| !s.is_empty()))
+}
 
 /// Try to compute via custom Rhai layout script if `general.layout` names a key in `layouts`
 /// Script must define `fn layout(n, left, top, right, bottom, gap)` returning array of maps with left/top/right/bottom
@@ -116,16 +137,16 @@ pub fn try_compute_custom(
         }
     };
     // check cache
-    let ast = {
+    let (ast, mut scope) = {
         let mut cache = LAYOUT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        let cached_ast = cache
+        let cached = cache
             .get(name)
-            .and_then(|(cached_mtime, cached_ast, cached_path)| {
+            .and_then(|(cached_mtime, cached_ast, cached_path, cached_scope)| {
                 (*cached_path == code_path && *cached_mtime == code_mtime)
-                    .then(|| cached_ast.clone())
+                    .then(|| (cached_ast.clone(), cached_scope.clone()))
             });
-        if let Some(cached_ast) = cached_ast {
-            cached_ast
+        if let Some(cached) = cached {
+            cached
         } else {
             let engine = crate::scripting::engine().lock().ok()?;
             let new_ast = match engine.compile(&code) {
@@ -135,19 +156,24 @@ pub fn try_compute_custom(
                     return None;
                 }
             };
+            let mut new_scope = rhai::Scope::new();
+            if let Err(e) = engine.eval_ast_with_scope::<()>(&mut new_scope, &new_ast) {
+                eprintln!("[layout] custom '{}' eval error: {}", name, e);
+                return None;
+            }
             cache.insert(
                 name.to_string(),
-                (code_mtime, new_ast.clone(), code_path.clone()),
+                (
+                    code_mtime,
+                    new_ast.clone(),
+                    code_path.clone(),
+                    new_scope.clone(),
+                ),
             );
-            new_ast
+            (new_ast, new_scope)
         }
     };
     let engine = crate::scripting::engine().lock().ok()?;
-    let mut scope = rhai::Scope::new();
-    if let Err(e) = engine.eval_ast_with_scope::<()>(&mut scope, &ast) {
-        eprintln!("[layout] custom '{}' eval error: {}", name, e);
-        return None;
-    }
     // call fn layout(n, left, top, right, bottom, gap)
     let res: Result<rhai::Array, _> = engine.call_fn(
         &mut scope,
@@ -236,79 +262,163 @@ fn shrink_rect(r: RECT, gap: i32) -> RECT {
     }
 }
 
+/// Master column on the left, the rest stacked on the right.
+///
+/// Both columns are derived from one inner rectangle inset by `gap` on all four
+/// sides. The previous arithmetic subtracted the gap budget from the stack width
+/// only, which put the stack's right edge exactly on the area boundary — the
+/// layout had a gap on its left and none on its right.
 fn master_stack_layout(n: usize, area: RECT, gap: i32) -> Vec<RECT> {
-    if n == 1 {
-        return vec![shrink_rect(area, gap / 2)];
+    let inner = shrink_rect(area, gap);
+    if n <= 1 {
+        return vec![inner];
     }
-
-    let width = area.right - area.left;
-    let height = area.bottom - area.top;
-
-    let master_w = width * 60 / 100 - gap / 2;
-    let stack_w = width - master_w - gap * 2;
+    let width = (inner.right - inner.left).max(1);
+    let columns = split_span(inner.left, width, 2, gap);
+    // 60/40 split of the space that remains once the inner gap is accounted for.
+    let content = width - gap;
+    let master_w = (content * 60 / 100).clamp(1, content.max(1));
+    let master_right = inner.left + master_w;
+    let stack_left = master_right + gap;
+    let _ = columns;
 
     let mut rects = Vec::with_capacity(n);
-
     rects.push(RECT {
-        left: area.left + gap,
-        top: area.top + gap,
-        right: area.left + gap + master_w,
-        bottom: area.bottom - gap,
+        left: inner.left,
+        top: inner.top,
+        right: master_right,
+        bottom: inner.bottom,
     });
-
-    let stack_x = area.left + gap + master_w + gap;
-    let stack_count = n - 1;
-    let total_stack_h = height - gap * 2;
-    let gap_total = gap * (stack_count as i32 - 1);
-    let win_h = (total_stack_h - gap_total) / stack_count as i32;
-
-    for i in 0..stack_count {
-        let y = area.top + gap + i as i32 * (win_h + gap);
-        let mut bottom = y + win_h;
-        if i == stack_count - 1 {
-            bottom = area.bottom - gap;
-        }
+    let height = (inner.bottom - inner.top).max(1);
+    for (top, bottom) in split_span(inner.top, height, n - 1, gap) {
         rects.push(RECT {
-            left: stack_x,
-            top: y,
-            right: stack_x + stack_w,
+            left: stack_left,
+            top,
+            right: inner.right,
             bottom,
         });
     }
-
     rects
 }
 
+/// Row counts for a grid of `n` windows, chosen so the last row is filled
+/// rather than left with a hole. `ceil(sqrt(n))` columns leaves three windows in
+/// a 2x2 with an empty cell; distributing the remainder across rows instead
+/// gives 2 + 1, with the lone window spanning the full width.
+fn grid_row_counts(n: usize) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let rows = ((n as f64).sqrt().round() as usize).clamp(1, n);
+    let base = n / rows;
+    let remainder = n % rows;
+    (0..rows)
+        .map(|row| base + usize::from(row < remainder))
+        .collect()
+}
+
 fn grid_layout(n: usize, area: RECT, gap: i32) -> Vec<RECT> {
-    let cols = (n as f64).sqrt().ceil() as usize;
-    let rows = n.div_ceil(cols);
-
-    let width = area.right - area.left;
-    let height = area.bottom - area.top;
-
-    let cell_w = (width - gap * (cols as i32 + 1)) / cols as i32;
-    let cell_h = (height - gap * (rows as i32 + 1)) / rows as i32;
-
+    let inner = shrink_rect(area, gap);
+    let row_counts = grid_row_counts(n);
+    if row_counts.is_empty() {
+        return Vec::new();
+    }
+    let height = (inner.bottom - inner.top).max(1);
+    let width = (inner.right - inner.left).max(1);
+    let rows = split_span(inner.top, height, row_counts.len(), gap);
     let mut rects = Vec::with_capacity(n);
-    for i in 0..n {
-        let col = i % cols;
-        let row = i / cols;
-        let left = area.left + gap + col as i32 * (cell_w + gap);
-        let top = area.top + gap + row as i32 * (cell_h + gap);
-        rects.push(RECT {
-            left,
-            top,
-            right: left + cell_w,
-            bottom: top + cell_h,
-        });
+    for (row_index, columns_in_row) in row_counts.iter().enumerate() {
+        let (top, bottom) = rows[row_index];
+        for (left, right) in split_span(inner.left, width, *columns_in_row, gap) {
+            rects.push(RECT {
+                left,
+                top,
+                right,
+                bottom,
+            });
+        }
     }
     rects
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_layout, Layout};
+    use super::{compute_layout, grid_row_counts, split_span, Layout};
     use windows::Win32::Foundation::RECT;
+
+    const AREA: RECT = RECT {
+        left: 0,
+        top: 0,
+        right: 1000,
+        bottom: 800,
+    };
+
+    #[test]
+    fn split_span_uses_every_pixel() {
+        let tracks = split_span(0, 100, 3, 10);
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(tracks[0].0, 0);
+        assert_eq!(tracks[2].1, 100, "last track must end on the far edge");
+        for pair in tracks.windows(2) {
+            assert_eq!(pair[1].0 - pair[0].1, 10, "gap between tracks");
+        }
+    }
+
+    #[test]
+    fn master_stack_gaps_are_symmetric() {
+        let gap = 10;
+        let rects = compute_layout(3, AREA, gap, Layout::MasterStack);
+        assert_eq!(rects.len(), 3);
+        // Outer inset is the same on all four sides.
+        assert_eq!(rects[0].left - AREA.left, gap);
+        assert_eq!(rects[0].top - AREA.top, gap);
+        assert_eq!(AREA.right - rects[1].right, gap, "stack must keep its right gap");
+        assert_eq!(AREA.bottom - rects[0].bottom, gap);
+        assert_eq!(AREA.bottom - rects[2].bottom, gap);
+        // Master and stack are separated by exactly one gap.
+        assert_eq!(rects[1].left - rects[0].right, gap);
+        // Stack members are separated by exactly one gap.
+        assert_eq!(rects[2].top - rects[1].bottom, gap);
+    }
+
+    #[test]
+    fn single_window_uses_the_same_inset_as_many() {
+        let gap = 12;
+        let one = compute_layout(1, AREA, gap, Layout::MasterStack);
+        let many = compute_layout(2, AREA, gap, Layout::MasterStack);
+        assert_eq!(one[0].left, many[0].left);
+        assert_eq!(one[0].top, many[0].top);
+        assert_eq!(one[0].right, AREA.right - gap);
+        assert_eq!(one[0].bottom, AREA.bottom - gap);
+    }
+
+    #[test]
+    fn grid_fills_the_last_row_instead_of_leaving_a_hole() {
+        assert_eq!(grid_row_counts(3), vec![2, 1]);
+        assert_eq!(grid_row_counts(4), vec![2, 2]);
+        assert_eq!(grid_row_counts(5), vec![3, 2]);
+        assert_eq!(grid_row_counts(7), vec![3, 2, 2]);
+        let rects = compute_layout(3, AREA, 10, Layout::Grid);
+        assert_eq!(rects.len(), 3);
+        // The lone window on the last row spans the full inner width.
+        assert_eq!(rects[2].left, 10);
+        assert_eq!(rects[2].right, AREA.right - 10);
+    }
+
+    #[test]
+    fn crowded_layouts_never_produce_inverted_rects() {
+        for n in 1..40usize {
+            for layout in [Layout::MasterStack, Layout::Grid, Layout::Monocle] {
+                let rects = compute_layout(n, AREA, 8, layout);
+                for rect in &rects {
+                    assert!(
+                        rect.right > rect.left && rect.bottom > rect.top,
+                        "n={n} {layout:?} produced {rect:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn monocle_positions_every_window_in_the_same_area() {
