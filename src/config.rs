@@ -44,6 +44,18 @@ pub struct General {
     pub taskbar_height: i32,
     #[serde(default = "default_true")]
     pub auto_tile: bool,
+    /// Place a newly shown window synchronously and suppress its first DWM
+    /// transition instead of waiting for the coalesced layout timer.
+    #[serde(default = "default_true")]
+    pub instant_first_layout: bool,
+    /// Float owned, modal, and small non-resizable utility windows by default.
+    /// An explicit matching rule with `floating = false` overrides this.
+    #[serde(default = "default_true")]
+    pub auto_float_utility_windows: bool,
+    /// Query WM_GETMINMAXINFO and float a window when its assigned tile would
+    /// violate the application's minimum tracking size.
+    #[serde(default = "default_true")]
+    pub respect_window_size_constraints: bool,
     /// Hide Explorer's primary/secondary taskbars while AltDWM is running.
     #[serde(default = "default_true")]
     pub hide_native_taskbar: bool,
@@ -215,6 +227,9 @@ impl Default for General {
             taskbar: default_taskbar(),
             taskbar_height: default_taskbar_height(),
             auto_tile: default_true(),
+            instant_first_layout: default_true(),
+            auto_float_utility_windows: default_true(),
+            respect_window_size_constraints: default_true(),
             hide_native_taskbar: default_true(),
             outer_gap: None,
             filter_virtual_desktop: default_filter_vd(),
@@ -744,21 +759,38 @@ pub fn example_config_with_panels() -> Config {
             extra: HashMap::new(),
         },
     ];
-    cfg.rules = vec![RuleConfig {
-        match_class: Some("Spotify".into()),
-        match_title: None,
-        match_process: None,
-        match_class_regex: None,
-        match_title_regex: None,
-        compiled_class_regex: None,
-        compiled_title_regex: None,
-        monitor: None,
-        floating: Some(true),
-        opacity: None,
-        layout: None,
-        on_create: None,
-        extra: HashMap::new(),
-    }];
+    cfg.rules = vec![
+        RuleConfig {
+            match_class: Some("Spotify".into()),
+            match_title: None,
+            match_process: None,
+            match_class_regex: None,
+            match_title_regex: None,
+            compiled_class_regex: None,
+            compiled_title_regex: None,
+            monitor: None,
+            floating: Some(true),
+            opacity: None,
+            layout: None,
+            on_create: None,
+            extra: HashMap::new(),
+        },
+        RuleConfig {
+            match_class: None,
+            match_title: None,
+            match_process: Some("steamwebhelper.exe".into()),
+            match_class_regex: None,
+            match_title_regex: Some("(?i)(friends list|steam chat|friends & chat)".into()),
+            compiled_class_regex: None,
+            compiled_title_regex: None,
+            monitor: None,
+            floating: Some(true),
+            opacity: None,
+            layout: None,
+            on_create: None,
+            extra: HashMap::new(),
+        },
+    ];
     cfg.layouts.insert(
         "spiral".into(),
         LayoutConfig {
@@ -792,6 +824,14 @@ mod tests {
         assert_eq!(config.panels[0].position, "right");
         assert_eq!(config.panels[0].height, 1);
         assert_eq!(config.panels[0].margin, Some([0, 2, 0, 4]));
+    }
+
+    #[test]
+    fn missing_instant_first_layout_setting_defaults_to_enabled() {
+        let config: Config = toml::from_str("[general]\nauto_tile = true\n").unwrap();
+        assert!(config.general.instant_first_layout);
+        assert!(config.general.auto_float_utility_windows);
+        assert!(config.general.respect_window_size_constraints);
     }
 
     #[test]

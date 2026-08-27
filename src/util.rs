@@ -92,6 +92,22 @@ pub fn is_cloaked(hwnd: HWND) -> bool {
     cloaked != 0
 }
 
+/// Suppress or restore DWM's transition animation for a window. This is used
+/// only around the first synchronous layout so a newly launched application
+/// appears in its tile instead of visibly gliding there from its default rect.
+pub fn set_transitions_forced_disabled(hwnd: HWND, disabled: bool) {
+    const DWMWA_TRANSITIONS_FORCEDISABLED_RAW: i32 = 3;
+    let value: i32 = i32::from(disabled);
+    unsafe {
+        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_TRANSITIONS_FORCEDISABLED_RAW),
+            &value as *const _ as _,
+            size_of_val(&value) as u32,
+        );
+    }
+}
+
 fn has_independent_app_presence(ex_style: u32, has_owner: bool) -> bool {
     let app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
     let tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;

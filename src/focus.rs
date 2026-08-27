@@ -115,7 +115,11 @@ fn tilable_windows() -> Vec<HWND> {
     prune_stale_floating();
     let tb = taskbar::get_taskbar_hwnd();
     let mut wins = collect_windows(tb);
-    wins.retain(|hwnd| !crate::rules::is_floating(*hwnd) && !is_runtime_floating(*hwnd));
+    wins.retain(|hwnd| {
+        !crate::rules::is_floating(*hwnd)
+            && !is_runtime_floating(*hwnd)
+            && !crate::manager::is_auto_floating(*hwnd)
+    });
     wins.retain(|hwnd| crate::virtual_desktop::is_on_current_desktop(*hwnd));
     wins
 }

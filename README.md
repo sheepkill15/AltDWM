@@ -12,9 +12,11 @@ Tested on Windows 11, 2 monitors, Rust 1.98 + `windows` 0.61.
 
 - **Tiling WM** (`src/manager.rs:84`): `EnumWindows` + `IsWindowVisible`/`IsIconic`/`DwmGetWindowAttribute(DWMWA_CLOAKED)`/`WS_EX_TOOLWINDOW`/`GA_ROOT` (`src/util.rs:57`). Per-monitor `MonitorFromWindow`/`GetMonitorInfoW`; atomic `BeginDeferWindowPos`/`DeferWindowPos` (`src/manager.rs:150`).
 - **Layouts** (`src/layout.rs:7`): `MasterStack` (60/40), `Grid`, `Monocle`, `Floating` — pluggable via `[[layouts.my]] script="..."` (Rhai).
-- **Event-driven** (`src/main.rs`): `SetWinEventHook` for `FOREGROUND/MINIMIZE/MOVESIZE/OBJECT_*` (`WINEVENT_OUTOFCONTEXT`). Maximize and external location changes are folded back into the active managed layout; title-bar moves swap pre-drag tile slots on release; resizing moves shared tile boundaries so adjacent windows absorb the size change. A 200ms `WM_TIMER` on `AltDWM_Host` coalesces layout work.
+- **Event-driven** (`src/main.rs`): `SetWinEventHook` for `FOREGROUND/MINIMIZE/MOVESIZE/OBJECT_*` (`WINEVENT_OUTOFCONTEXT`). A newly shown window bypasses the normal 200ms coalescing timer and is placed synchronously with its first DWM transition suppressed; ordinary event bursts still coalesce. Maximize and external location changes are folded back into the active layout, title-bar moves swap tile slots, and resizing moves shared boundaries.
 - **Coherent native shell bar** (`src/panel.rs`, `src/widgets.rs`): a rounded per-display bar with hover feedback, a live/clickable layout capsule, real application icons, active/minimized window states, overflow counts, compact system status, and a two-line clock.
-- **Searchable command center** (`src/command_center.rs`): open it from the AltDWM button or `Alt+Shift+Space`; type to filter, use arrows to select, and launch apps, edit/reload configuration, pause tiling, or change layouts without memorizing commands.
+- **Constraint-aware window policy** (`src/manager.rs`, `src/rules.rs`): explicit floating rules win; owned/modal/fixed-size utilities float automatically; windows whose minimum tracking size cannot fit their proposed tile are floated and clamped inside the usable monitor area. `floating=false` forces a matching window back into tiling.
+- **Focused window borders**: DWM border colors update on foreground changes without retiling. Configure `theme.border_active` and `theme.border_inactive` independently.
+- **Searchable command center** (`src/command_center.rs`): open it from the AltDWM button or `Alt+Shift+Space`; type to filter, use arrows to select, view every successfully registered shortcut, and launch apps, edit/reload configuration, pause tiling, or change layouts without memorizing commands.
 - **Declarative panels DSL** (`src/config.rs:16`, `docs/EXTENSIBILITY.md`): TOML `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`. Multiple bars remain supported, while generated and example configs now start with one polished shell bar.
 - **Widgets** (`src/widgets.rs` trait): `clock`, live `layout`/`workspaces` status, `window_list` (including minimized windows; click to focus/minimize/restore), `window_title`, Explorer-backed clickable `tray`, `spacer`, `launcher`, and Rhai `custom` status widgets.
 - **Panels** (`src/panel.rs:47`): Each `[[panels]]` is a `WS_POPUP|WS_EX_TOPMOST` window (`AltDWM_Panel` class), flex layout for widgets, 1s + 250ms timers, click → `scripting::dispatch_action`.
@@ -129,7 +131,7 @@ Fallback (no panels) → `[taskbar] 1920x40 @ 0,1040` + `"(0,0 1920x992)"`.
 
 ## Next steps
 
-- `AltDHook.dll` (`WH_CBT`) for elevated windows
+- `AltDHook.dll` (`WH_CBT`) for literal pre-show `HCBT_CREATEWND` placement and elevated windows
 - `IVirtualDesktopManager` + `IVirtualDesktopManagerInternal` workspaces
 - Explorer-free shell replacement and native notification-area hosting (design notes in `docs/EXTENSIBILITY.md`; the current tray bridges Explorer through UI Automation)
 - `uiAccess` manifest + signing

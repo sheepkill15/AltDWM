@@ -20,6 +20,10 @@ pub struct Theme {
     pub accent_active: String,
     #[serde(default = "def_border")]
     pub border: String,
+    #[serde(default = "def_border_active")]
+    pub border_active: String,
+    #[serde(default = "def_border_inactive")]
+    pub border_inactive: String,
     #[serde(default = "def_tray_bg")]
     pub tray_bg: String,
     #[serde(default = "def_surface")]
@@ -57,6 +61,12 @@ fn def_accent_active() -> String {
 fn def_border() -> String {
     "#404040".into()
 }
+fn def_border_active() -> String {
+    "#8b5cf6".into()
+}
+fn def_border_inactive() -> String {
+    "#343842".into()
+}
 fn def_tray_bg() -> String {
     "#2d2d30".into()
 }
@@ -89,6 +99,8 @@ impl Default for Theme {
             accent: def_accent(),
             accent_active: def_accent_active(),
             border: def_border(),
+            border_active: def_border_active(),
+            border_inactive: def_border_inactive(),
             tray_bg: def_tray_bg(),
             surface: def_surface(),
             surface_hover: def_surface_hover(),
@@ -125,6 +137,12 @@ impl Theme {
     }
     pub fn border_color(&self) -> COLORREF {
         self.color(&self.border)
+    }
+    pub fn active_window_border_color(&self) -> COLORREF {
+        self.color(&self.border_active)
+    }
+    pub fn inactive_window_border_color(&self) -> COLORREF {
+        self.color(&self.border_inactive)
     }
     pub fn surface_color(&self) -> COLORREF {
         self.color(&self.surface)

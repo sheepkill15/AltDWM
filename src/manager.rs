@@ -1,13 +1,15 @@
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
     MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetCursorPos,
-    GetWindowRect, IsWindow, IsZoomed, ShowWindow, HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_RESTORE,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetCursorPos, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, IsWindow, IsZoomed, SendMessageTimeoutW, SetWindowPos,
+    ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_TOP, MINMAXINFO, SMTO_ABORTIFHUNG,
+    SMTO_BLOCK, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, WM_GETMINMAXINFO, WS_EX_DLGMODALFRAME,
+    WS_THICKFRAME,
 };
 
 use crate::layout::{compute_layout, Layout};
@@ -23,6 +25,92 @@ use std::sync::{LazyLock, Mutex};
 static WINDOW_ORDER: LazyLock<Mutex<Vec<isize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static EXPECTED_RECTS: LazyLock<Mutex<HashMap<isize, RECT>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static AUTO_FLOATING: LazyLock<Mutex<HashSet<isize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowConstraints {
+    min_width: i32,
+    min_height: i32,
+    max_width: i32,
+    max_height: i32,
+}
+
+pub fn is_auto_floating(hwnd: HWND) -> bool {
+    AUTO_FLOATING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(&(hwnd.0 as isize))
+}
+
+fn query_window_constraints(hwnd: HWND) -> WindowConstraints {
+    let mut info = MINMAXINFO::default();
+    unsafe {
+        let _ = SendMessageTimeoutW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            WPARAM(0),
+            LPARAM(&mut info as *mut MINMAXINFO as isize),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            40,
+            None,
+        );
+    }
+    WindowConstraints {
+        min_width: info.ptMinTrackSize.x.max(0),
+        min_height: info.ptMinTrackSize.y.max(0),
+        max_width: info.ptMaxTrackSize.x.max(0),
+        max_height: info.ptMaxTrackSize.y.max(0),
+    }
+}
+
+fn rect_violates_constraints(rect: RECT, constraints: WindowConstraints) -> bool {
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    (constraints.min_width > 0 && width < constraints.min_width)
+        || (constraints.min_height > 0 && height < constraints.min_height)
+}
+
+fn is_automatic_utility_window(hwnd: HWND, constraints: WindowConstraints) -> bool {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let owned = GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.0.is_null());
+        let modal_frame = (ex_style & WS_EX_DLGMODALFRAME.0) != 0;
+        let resizable = (style & WS_THICKFRAME.0) != 0;
+        let fixed_by_limits = constraints.min_width > 0
+            && constraints.min_height > 0
+            && constraints.max_width > 0
+            && constraints.max_height > 0
+            && constraints.min_width >= constraints.max_width.saturating_sub(2)
+            && constraints.min_height >= constraints.max_height.saturating_sub(2);
+        let mut rect = RECT::default();
+        let compact_non_resizable = GetWindowRect(hwnd, &mut rect).is_ok()
+            && !resizable
+            && rect.right - rect.left <= 900
+            && rect.bottom - rect.top <= 800;
+        owned || modal_frame || fixed_by_limits || compact_non_resizable
+    }
+}
+
+fn contained_floating_rect(current: RECT, area: RECT, constraints: WindowConstraints) -> RECT {
+    let area_width = (area.right - area.left).max(1);
+    let area_height = (area.bottom - area.top).max(1);
+    let width = (current.right - current.left)
+        .max(constraints.min_width)
+        .clamp(1, area_width);
+    let height = (current.bottom - current.top)
+        .max(constraints.min_height)
+        .clamp(1, area_height);
+    let left = current.left.clamp(area.left, area.right - width);
+    let top = current.top.clamp(area.top, area.bottom - height);
+    RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
+}
 
 #[derive(Clone)]
 struct MoveState {
@@ -553,7 +641,7 @@ fn panel_reserves_for_monitor(hmon: HMONITOR, cfg: &crate::config::Config) -> (i
     (left, top, right, bottom)
 }
 
-fn apply_window_chrome(hwnd: HWND, cfg: &crate::config::Config) {
+fn apply_window_chrome(hwnd: HWND, cfg: &crate::config::Config, focused: bool) {
     use windows::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
     };
@@ -566,13 +654,28 @@ fn apply_window_chrome(hwnd: HWND, cfg: &crate::config::Config) {
             &corner as *const _ as _,
             size_of_val(&corner) as u32,
         );
-        let border = cfg.theme.border_color();
+        let border = if focused {
+            cfg.theme.active_window_border_color()
+        } else {
+            cfg.theme.inactive_window_border_color()
+        };
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_BORDER_COLOR,
             &border.0 as *const _ as _,
             size_of_val(&border) as u32,
         );
+    }
+}
+
+pub fn refresh_window_borders() {
+    let cfg = crate::CURRENT_CONFIG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let foreground = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    for hwnd in collect_windows_including_minimized(crate::taskbar::get_taskbar_hwnd()) {
+        apply_window_chrome(hwnd, &cfg, hwnd == foreground);
     }
 }
 
@@ -642,6 +745,57 @@ fn get_work_area_for_hmonitor(
     }
 }
 
+fn contain_floating_windows(
+    windows: &[HWND],
+    top_reserve: i32,
+    bottom_reserve: i32,
+    taskbar_hwnd: Option<HWND>,
+    cfg: &crate::config::Config,
+    constraints: &HashMap<isize, WindowConstraints>,
+) {
+    let foreground = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    for hwnd in windows {
+        let monitor = if let Some(target) = crate::rules::rule_monitor(*hwnd) {
+            hmonitor_for_target(&target)
+                .unwrap_or_else(|| unsafe { MonitorFromWindow(*hwnd, MONITOR_DEFAULTTONEAREST) })
+        } else {
+            unsafe { MonitorFromWindow(*hwnd, MONITOR_DEFAULTTONEAREST) }
+        };
+        let area =
+            get_work_area_for_hmonitor(monitor, top_reserve, bottom_reserve, taskbar_hwnd, cfg);
+        let mut current = RECT::default();
+        if unsafe { GetWindowRect(*hwnd, &mut current) }.is_err() {
+            continue;
+        }
+        let target = contained_floating_rect(
+            current,
+            area,
+            constraints
+                .get(&(hwnd.0 as isize))
+                .copied()
+                .unwrap_or_default(),
+        );
+        EXPECTED_RECTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(hwnd.0 as isize));
+        apply_window_chrome(*hwnd, cfg, *hwnd == foreground);
+        if target != current {
+            unsafe {
+                let _ = SetWindowPos(
+                    *hwnd,
+                    Some(HWND_TOP),
+                    target.left,
+                    target.top,
+                    target.right - target.left,
+                    target.bottom - target.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+}
+
 /// Tile with explicit top/bottom reserves (for panels DSL)
 pub fn tile_windows_reserved(
     taskbar_hwnd: Option<HWND>,
@@ -681,12 +835,37 @@ pub fn tile_windows_reserved(
         return;
     }
 
-    // apply rules — floating windows are excluded from tiling (including runtime floating via Alt+Shift+Y)
-    let (windows, floating): (Vec<_>, Vec<_>) = all_windows.into_iter().partition(|hwnd| {
-        !crate::rules::is_floating(*hwnd) && !crate::focus::is_runtime_floating(*hwnd)
-    });
+    // Explicit rules decide first. Manual runtime floating is authoritative;
+    // automatic utility classification is only used when no rule opted the
+    // window in or out.
+    let constraints: HashMap<isize, WindowConstraints> = all_windows
+        .iter()
+        .map(|hwnd| (hwnd.0 as isize, query_window_constraints(*hwnd)))
+        .collect();
+    let mut windows = Vec::new();
+    let mut floating = Vec::new();
+    let mut auto_floating_keys = HashSet::new();
+    for hwnd in all_windows {
+        let key = hwnd.0 as isize;
+        let manual = crate::focus::is_runtime_floating(hwnd);
+        let decision = crate::rules::floating_decision(hwnd);
+        let automatic = decision.is_none()
+            && cfg_snapshot.general.auto_float_utility_windows
+            && is_automatic_utility_window(
+                hwnd,
+                constraints.get(&key).copied().unwrap_or_default(),
+            );
+        if manual || decision == Some(true) || automatic {
+            if automatic {
+                auto_floating_keys.insert(key);
+            }
+            floating.push(hwnd);
+        } else {
+            windows.push(hwnd);
+        }
+    }
     if verbose && !floating.is_empty() {
-        println!("[manager] floating {} window(s) per rules:", floating.len());
+        println!("[manager] floating {} window(s) by policy:", floating.len());
         for hwnd in &floating {
             let cls = crate::util::get_class_name(*hwnd);
             let title = crate::util::get_window_title(*hwnd);
@@ -706,6 +885,17 @@ pub fn tile_windows_reserved(
         }
     }
     if windows.is_empty() {
+        *AUTO_FLOATING
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = auto_floating_keys;
+        contain_floating_windows(
+            &floating,
+            top_reserve,
+            bottom_reserve,
+            taskbar_hwnd,
+            &cfg_snapshot,
+            &constraints,
+        );
         if verbose {
             println!("[manager] no tilable windows (all floating)");
         }
@@ -799,19 +989,58 @@ pub fn tile_windows_reserved(
             monitor_cfg.general.layout = rule_layout;
             monitor_layout = monitor_cfg.layout_enum();
         }
-        // try custom layout first (if general.layout names a key in layouts with script)
-        let computed_rects = if let Some(custom) =
-            crate::layout::try_compute_custom(wins.len(), area, gap, &monitor_cfg)
-        {
-            if verbose {
-                println!("[manager] custom layout '{}'", monitor_cfg.general.layout);
+        let mut tiled_wins = wins;
+        let rects = loop {
+            // try custom layout first (if general.layout names a key in layouts with script)
+            let computed_rects = if let Some(custom) =
+                crate::layout::try_compute_custom(tiled_wins.len(), area, gap, &monitor_cfg)
+            {
+                if verbose {
+                    println!("[manager] custom layout '{}'", monitor_cfg.general.layout);
+                }
+                custom
+            } else {
+                compute_layout(tiled_wins.len(), area, gap, monitor_layout)
+            };
+            let rects = apply_layout_override(mon, &tiled_wins, computed_rects);
+            if !cfg_snapshot.general.respect_window_size_constraints {
+                break rects;
             }
-            custom
-        } else {
-            compute_layout(wins.len(), area, gap, monitor_layout)
+            let violations = tiled_wins
+                .iter()
+                .zip(rects.iter())
+                .enumerate()
+                .filter_map(|(index, (hwnd, rect))| {
+                    let limits = constraints
+                        .get(&(hwnd.0 as isize))
+                        .copied()
+                        .unwrap_or_default();
+                    rect_violates_constraints(*rect, limits).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if violations.is_empty() {
+                break rects;
+            }
+            for index in violations.into_iter().rev() {
+                let hwnd = tiled_wins.remove(index);
+                auto_floating_keys.insert(hwnd.0 as isize);
+                floating.push(hwnd);
+                if verbose {
+                    let limits = constraints
+                        .get(&(hwnd.0 as isize))
+                        .copied()
+                        .unwrap_or_default();
+                    println!(
+                        "[manager] auto-float {:?}: minimum {}x{} does not fit assigned tile",
+                        hwnd.0, limits.min_width, limits.min_height
+                    );
+                }
+            }
+            if tiled_wins.is_empty() {
+                break Vec::new();
+            }
         };
-        let rects = apply_layout_override(mon, &wins, computed_rects);
-        for (i, hwnd) in wins.iter().enumerate() {
+        for (i, hwnd) in tiled_wins.iter().enumerate() {
             let r = if i < rects.len() {
                 rects[i]
             } else {
@@ -822,7 +1051,9 @@ pub fn tile_windows_reserved(
             if w <= 0 || h <= 0 {
                 continue;
             }
-            apply_window_chrome(*hwnd, &cfg_snapshot);
+            let foreground =
+                unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+            apply_window_chrome(*hwnd, &cfg_snapshot, *hwnd == foreground);
             EXPECTED_RECTS
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -870,16 +1101,77 @@ pub fn tile_windows_reserved(
             Err(e) => println!("[manager] EndDeferWindowPos failed: {:?}", e),
         }
     }
+    *AUTO_FLOATING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = auto_floating_keys;
+    contain_floating_windows(
+        &floating,
+        top_reserve,
+        bottom_reserve,
+        taskbar_hwnd,
+        &cfg_snapshot,
+        &constraints,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        adjust_rects_for_resize, panel_reserves_for_monitor, reconcile_window_order,
-        swap_window_order,
+        adjust_rects_for_resize, contained_floating_rect, panel_reserves_for_monitor,
+        reconcile_window_order, rect_violates_constraints, swap_window_order, WindowConstraints,
     };
     use crate::config::{Config, PanelConfig};
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::HMONITOR;
+
+    #[test]
+    fn minimum_size_violation_is_detected_before_placement() {
+        let tile = RECT {
+            left: 0,
+            top: 0,
+            right: 500,
+            bottom: 400,
+        };
+        assert!(rect_violates_constraints(
+            tile,
+            WindowConstraints {
+                min_width: 640,
+                min_height: 360,
+                ..Default::default()
+            }
+        ));
+        assert!(!rect_violates_constraints(
+            tile,
+            WindowConstraints {
+                min_width: 480,
+                min_height: 360,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn floating_rect_is_kept_inside_work_area() {
+        let result = contained_floating_rect(
+            RECT {
+                left: 900,
+                top: 700,
+                right: 1500,
+                bottom: 1200,
+            },
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1000,
+                bottom: 800,
+            },
+            WindowConstraints::default(),
+        );
+        assert_eq!(result.left, 400);
+        assert_eq!(result.top, 300);
+        assert_eq!(result.right, 1000);
+        assert_eq!(result.bottom, 800);
+    }
 
     #[test]
     fn reserves_all_four_panel_edges_with_margins() {

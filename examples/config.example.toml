@@ -5,6 +5,9 @@ layout = "MasterStack"
 taskbar = true
 taskbar_height = 40
 auto_tile = true
+instant_first_layout = true
+auto_float_utility_windows = true
+respect_window_size_constraints = true
 hide_native_taskbar = true
 filter_virtual_desktop = false
 
@@ -28,6 +31,8 @@ text_dim = "#aaaaaa"
 accent = "#3a6ea5"
 accent_active = "#007acc"
 border = "#404040"
+border_active = "#8b5cf6"
+border_inactive = "#343842"
 tray_bg = "#2d2d30"
 surface = "#292b32"
 surface_hover = "#353842"
@@ -91,6 +96,11 @@ width = 150
 
 [[rules]]
 match_class = "Spotify"
+floating = true
+
+[[rules]]
+match_process = "steamwebhelper.exe"
+match_title_regex = "(?i)(friends list|steam chat|friends & chat)"
 floating = true
 
 [[keybinds]]

@@ -9,6 +9,13 @@ Goal: let users configure **and change anything** without forking Rust code — 
 3. **Stable Rust core, pluggable edges** — `Panel`, `Widget`, `Layout`, `Rule`, `Keybind` form the extension boundary. New widget types are added in Rust through `create_widget`; Rhai covers text widgets, layouts, and actions.
 4. **Fail-safe** — startup can use defaults when no valid config exists; a bad hot reload is rejected and the last-known-good configuration remains active.
 
+`general.instant_first_layout = true` is the default. CREATE/SHOW/FOREGROUND
+events for an untracked window trigger a synchronous layout and briefly suppress
+DWM transitions, so applications appear in their tile instead of animating from
+their own startup rectangle. Set it to `false` to restore timer-coalesced startup
+placement. A genuinely pre-creation intercept remains a separate injected
+`WH_CBT` hook feature because out-of-process WinEvent hooks run after HWND creation.
+
 ## Stack choice — Why TOML + Rhai (not Lua/Python)?
 
 | Option           | Pros                                                                                | Cons                                                    |
@@ -85,6 +92,29 @@ on_create = "rhai: focus_next()"
 
 Matcher supports exact/substring class and title matching, class/title regexes, and process-name substring matching; actions can be declarative or Rhai.
 When multiple layout rules match windows on one monitor, the first rule in configuration order wins.
+
+Floating decisions use this order:
+
+1. `Alt+Shift+Y` manual floating state.
+2. The first matching rule with `floating = true` or `floating = false`.
+3. Automatic utility detection for owned, modal, fixed-size, and compact non-resizable windows.
+4. Minimum-size validation against the proposed tile; a window that cannot fit is floated.
+
+Automatic floating windows retain their size where possible and are clamped into
+the monitor work area. Set `general.auto_float_utility_windows = false` or
+`general.respect_window_size_constraints = false` to disable either heuristic.
+Use an explicit `floating = false` rule to force a particular application into
+the layout. Steam Friends is included in the example configuration as an
+explicit process/title rule because it is an independent resizable window and
+cannot be reliably distinguished from Steam's main window by styles alone.
+
+Window chrome colors are independent theme tokens:
+
+```toml
+[theme]
+border_active = "#8b5cf6"
+border_inactive = "#343842"
+```
 
 ### 4) Layouts — pluggable tiling algorithms
 

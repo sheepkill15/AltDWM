@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -53,6 +54,10 @@ pub static CONFIG_PATH: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mute
 pub static CURRENT_CONFIG: LazyLock<Mutex<config::Config>> =
     LazyLock::new(|| Mutex::new(config::Config::default()));
 pub static HOTKEY_ACTIONS: LazyLock<Mutex<HashMap<i32, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static ACTIVE_KEYBINDS: LazyLock<Mutex<Vec<config::KeybindConfig>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static TRANSITIONS_TO_RESTORE: LazyLock<Mutex<HashMap<isize, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 pub static MAIN_TID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
@@ -157,6 +162,73 @@ fn bar_reserves(cfg: &config::Config) -> (i32, i32) {
     }
 }
 
+fn tile_current_layout_now() {
+    let cfg = CURRENT_CONFIG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let (top_reserve, bottom_reserve) = bar_reserves(&cfg);
+    let taskbar_hwnd = taskbar::get_taskbar_hwnd();
+    let reserve = if cfg.panels.is_empty() {
+        taskbar_hwnd
+    } else {
+        None
+    };
+    manager::tile_windows_reserved(
+        reserve,
+        top_reserve,
+        bottom_reserve,
+        cfg.layout_enum(),
+        cfg.general.gap,
+    );
+}
+
+fn place_new_window_immediately(hwnd: HWND) {
+    let taskbar_hwnd = taskbar::get_taskbar_hwnd();
+    let mut windows = manager::collect_windows(taskbar_hwnd);
+    if !windows.contains(&hwnd) {
+        windows.push(hwnd);
+    }
+    let restore_at = Instant::now() + Duration::from_millis(300);
+    let mut pending_restore = TRANSITIONS_TO_RESTORE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for window in windows {
+        util::set_transitions_forced_disabled(window, true);
+        pending_restore.insert(window.0 as isize, restore_at);
+    }
+    drop(pending_restore);
+
+    // This bypasses the normal 200 ms coalescing timer. CREATE may arrive
+    // before WS_VISIBLE, while SHOW/FOREGROUND catches the first usable frame.
+    RETILE_PENDING.store(false, Ordering::SeqCst);
+    tile_current_layout_now();
+    panel::invalidate_all();
+    if std::env::var_os("ALT_DWM_VERBOSE").is_some() {
+        println!("[manager] instant first layout for {:?}", hwnd.0);
+    }
+}
+
+fn restore_initial_transition_settings() {
+    let now = Instant::now();
+    let ready: Vec<isize> = {
+        let mut pending = TRANSITIONS_TO_RESTORE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let ready = pending
+            .iter()
+            .filter_map(|(hwnd, deadline)| (*deadline <= now).then_some(*hwnd))
+            .collect::<Vec<_>>();
+        for hwnd in &ready {
+            pending.remove(hwnd);
+        }
+        ready
+    };
+    for raw in ready {
+        util::set_transitions_forced_disabled(HWND(raw as *mut std::ffi::c_void), false);
+    }
+}
+
 fn vk_from_name(name: &str) -> Option<u32> {
     let s = name.trim().to_lowercase();
     if s.len() == 1 {
@@ -254,6 +326,10 @@ fn register_keybinds(cfg: &config::Config) {
     }
     map.clear();
     drop(map);
+    ACTIVE_KEYBINDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 
     let mut next_id = 1;
     for kb in &cfg.keybinds {
@@ -268,6 +344,10 @@ fn register_keybinds(cfg: &config::Config) {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(id, kb.action.clone());
+                        ACTIVE_KEYBINDS
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(kb.clone());
                     }
                     Err(e) => eprintln!("[hotkey] failed {} -> '{}': {:?}", kb.keys, kb.action, e),
                 }
@@ -322,6 +402,10 @@ unsafe extern "system" fn win_event_proc(
     }
     if event == EVENT_OBJECT_DESTROY {
         rules::forget_window(hwnd);
+        TRANSITIONS_TO_RESTORE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(hwnd.0 as isize));
     }
     // on_create rules — run even if tiling disabled, but only for CREATE/SHOW
     if event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW {
@@ -339,6 +423,14 @@ unsafe extern "system" fn win_event_proc(
     // HWND on each focus change.
     panel::invalidate_all();
     if event == EVENT_SYSTEM_FOREGROUND {
+        manager::refresh_window_borders();
+    }
+    let was_tracked = manager::is_tracked_window(hwnd);
+    let is_first_layout_signal = matches!(
+        event,
+        EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW | EVENT_SYSTEM_FOREGROUND
+    );
+    if event == EVENT_SYSTEM_FOREGROUND && was_tracked {
         return;
     }
     // Location changes cover maximize/restore and keyboard-driven moves. During
@@ -352,22 +444,26 @@ unsafe extern "system" fn win_event_proc(
     // Accessibility and shell UI can emit window-object events too. Only a
     // newly manageable HWND or one already known to the manager can affect the
     // layout; ignoring the rest prevents tray/UIA activity from causing retiles.
-    let affects_layout =
-        manager::is_tracked_window(hwnd) || util::is_manageable(hwnd, taskbar::get_taskbar_hwnd());
+    let affects_layout = was_tracked || util::is_manageable(hwnd, taskbar::get_taskbar_hwnd());
     if !affects_layout {
         return;
     }
     if !TILING_ENABLED.load(Ordering::SeqCst) {
         return;
     }
-    let auto = {
-        CURRENT_CONFIG
+    let (auto, instant_first_layout) = {
+        let general = CURRENT_CONFIG
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .general
-            .auto_tile
+            .clone();
+        (general.auto_tile, general.instant_first_layout)
     };
     if !auto {
+        return;
+    }
+    if instant_first_layout && is_first_layout_signal && !was_tracked {
+        place_new_window_immediately(hwnd);
         return;
     }
     RETILE_PENDING.store(true, Ordering::SeqCst);
@@ -388,30 +484,11 @@ unsafe extern "system" fn host_wndproc(
         }
         WM_TIMER => {
             if wparam.0 == 100 {
+                restore_initial_transition_settings();
                 // handle reload request if pending (checked via scripting flag? for now just retile)
                 if RETILE_PENDING.load(Ordering::SeqCst) && TILING_ENABLED.load(Ordering::SeqCst) {
                     RETILE_PENDING.store(false, Ordering::SeqCst);
-                    // compute panel/taskbar reservation — now top+bottom aware
-                    let cfg = CURRENT_CONFIG
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    let gap = cfg.general.gap;
-                    let layout = cfg.layout_enum();
-                    let (top_reserve, bottom_reserve) = bar_reserves(&cfg);
-                    let taskbar_hwnd = taskbar::get_taskbar_hwnd();
-                    let reserve = if !cfg.panels.is_empty() {
-                        None
-                    } else {
-                        taskbar_hwnd
-                    };
-                    manager::tile_windows_reserved(
-                        reserve,
-                        top_reserve,
-                        bottom_reserve,
-                        layout,
-                        gap,
-                    );
+                    tile_current_layout_now();
                 }
             }
             LRESULT(0)

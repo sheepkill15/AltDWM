@@ -7,6 +7,9 @@ layout = "spiral"
 taskbar = true
 taskbar_height = 40
 auto_tile = true
+instant_first_layout = true
+auto_float_utility_windows = true
+respect_window_size_constraints = true
 hide_native_taskbar = true
 filter_virtual_desktop = false
 
@@ -31,6 +34,8 @@ text_dim = "#9aa4b5"
 accent = "#8b5cf6"
 accent_active = "#a78bfa"
 border = "#4c3f73"
+border_active = "#a78bfa"
+border_inactive = "#353b49"
 tray_bg = "#272b35"
 surface = "#292d38"
 surface_hover = "#353b49"
@@ -96,6 +101,13 @@ match_class_regex = "(?i)spotify"
 floating = true
 opacity = 0.94
 on_create = 'rhai: log("Spotify matched the full-demo rule")'
+
+# Steam's friends/chat utility is an independent top-level window, but it is
+# better treated as a persistent floating palette than a member of the layout.
+[[rules]]
+match_process = "steamwebhelper.exe"
+match_title_regex = "(?i)(friends list|steam chat|friends & chat)"
+floating = true
 
 [[keybinds]]
 keys = "Alt+Shift+R"

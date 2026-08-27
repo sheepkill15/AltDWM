@@ -124,17 +124,26 @@ pub fn get_process_name(hwnd: HWND) -> String {
     }
 }
 
-/// Returns true if window should float (not tiled) per rules
-pub fn is_floating(hwnd: HWND) -> bool {
+/// First matching explicit floating decision. This allows `floating = false`
+/// to opt a window back into tiling even when automatic utility/constraint
+/// heuristics would otherwise float it.
+pub fn floating_decision(hwnd: HWND) -> Option<bool> {
     let cfg = crate::CURRENT_CONFIG
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     for rule in &cfg.rules {
-        if rule_matches(hwnd, rule) && rule.floating == Some(true) {
-            return true;
+        if rule_matches(hwnd, rule) {
+            if let Some(floating) = rule.floating {
+                return Some(floating);
+            }
         }
     }
-    false
+    None
+}
+
+/// Returns true if a window is explicitly configured to float.
+pub fn is_floating(hwnd: HWND) -> bool {
+    floating_decision(hwnd) == Some(true)
 }
 
 /// Get monitor target from rule, if any (e.g. rule monitor=2)

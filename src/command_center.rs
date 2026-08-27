@@ -36,6 +36,7 @@ const KEY_UP: u16 = VK_UP.0;
 
 #[derive(Clone, Copy)]
 enum CommandAction {
+    ShowShortcuts,
     Launch(&'static str),
     OpenConfig,
     Reload,
@@ -53,6 +54,13 @@ struct CommandItem {
 }
 
 const ITEMS: &[CommandItem] = &[
+    CommandItem {
+        badge: "KB",
+        title: "Active shortcuts",
+        description: "View every registered AltDWM shortcut",
+        keywords: "keyboard keys keybinds hotkeys help controls",
+        action: CommandAction::ShowShortcuts,
+    },
     CommandItem {
         badge: "FI",
         title: "Files",
@@ -111,11 +119,19 @@ const ITEMS: &[CommandItem] = &[
     },
 ];
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum CenterView {
+    #[default]
+    Commands,
+    Shortcuts,
+}
+
 #[derive(Default)]
 struct CenterState {
     hwnd: isize,
     query: String,
     selected: usize,
+    view: CenterView,
 }
 
 static STATE: LazyLock<Mutex<CenterState>> = LazyLock::new(|| Mutex::new(CenterState::default()));
@@ -133,6 +149,16 @@ fn matching_indices(query: &str) -> Vec<usize> {
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+fn compact_label(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut compact: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        compact.pop();
+        compact.push('…');
+    }
+    compact
 }
 
 unsafe fn fill_rect(hdc: HDC, rect: RECT, color: COLORREF) {
@@ -185,13 +211,25 @@ unsafe fn paint(hwnd: HWND) {
     let previous = SelectObject(hdc, title_font.into());
     text(hdc, "AltDWM", 28, 22, theme.text_color());
     let _ = SelectObject(hdc, small_font.into());
+    let view = STATE.lock().unwrap_or_else(|error| error.into_inner()).view;
     text(
         hdc,
-        "COMMAND CENTER  •  TYPE TO FILTER",
+        if view == CenterView::Shortcuts {
+            "ACTIVE SHORTCUTS"
+        } else {
+            "COMMAND CENTER  •  TYPE TO FILTER"
+        },
         29,
         54,
         theme.text_dim_color(),
     );
+
+    if view == CenterView::Shortcuts {
+        paint_shortcuts(hdc, client, &theme, body_font, small_font);
+        let _ = SelectObject(hdc, previous);
+        let _ = EndPaint(hwnd, &ps);
+        return;
+    }
 
     let query = STATE
         .lock()
@@ -299,8 +337,85 @@ unsafe fn paint(hwnd: HWND) {
     let _ = EndPaint(hwnd, &ps);
 }
 
+unsafe fn paint_shortcuts(
+    hdc: HDC,
+    client: RECT,
+    theme: &crate::theme::Theme,
+    body_font: windows::Win32::Graphics::Gdi::HFONT,
+    small_font: windows::Win32::Graphics::Gdi::HFONT,
+) {
+    let keybinds = crate::ACTIVE_KEYBINDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let count = keybinds.len();
+    let columns = if count > 7 { 2 } else { 1 };
+    let rows = count.div_ceil(columns).max(1);
+    let column_width = (client.right - 52) / columns as i32;
+
+    if keybinds.is_empty() {
+        let _ = SelectObject(hdc, body_font.into());
+        text(
+            hdc,
+            "No shortcuts are currently registered.",
+            28,
+            104,
+            theme.text_color(),
+        );
+    } else {
+        for (index, keybind) in keybinds.iter().enumerate() {
+            let column = index / rows;
+            let row = index % rows;
+            let left = 26 + column as i32 * column_width;
+            let top = 92 + row as i32 * 54;
+            let card = RECT {
+                left,
+                top,
+                right: left + column_width - 10,
+                bottom: top + 46,
+            };
+            fill_round_rect(hdc, card, 10, theme.surface_color());
+            let _ = SelectObject(hdc, body_font.into());
+            text(
+                hdc,
+                &keybind.keys,
+                left + 12,
+                top + 7,
+                theme.accent_active_color(),
+            );
+            let _ = SelectObject(hdc, small_font.into());
+            let description = keybind.description.as_deref().unwrap_or(&keybind.action);
+            let description = compact_label(description, 31);
+            text(
+                hdc,
+                &description,
+                left + 12,
+                top + 27,
+                theme.text_dim_color(),
+            );
+        }
+    }
+
+    let footer = RECT {
+        left: 0,
+        top: client.bottom - 42,
+        right: client.right,
+        bottom: client.bottom,
+    };
+    fill_rect(hdc, footer, theme.surface_color());
+    let _ = SelectObject(hdc, small_font.into());
+    text(
+        hdc,
+        "ESC / BACKSPACE  BACK TO COMMANDS",
+        28,
+        client.bottom - 27,
+        theme.text_dim_color(),
+    );
+}
+
 fn run_action(action: CommandAction) {
     match action {
+        CommandAction::ShowShortcuts => {}
         CommandAction::Launch(command) => {
             crate::scripting::dispatch_action(&format!("launch('{command}')"));
         }
@@ -327,11 +442,22 @@ fn invoke_selected(hwnd: HWND) {
             .get(state.selected.min(matches.len().saturating_sub(1)))
             .map(|index| ITEMS[*index].action)
     };
-    unsafe {
-        let _ = DestroyWindow(hwnd);
-    }
     if let Some(action) = action {
-        run_action(action);
+        if matches!(action, CommandAction::ShowShortcuts) {
+            let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+            state.view = CenterView::Shortcuts;
+            state.query.clear();
+            state.selected = 0;
+            drop(state);
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        } else {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            run_action(action);
+        }
     }
 }
 
@@ -347,6 +473,10 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_CHAR => {
+            if STATE.lock().unwrap_or_else(|error| error.into_inner()).view == CenterView::Shortcuts
+            {
+                return LRESULT(0);
+            }
             let character = char::from_u32(wparam.0 as u32);
             if let Some(character) = character.filter(|character| !character.is_control()) {
                 let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
@@ -360,6 +490,18 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_KEYDOWN => {
+            let shortcuts_view = STATE.lock().unwrap_or_else(|error| error.into_inner()).view
+                == CenterView::Shortcuts;
+            if shortcuts_view && matches!(wparam.0 as u16, KEY_ESCAPE | KEY_BACK) {
+                let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+                state.view = CenterView::Commands;
+                drop(state);
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                return LRESULT(0);
+            }
+            if shortcuts_view {
+                return LRESULT(0);
+            }
             match wparam.0 as u16 {
                 KEY_ESCAPE => {
                     let _ = DestroyWindow(hwnd);
@@ -390,6 +532,10 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            if STATE.lock().unwrap_or_else(|error| error.into_inner()).view == CenterView::Shortcuts
+            {
+                return LRESULT(0);
+            }
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
             if y >= ITEM_TOP {
                 let row = ((y - ITEM_TOP) / ITEM_HEIGHT) as usize;
@@ -417,6 +563,7 @@ unsafe extern "system" fn wndproc(
                 state.hwnd = 0;
                 state.query.clear();
                 state.selected = 0;
+                state.view = CenterView::Commands;
             }
             LRESULT(0)
         }
@@ -551,13 +698,21 @@ pub fn close() {
 
 #[cfg(test)]
 mod tests {
-    use super::matching_indices;
+    use super::{compact_label, matching_indices};
 
     #[test]
     fn command_search_matches_titles_descriptions_and_keywords() {
+        assert_eq!(matching_indices("shortcut"), vec![0]);
         assert!(!matching_indices("terminal").is_empty());
         assert!(!matching_indices("settings").is_empty());
         assert!(!matching_indices("balanced").is_empty());
         assert!(matching_indices("definitely-not-a-command").is_empty());
+    }
+
+    #[test]
+    fn shortcut_labels_are_compacted_on_character_boundaries() {
+        assert_eq!(compact_label("Focus next window", 31), "Focus next window");
+        assert_eq!(compact_label("1234567890", 5), "1234…");
+        assert_eq!(compact_label("éééééé", 5), "éééé…");
     }
 }

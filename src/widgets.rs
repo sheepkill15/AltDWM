@@ -297,7 +297,9 @@ impl Widget for WorkspacesWidget {
             // real counts: tilable windows + layout
             let mut wins = ctx.windows.clone();
             wins.retain(|w| {
-                !crate::rules::is_floating(*w) && !crate::focus::is_runtime_floating(*w)
+                !crate::rules::is_floating(*w)
+                    && !crate::focus::is_runtime_floating(*w)
+                    && !crate::manager::is_auto_floating(*w)
             });
             let count = wins.len();
             let layout = crate::CURRENT_LAYOUT
