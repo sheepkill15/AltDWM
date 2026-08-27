@@ -7,7 +7,8 @@ layout = "spiral"
 taskbar = true
 taskbar_height = 40
 auto_tile = true
-filter_virtual_desktop = true
+hide_native_taskbar = true
+filter_virtual_desktop = false
 
 [ignore]
 classes = [
@@ -20,7 +21,7 @@ classes = [
     "AltDWM_Panel",
 ]
 titles = []
-processes = ["rustrover64.exe", "idea64.exe"]
+processes = []
 
 [theme]
 panel_bg = "#17191f"
@@ -31,81 +32,63 @@ accent = "#8b5cf6"
 accent_active = "#a78bfa"
 border = "#4c3f73"
 tray_bg = "#272b35"
+surface = "#292d38"
+surface_hover = "#353b49"
 font_name = "Segoe UI"
 font_size = 13
-rounding = 8
+rounding = 12
 gap = 10
 
-# One bottom panel per display demonstrates multi-monitor panel placement.
+# One coherent shell bar per display. The primary controls are deliberately
+# discoverable instead of split across developer-demo panels.
 [[panels]]
-name = "bottom"
+name = "shell"
 position = "bottom"
-height = 42
+height = 58
 monitor = "all"
-margin = [0, 6, 6, 6]
+margin = [0, 8, 8, 8]
 widgets = [
-    "workspaces",
+    "launcher",
+    "layout",
     "window_list",
-    "spacer",
-    "window_title",
+    "cpu",
     "tray",
     "clock",
 ]
 
-# The primary top panel exercises launcher and custom Rhai widgets.
-[[panels]]
-name = "top"
-position = "top"
-height = 32
-monitor = "primary"
-margin = [6, 6, 0, 6]
-widgets = ["launcher", "spacer", "cpu"]
+[[widgets]]
+type = "launcher"
+name = "launcher"
+label = "AltDWM"
+width = 120
 
 [[widgets]]
-type = "workspaces"
-name = "workspaces"
-width = 150
+type = "layout"
+name = "layout"
+width = 216
 
 [[widgets]]
 type = "window_list"
 name = "window_list"
-width = 360
-
-[[widgets]]
-type = "window_title"
-name = "window_title"
-width = 320
 
 [[widgets]]
 type = "tray"
 name = "tray"
-width = 180
+width = 176
 
 [[widgets]]
 type = "clock"
 name = "clock"
-format = "%H:%M:%S"
+format = "%H:%M"
 interval = 500
-action = 'rhai: launch("explorer.exe")'
-width = 150
-
-[[widgets]]
-type = "spacer"
-name = "spacer"
-
-[[widgets]]
-type = "launcher"
-name = "launcher"
-action = "launch('wt.exe')"
-label = "Terminal"
-width = 96
+width = 136
 
 [[widgets]]
 type = "custom"
 name = "cpu"
 interval = 1000
 script = "scripts/cpu.rhai"
-width = 230
+width = 150
 
 # Demonstrates class matching, floating rules, opacity, and on-create Rhai.
 [[rules]]
@@ -123,6 +106,11 @@ description = "Retile windows"
 keys = "Alt+Shift+T"
 action = "toggle_tiling"
 description = "Toggle tiling"
+
+[[keybinds]]
+keys = "Alt+Shift+Space"
+action = "command_center"
+description = "Open the AltDWM command center"
 
 [[keybinds]]
 keys = "Alt+Shift+Q"

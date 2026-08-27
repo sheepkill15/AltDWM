@@ -98,7 +98,7 @@ fn has_independent_app_presence(ex_style: u32, has_owner: bool) -> bool {
     (!has_owner || app_window) && (!tool_window || app_window)
 }
 
-pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
+fn is_manageable_impl(hwnd: HWND, taskbar_hwnd: Option<HWND>, include_minimized: bool) -> bool {
     unsafe {
         if hwnd.0.is_null() {
             return false;
@@ -111,7 +111,7 @@ pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
         if !IsWindowVisible(hwnd).as_bool() {
             return false;
         }
-        if IsIconic(hwnd).as_bool() {
+        if !include_minimized && IsIconic(hwnd).as_bool() {
             return false;
         }
         // Only top-level windows
@@ -142,6 +142,7 @@ pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
             "Shell_SecondaryTrayWnd" => return false,
             "AltDWM_Taskbar" => return false,
             "AltDWM_Panel" => return false,
+            "AltDWM_CommandCenter" => return false,
             "AltDWM_Host" => return false,
             "Windows.UI.Core.CoreWindow" => {
                 let title = get_window_title(hwnd);
@@ -175,6 +176,14 @@ pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
 
         true
     }
+}
+
+pub fn is_manageable(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
+    is_manageable_impl(hwnd, taskbar_hwnd, false)
+}
+
+pub fn is_manageable_or_minimized(hwnd: HWND, taskbar_hwnd: Option<HWND>) -> bool {
+    is_manageable_impl(hwnd, taskbar_hwnd, true)
 }
 
 pub fn rect_to_string(r: &RECT) -> String {

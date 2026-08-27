@@ -23,18 +23,18 @@ Goal: let users configure **and change anything** without forking Rust code — 
 
 Users who want full Rust can still use the plugin API (compile-time).
 
-## What you can customize (v0.2 DSL)
+## What you can customize (v0.3 DSL)
 
 ### 1) Panels = taskbars / bars / docks
 
 ```toml
 [[panels]]
-name = "bottom"
+name = "shell"
 position = "bottom"      # top | bottom | left | right
-height = 40              # or width for vertical bars
+height = 58              # or width for vertical bars
 monitor = "all"          # all | primary | 1 | 2 | "Dell U2720Q"
-margin = [0,0,0,0]       # top,right,bottom,left
-widgets = ["workspaces", "spacer", "window_title", "tray", "clock"]
+margin = [0,8,8,8]       # top,right,bottom,left
+widgets = ["launcher", "layout", "window_list", "tray", "clock"]
 # each panel is a Win32 WS_POPUP | WS_EX_TOPMOST window, drawn via GDI/Direct2D
 ```
 
@@ -42,28 +42,28 @@ Multiple panels allowed — e.g. top bar + side dock.
 
 ### 2) Widgets — composable units inside panels
 
-Built-ins (v0.2):
+Built-ins (v0.3):
 
 | widget         | description                                                                   | key config                   |
 |----------------|-------------------------------------------------------------------------------|------------------------------|
 | `clock`        | `Format: 09:41`                                                               | `format`, `interval`         |
-| `workspaces`   | Current tiling layout and live tilable/floating count                         | `width`                      |
+| `layout` / `workspaces` | Current layout and managed count; click to cycle layouts              | `width`                      |
 | `window_list`  | Clickable list of current desktop's tiled windows                             | `width`                      |
 | `window_title` | Active window title                                                           | `max_len`                    |
-| `tray`         | Visual system-tray placeholder (notification-area hosting is not implemented) | `width`                      |
+| `tray`         | Clickable Explorer notification-area bridge; requires Explorer until a native shell receiver is implemented | `width`                      |
 | `spacer`       | Flexible gap                                                                  | `width` (`0` means flexible) |
-| `launcher`     | App grid / start button                                                       | `label`, `icon`, `command`   |
+| `launcher`     | Opens the searchable AltDWM command center; an explicit action overrides it   | `label`, `icon`, `action`    |
 | `custom`       | Rhai-drawn widget                                                             | `script`, `interval`         |
 
 Widget registry is extensible:
 
 ```rust
 // src/widgets.rs:14
-pub trait Widget: Send {
+pub trait Widget: Send + Sync {
   fn name(&self) -> &str;
   fn width(&self, ctx: &PanelCtx) -> i32;          // 0 = flex
   fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx);
-  fn on_click(&self, btn: MouseButton) -> Option<Action>;
+  fn on_click(&self, x: i32, y: i32, ctx: &PanelCtx) -> Option<String>;
   fn interval_ms(&self) -> Option<u32>;
 }
 ```
@@ -215,5 +215,35 @@ action = "launch('wt.exe')"
 2. **Done**: `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`, widget trait scaffold, panel manager, TOML widgets.
 3. **Done**: Rhai engine + `scripts/*.rhai` for custom widgets/layouts/callbacks.
 4. **Later**: real notification-area hosting, virtual-desktop workspace switching, elevated-window hook DLL, optional plugin ABI.
+
+## Deferred: Explorer-free shell and notification area
+
+The current implementation makes Explorer's taskbar fully transparent and uses
+UI Automation to bridge its live notification-area items into AltDWM. This is a
+compatibility stage: Explorer remains alive as the tray backend even though no
+native taskbar pixels are visible and its work-area reservation is ignored.
+
+A complete shell-replacement mode should instead:
+
+1. Start AltDWM as the user's shell without starting `explorer.exe`.
+2. Host a notification-area compatibility endpoint for applications calling
+   `Shell_NotifyIcon`, including add/modify/delete/version operations, icon and
+   tooltip ownership, mouse/keyboard callback messages, balloon notifications,
+   DPI changes, overflow state, and the `TaskbarCreated` recovery broadcast.
+3. Implement clock, audio, network, battery, input, quick settings, and
+   notification access as AltDWM widgets backed by their Windows APIs rather
+   than Explorer UI Automation.
+4. Provide startup failure recovery and an explicit command that restores the
+   normal Explorer shell before enabling this mode persistently.
+5. Decide how folder browsing works: starting `explorer.exe` as a file manager
+   can also recreate shell UI, so Explorer process lifetime must be controlled
+   or a separate file manager must be used.
+
+Windows documents the application-facing `Shell_NotifyIcon` contract but not a
+supported third-party implementation contract for the receiving tray host.
+Generic tray compatibility will therefore require a carefully isolated,
+version-tested compatibility layer. This work is deliberately deferred; the
+transparent Explorer bridge remains the default until that layer has recovery
+and compatibility coverage.
 
 This keeps easy tasks easy (edit TOML) and hard tasks possible (Rhai/Rust) — same model as Linux WMs but native to Windows.

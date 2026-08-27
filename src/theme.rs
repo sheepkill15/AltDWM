@@ -22,6 +22,10 @@ pub struct Theme {
     pub border: String,
     #[serde(default = "def_tray_bg")]
     pub tray_bg: String,
+    #[serde(default = "def_surface")]
+    pub surface: String,
+    #[serde(default = "def_surface_hover")]
+    pub surface_hover: String,
     #[serde(default = "def_font_name")]
     pub font_name: String,
     #[serde(default = "def_font_size")]
@@ -56,6 +60,12 @@ fn def_border() -> String {
 fn def_tray_bg() -> String {
     "#2d2d30".into()
 }
+fn def_surface() -> String {
+    "#292b32".into()
+}
+fn def_surface_hover() -> String {
+    "#353842".into()
+}
 fn def_font_name() -> String {
     "Segoe UI".into()
 }
@@ -80,6 +90,8 @@ impl Default for Theme {
             accent_active: def_accent_active(),
             border: def_border(),
             tray_bg: def_tray_bg(),
+            surface: def_surface(),
+            surface_hover: def_surface_hover(),
             font_name: def_font_name(),
             font_size: def_font_size(),
             rounding: def_rounding(),
@@ -113,6 +125,12 @@ impl Theme {
     }
     pub fn border_color(&self) -> COLORREF {
         self.color(&self.border)
+    }
+    pub fn surface_color(&self) -> COLORREF {
+        self.color(&self.surface)
+    }
+    pub fn surface_hover_color(&self) -> COLORREF {
+        self.color(&self.surface_hover)
     }
 }
 
@@ -172,12 +190,48 @@ static FONT_CACHE: LazyLock<Mutex<HashMap<String, isize>>> =
 
 /// Cached version — reuses HFONT per (font_name, size), leaked until exit to avoid GDI churn
 pub fn get_cached_font(theme: &Theme) -> HFONT {
-    let key = format!("{}:{}", theme.font_name, theme.font_size);
+    get_cached_font_variant(
+        theme,
+        theme.font_size,
+        windows::Win32::Graphics::Gdi::FW_NORMAL.0 as i32,
+    )
+}
+
+/// Cached font variant used by richer shell surfaces without creating GDI
+/// objects during every paint.
+pub fn get_cached_font_variant(theme: &Theme, size: i32, weight: i32) -> HFONT {
+    use windows::Win32::Graphics::Gdi::{
+        CreateFontW, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, FF_DONTCARE,
+        OUT_DEFAULT_PRECIS, VARIABLE_PITCH,
+    };
+    let key = format!("{}:{size}:{weight}", theme.font_name);
     let mut cache = FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&v) = cache.get(&key) {
         return HFONT(v as *mut std::ffi::c_void);
     }
-    let h = create_font(theme);
+    let name_wide: Vec<u16> = theme
+        .font_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let h = unsafe {
+        CreateFontW(
+            -size,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            VARIABLE_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+            windows::core::PCWSTR(name_wide.as_ptr()),
+        )
+    };
     cache.insert(key, h.0 as isize);
     h
 }

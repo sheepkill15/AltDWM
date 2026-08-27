@@ -5,6 +5,7 @@ layout = "MasterStack"
 taskbar = true
 taskbar_height = 40
 auto_tile = true
+hide_native_taskbar = true
 filter_virtual_desktop = false
 
 [ignore]
@@ -28,41 +29,38 @@ accent = "#3a6ea5"
 accent_active = "#007acc"
 border = "#404040"
 tray_bg = "#2d2d30"
+surface = "#292b32"
+surface_hover = "#353842"
 font_name = "Segoe UI"
 font_size = 13
-rounding = 6
+rounding = 12
 gap = 8
 
 [[panels]]
-name = "bottom"
+name = "shell"
 position = "bottom"
-height = 40
+height = 58
 monitor = "all"
-background = "#202020"
-margin = [0, 0, 0, 0]
+margin = [0, 8, 8, 8]
 widgets = [
-    "workspaces",
+    "launcher",
+    "layout",
     "window_list",
-    "spacer",
+    "cpu",
     "tray",
     "clock",
 ]
 
-[[panels]]
-name = "top"
-position = "top"
-height = 28
-monitor = "primary"
-background = "#1a1a1a"
-widgets = [
-    "launcher",
-    "spacer",
-    "cpu",
-]
+[[widgets]]
+type = "launcher"
+name = "launcher"
+label = "AltDWM"
+width = 120
 
 [[widgets]]
-type = "workspaces"
-name = "workspaces"
+type = "layout"
+name = "layout"
+width = 216
 
 [[widgets]]
 type = "window_list"
@@ -75,33 +73,21 @@ name = "window_title"
 [[widgets]]
 type = "tray"
 name = "tray"
-width = 220
+width = 180
 
 [[widgets]]
 type = "clock"
 name = "clock"
-format = "%H:%M:%S"
+format = "%H:%M"
 interval = 1000
-action = 'rhai: launch("explorer.exe")'
-width = 160
-
-[[widgets]]
-type = "spacer"
-name = "spacer"
-
-[[widgets]]
-type = "launcher"
-name = "launcher"
-action = "launch('explorer.exe')"
-label = "Menu"
-width = 40
+width = 136
 
 [[widgets]]
 type = "custom"
 name = "cpu"
 interval = 2000
 script = "scripts/cpu.rhai"
-width = 120
+width = 150
 
 [[rules]]
 match_class = "Spotify"
@@ -116,6 +102,11 @@ description = "Retile windows"
 keys = "Alt+Shift+T"
 action = "toggle_tiling"
 description = "Toggle tiling"
+
+[[keybinds]]
+keys = "Alt+Shift+Space"
+action = "command_center"
+description = "Open the AltDWM command center"
 
 [[keybinds]]
 keys = "Alt+Shift+Q"

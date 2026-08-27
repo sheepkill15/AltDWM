@@ -1,3 +1,4 @@
+mod command_center;
 mod config;
 mod focus;
 mod layout;
@@ -5,8 +6,10 @@ mod manager;
 mod panel;
 mod rules;
 mod scripting;
+mod shell;
 mod taskbar;
 mod theme;
+mod tray;
 mod util;
 mod virtual_desktop;
 mod watcher;
@@ -26,9 +29,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
     TranslateMessage, CW_USEDEFAULT, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
-    EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, HMENU, HWND_MESSAGE, MSG,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_TIMER,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+    EVENT_SYSTEM_MOVESIZESTART, HMENU, HWND_MESSAGE, MSG, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_TIMER,
 };
 
 use layout::Layout;
@@ -102,6 +106,7 @@ pub fn set_layout_by_name(name: &str) {
         "floating" => Layout::Floating,
         _ => Layout::MasterStack,
     };
+    manager::clear_layout_overrides();
     *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = layout;
     {
         let mut cfg = CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
@@ -304,12 +309,53 @@ unsafe extern "system" fn win_event_proc(
     if hwnd.0.is_null() {
         return;
     }
+    if shell::is_native_taskbar(hwnd) {
+        if CURRENT_CONFIG
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .general
+            .hide_native_taskbar
+        {
+            shell::hide_native_taskbar(hwnd);
+        }
+        return;
+    }
     if event == EVENT_OBJECT_DESTROY {
         rules::forget_window(hwnd);
     }
     // on_create rules — run even if tiling disabled, but only for CREATE/SHOW
     if event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW {
         rules::maybe_run_on_create(hwnd);
+    }
+    if event == EVENT_SYSTEM_MOVESIZESTART {
+        manager::begin_interactive_move(hwnd);
+        return;
+    }
+    if event == EVENT_SYSTEM_MOVESIZEEND {
+        manager::finish_interactive_move(hwnd);
+    }
+    // Foreground changes only affect panel state (active window/title). A full
+    // layout pass here made window-list feedback laggy and needlessly moved every
+    // HWND on each focus change.
+    panel::invalidate_all();
+    if event == EVENT_SYSTEM_FOREGROUND {
+        return;
+    }
+    // Location changes cover maximize/restore and keyboard-driven moves. During
+    // a mouse drag, wait for MOVESIZEEND so AltDWM does not fight the pointer.
+    // Ignore the exact rectangle assigned by our own most recent layout pass.
+    if event == EVENT_OBJECT_LOCATIONCHANGE
+        && (manager::is_move_active(hwnd) || manager::is_expected_location(hwnd))
+    {
+        return;
+    }
+    // Accessibility and shell UI can emit window-object events too. Only a
+    // newly manageable HWND or one already known to the manager can affect the
+    // layout; ignoring the rest prevents tray/UIA activity from causing retiles.
+    let affects_layout =
+        manager::is_tracked_window(hwnd) || util::is_manageable(hwnd, taskbar::get_taskbar_hwnd());
+    if !affects_layout {
+        return;
     }
     if !TILING_ENABLED.load(Ordering::SeqCst) {
         return;
@@ -410,7 +456,7 @@ fn print_banner() {
         r#"
   ___   _ _   ___  _ _ _ _  
  / _ \ | | | |   \| | | | | 
-| |_| || | | | |) | | | | |  AltDWM 0.2.0 - Experimental Windows Shell
+| |_| || | | | |) | | | | |  AltDWM 0.3.0 - Native Windows Shell
  \___/ |_|_| |___/|_|_|_|_|  Rust + Win32 + DWM (declarative panels + Rhai)
 "#
     );
@@ -541,6 +587,8 @@ fn apply_config_reload(
     panel_handles: &mut Vec<HWND>,
     taskbar_hwnd: &mut Option<HWND>,
 ) {
+    command_center::close();
+    manager::clear_layout_overrides();
     for w in new_cfg.validate() {
         eprintln!("[config] warn: {}", w);
     }
@@ -548,6 +596,10 @@ fn apply_config_reload(
     *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.layout_enum();
     *CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
     *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = new_path.clone();
+    if new_cfg.general.hide_native_taskbar && !shell::native_taskbars_are_hidden() {
+        tray::prime();
+    }
+    shell::set_native_taskbars_hidden(new_cfg.general.hide_native_taskbar);
     register_keybinds(&new_cfg);
     panel::destroy_panels();
     panel_handles.clear();
@@ -708,6 +760,11 @@ fn main() {
         }
     };
 
+    if cfg.general.hide_native_taskbar {
+        tray::prime();
+    }
+    shell::set_native_taskbars_hidden(cfg.general.hide_native_taskbar);
+
     // --- panels vs legacy taskbar
     let mut panel_handles: Vec<HWND> = Vec::new();
     let mut taskbar_hwnd: Option<HWND> = if !cfg.panels.is_empty() {
@@ -783,6 +840,11 @@ fn main() {
             "MINIMIZE",
         );
         try_hook(
+            EVENT_SYSTEM_MOVESIZESTART,
+            EVENT_SYSTEM_MOVESIZESTART,
+            "MOVESIZESTART",
+        );
+        try_hook(
             EVENT_SYSTEM_MOVESIZEEND,
             EVENT_SYSTEM_MOVESIZEEND,
             "MOVESIZEEND",
@@ -791,6 +853,11 @@ fn main() {
         try_hook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, "DESTROY");
         try_hook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, "SHOW");
         try_hook(EVENT_OBJECT_HIDE, EVENT_OBJECT_HIDE, "HIDE");
+        try_hook(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            "LOCATIONCHANGE",
+        );
     }
 
     if TILING_ENABLED.load(Ordering::SeqCst) {
@@ -873,6 +940,8 @@ fn main() {
             let _ = UnhookWinEvent(h);
         }
         panel::destroy_panels();
+        command_center::close();
+        shell::restore_native_taskbars();
         let _ = host_hwnd;
         let _ = panel_handles;
     }

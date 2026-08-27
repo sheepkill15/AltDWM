@@ -201,6 +201,7 @@ pub fn dispatch_action(action: &str) {
     match act {
         "retile" => crate::request_retile(),
         "toggle_tiling" => crate::toggle_tiling(),
+        "command_center" | "launcher" => crate::command_center::toggle_from_keyboard(),
         "quit" => crate::request_quit(),
         "reload_config" => {
             println!("[scripting] reload_config");

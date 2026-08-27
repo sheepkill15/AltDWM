@@ -44,6 +44,9 @@ pub struct General {
     pub taskbar_height: i32,
     #[serde(default = "default_true")]
     pub auto_tile: bool,
+    /// Hide Explorer's primary/secondary taskbars while AltDWM is running.
+    #[serde(default = "default_true")]
+    pub hide_native_taskbar: bool,
     /// Additional inset applied to every edge of each monitor's work area.
     #[serde(default)]
     pub outer_gap: Option<i32>,
@@ -212,6 +215,7 @@ impl Default for General {
             taskbar: default_taskbar(),
             taskbar_height: default_taskbar_height(),
             auto_tile: default_true(),
+            hide_native_taskbar: default_true(),
             outer_gap: None,
             filter_virtual_desktop: default_filter_vd(),
         }
@@ -258,6 +262,8 @@ impl Default for Config {
                     "Shell_TrayWnd".into(),
                     "Shell_SecondaryTrayWnd".into(),
                     "AltDWM_Taskbar".into(),
+                    "AltDWM_Panel".into(),
+                    "AltDWM_CommandCenter".into(),
                     "AltDWM_Host".into(),
                 ],
                 titles: vec![],
@@ -278,6 +284,11 @@ impl Default for Config {
                     keys: "Alt+Shift+T".into(),
                     action: "toggle_tiling".into(),
                     description: Some("Toggle tiling".into()),
+                },
+                KeybindConfig {
+                    keys: "Alt+Shift+Space".into(),
+                    action: "command_center".into(),
+                    description: Some("Open AltDWM command center".into()),
                 },
                 KeybindConfig {
                     keys: "Alt+Shift+Q".into(),
@@ -511,7 +522,7 @@ impl Config {
 
 pub fn builtin_widget_config(name: &str) -> Option<WidgetConfig> {
     let widget_type = match name {
-        "spacer" | "workspaces" | "window_title" | "tray" | "clock" | "launcher"
+        "spacer" | "workspaces" | "layout" | "window_title" | "tray" | "clock" | "launcher"
         | "window_list" => name,
         _ => return None,
     };
@@ -636,38 +647,40 @@ pub fn example_config_with_panels() -> Config {
     cfg.general.gap = 8;
     cfg.general.layout = "MasterStack".into();
     // add sample panels/widgets/rules so generated file is illustrative
-    cfg.panels = vec![
-        PanelConfig {
-            name: "bottom".into(),
-            position: "bottom".into(),
-            height: 40,
-            monitor: "all".into(),
-            margin: None,
-            background: Some("#202020".into()),
-            widgets: vec![
-                "workspaces".into(),
-                "window_list".into(),
-                "spacer".into(),
-                "tray".into(),
-                "clock".into(),
-            ],
-            extra: HashMap::new(),
-        },
-        PanelConfig {
-            name: "top".into(),
-            position: "top".into(),
-            height: 28,
-            monitor: "primary".into(),
-            margin: None,
-            background: Some("#1a1a1a".into()),
-            widgets: vec!["launcher".into(), "spacer".into(), "cpu".into()],
-            extra: HashMap::new(),
-        },
-    ];
+    cfg.panels = vec![PanelConfig {
+        name: "shell".into(),
+        position: "bottom".into(),
+        height: 58,
+        monitor: "all".into(),
+        margin: Some([0, 8, 8, 8]),
+        background: None,
+        widgets: vec![
+            "launcher".into(),
+            "layout".into(),
+            "window_list".into(),
+            "cpu".into(),
+            "tray".into(),
+            "clock".into(),
+        ],
+        extra: HashMap::new(),
+    }];
     cfg.widgets = vec![
         WidgetConfig {
-            widget_type: "workspaces".into(),
-            name: "workspaces".into(),
+            widget_type: "launcher".into(),
+            name: "launcher".into(),
+            format: None,
+            interval: None,
+            script: None,
+            action: None,
+            command: None,
+            label: Some("AltDWM".into()),
+            icon: None,
+            width: Some(120),
+            extra: HashMap::new(),
+        },
+        WidgetConfig {
+            widget_type: "layout".into(),
+            name: "layout".into(),
             format: None,
             interval: None,
             script: None,
@@ -675,25 +688,12 @@ pub fn example_config_with_panels() -> Config {
             command: None,
             label: None,
             icon: None,
-            width: None,
+            width: Some(216),
             extra: HashMap::new(),
         },
         WidgetConfig {
             widget_type: "window_list".into(),
             name: "window_list".into(),
-            format: None,
-            interval: None,
-            script: None,
-            action: None,
-            command: None,
-            label: None,
-            icon: None,
-            width: None,
-            extra: HashMap::new(),
-        },
-        WidgetConfig {
-            widget_type: "window_title".into(),
-            name: "window_title".into(),
             format: None,
             interval: None,
             script: None,
@@ -714,46 +714,20 @@ pub fn example_config_with_panels() -> Config {
             command: None,
             label: None,
             icon: None,
-            width: Some(220),
+            width: Some(180),
             extra: HashMap::new(),
         },
         WidgetConfig {
             widget_type: "clock".into(),
             name: "clock".into(),
-            format: Some("%H:%M:%S".into()),
+            format: Some("%H:%M".into()),
             interval: Some(1000),
-            script: None,
-            action: Some("rhai: launch(\"explorer.exe\")".into()),
-            command: None,
-            label: None,
-            icon: None,
-            width: Some(160),
-            extra: HashMap::new(),
-        },
-        WidgetConfig {
-            widget_type: "spacer".into(),
-            name: "spacer".into(),
-            format: None,
-            interval: None,
             script: None,
             action: None,
             command: None,
             label: None,
             icon: None,
-            width: None,
-            extra: HashMap::new(),
-        },
-        WidgetConfig {
-            widget_type: "launcher".into(),
-            name: "launcher".into(),
-            format: None,
-            interval: None,
-            script: None,
-            action: Some("launch('explorer.exe')".into()),
-            command: None,
-            label: Some("Menu".into()),
-            icon: None,
-            width: Some(40),
+            width: Some(136),
             extra: HashMap::new(),
         },
         WidgetConfig {
@@ -766,7 +740,7 @@ pub fn example_config_with_panels() -> Config {
             command: None,
             label: None,
             icon: None,
-            width: Some(120),
+            width: Some(150),
             extra: HashMap::new(),
         },
     ];

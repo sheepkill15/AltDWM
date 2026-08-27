@@ -7,13 +7,15 @@ use std::sync::{Arc, Mutex};
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, HMONITOR,
-    MONITORINFO, MONITORINFOEXW, PAINTSTRUCT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
+    DeleteObject, EndPaint, FillRect, GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    PAINTSTRUCT, SRCCOPY,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT,
-    WM_TIMER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::config::{Config, PanelConfig};
@@ -23,6 +25,35 @@ type PanelCollection = Arc<Mutex<Vec<Panel>>>;
 
 static PANELS: std::sync::LazyLock<Mutex<Option<PanelCollection>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
+static HOVERED_WIDGETS: std::sync::LazyLock<Mutex<HashMap<isize, Option<usize>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+const WM_MOUSELEAVE_RAW: u32 = 0x02A3;
+
+/// Schedule a repaint without blocking if a paint/config callback already owns
+/// the panel collection. WinEvent callbacks can be COM-reentrant on this thread.
+pub fn invalidate_all() {
+    let Ok(panels_guard) = PANELS.try_lock() else {
+        return;
+    };
+    let Some(panel_arc) = panels_guard.as_ref().cloned() else {
+        return;
+    };
+    drop(panels_guard);
+    let Ok(panels) = panel_arc.try_lock() else {
+        return;
+    };
+    for panel in panels.iter() {
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(panel.hwnd), None, false);
+        }
+    }
+}
+
+pub fn first_handle() -> Option<HWND> {
+    let panels_guard = PANELS.try_lock().ok()?;
+    let panels = panels_guard.as_ref()?.try_lock().ok()?;
+    panels.first().map(|panel| panel.hwnd)
+}
 
 pub struct Panel {
     pub cfg: PanelConfig,
@@ -88,12 +119,16 @@ fn resolve_widget_layout(panel: &Panel, rect: RECT, hwnd: HWND) -> (PanelCtx, bo
     } else {
         rect.right - rect.left
     };
+    let mut windows =
+        crate::manager::collect_windows_including_minimized(crate::taskbar::get_taskbar_hwnd());
+    windows.retain(|window| crate::virtual_desktop::is_on_current_desktop(*window));
     let ctx = PanelCtx {
         panel_name: panel.cfg.name.clone(),
         monitor: panel.cfg.monitor.clone(),
         width: total_extent,
         height: panel.cfg.height,
         hwnd,
+        windows,
     };
     let requested: Vec<i32> = panel
         .widgets
@@ -127,10 +162,13 @@ unsafe extern "system" fn panel_wndproc(
         }
         WM_TIMER => {
             if wparam.0 == 1 || wparam.0 == 2 {
-                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
+                // The paint path fills every pixel itself. Asking Windows to erase
+                // first exposes a blank frame on every clock/widget tick.
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
+        WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             // find panel
             let panels_guard = PANELS.lock().unwrap_or_else(|e| e.into_inner());
@@ -143,14 +181,34 @@ unsafe extern "system" fn panel_wndproc(
                     let hdc = BeginPaint(hwnd, &mut ps);
                     let mut rect = RECT::default();
                     let _ = GetClientRect(hwnd, &mut rect);
+                    let width = (rect.right - rect.left).max(1);
+                    let height = (rect.bottom - rect.top).max(1);
+                    let buffer_dc = CreateCompatibleDC(Some(hdc));
+                    let buffer_bitmap = CreateCompatibleBitmap(hdc, width, height);
+                    let buffered = !buffer_dc.0.is_null() && !buffer_bitmap.0.is_null();
+                    let old_bitmap = if buffered {
+                        Some(windows::Win32::Graphics::Gdi::SelectObject(
+                            buffer_dc,
+                            buffer_bitmap.into(),
+                        ))
+                    } else {
+                        None
+                    };
+                    let draw_dc = if buffered { buffer_dc } else { hdc };
                     let brush = CreateSolidBrush(p.background);
-                    FillRect(hdc, &rect, brush);
+                    FillRect(draw_dc, &rect, brush);
                     let _ = DeleteObject(brush.into());
 
                     // Layout along the panel's long axis: horizontal bars and vertical docks.
                     let (ctx, vertical, widths) = resolve_widget_layout(p, rect, hwnd);
                     let mut x = if vertical { rect.top } else { rect.left };
-                    for (widget, width) in p.widgets.iter().zip(widths) {
+                    let hovered = HOVERED_WIDGETS
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get(&(hwnd.0 as isize))
+                        .copied()
+                        .flatten();
+                    for (index, (widget, width)) in p.widgets.iter().zip(widths).enumerate() {
                         let r = if vertical {
                             RECT {
                                 left: rect.left,
@@ -166,8 +224,43 @@ unsafe extern "system" fn panel_wndproc(
                                 bottom: rect.bottom,
                             }
                         };
-                        widget.draw(hdc, r, &ctx);
+                        if hovered == Some(index) && widget.name() != "spacer" {
+                            let inset = RECT {
+                                left: r.left + 3,
+                                top: r.top + 3,
+                                right: r.right - 3,
+                                bottom: r.bottom - 3,
+                            };
+                            let theme = crate::CURRENT_CONFIG
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .theme
+                                .clone();
+                            let region = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(
+                                inset.left,
+                                inset.top,
+                                inset.right,
+                                inset.bottom,
+                                theme.rounding.max(8),
+                                theme.rounding.max(8),
+                            );
+                            let brush = CreateSolidBrush(theme.surface_hover_color());
+                            let _ = windows::Win32::Graphics::Gdi::FillRgn(draw_dc, region, brush);
+                            let _ = DeleteObject(region.into());
+                            let _ = DeleteObject(brush.into());
+                        }
+                        widget.draw(draw_dc, r, &ctx);
                         x += width;
+                    }
+                    if let Some(old_bitmap) = old_bitmap {
+                        let _ = BitBlt(hdc, 0, 0, width, height, Some(buffer_dc), 0, 0, SRCCOPY);
+                        let _ = windows::Win32::Graphics::Gdi::SelectObject(buffer_dc, old_bitmap);
+                    }
+                    if !buffer_bitmap.0.is_null() {
+                        let _ = DeleteObject(buffer_bitmap.into());
+                    }
+                    if !buffer_dc.0.is_null() {
+                        let _ = DeleteDC(buffer_dc);
                     }
                     let _ = EndPaint(hwnd, &ps);
                     return LRESULT(0);
@@ -216,9 +309,62 @@ unsafe extern "system" fn panel_wndproc(
             }
             LRESULT(0)
         }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            let panels_guard = PANELS.lock().unwrap_or_else(|e| e.into_inner());
+            let panel_arc = panels_guard.as_ref().cloned();
+            drop(panels_guard);
+            if let Some(panel_arc) = panel_arc {
+                let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(p) = panels.iter().find(|p| p.hwnd == hwnd) {
+                    let mut rect = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rect);
+                    let (_, vertical, widths) = resolve_widget_layout(p, rect, hwnd);
+                    let point = if vertical { y } else { x };
+                    let mut edge = 0;
+                    let mut next = None;
+                    for (index, width) in widths.iter().enumerate() {
+                        if point >= edge && point < edge + *width {
+                            next = Some(index);
+                            break;
+                        }
+                        edge += *width;
+                    }
+                    let mut hovered = HOVERED_WIDGETS
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if hovered.get(&(hwnd.0 as isize)).copied().flatten() != next {
+                        hovered.insert(hwnd.0 as isize, next);
+                        let _ =
+                            windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+                    }
+                    let mut tracking = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tracking);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE_RAW => {
+            HOVERED_WIDGETS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&(hwnd.0 as isize));
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 1);
             let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2);
+            HOVERED_WIDGETS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&(hwnd.0 as isize));
             // don't PostQuitMessage — panels are not main loop; host is
             LRESULT(0)
         }

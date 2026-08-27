@@ -8,17 +8,20 @@ Rust prototype that **proves** a full Explorer replacement is possible on Window
 
 Tested on Windows 11, 2 monitors, Rust 1.98 + `windows` 0.61.
 
-## What this prototype does (0.2.0)
+## What AltDWM does (0.3.0)
 
 - **Tiling WM** (`src/manager.rs:84`): `EnumWindows` + `IsWindowVisible`/`IsIconic`/`DwmGetWindowAttribute(DWMWA_CLOAKED)`/`WS_EX_TOOLWINDOW`/`GA_ROOT` (`src/util.rs:57`). Per-monitor `MonitorFromWindow`/`GetMonitorInfoW`; atomic `BeginDeferWindowPos`/`DeferWindowPos` (`src/manager.rs:150`).
 - **Layouts** (`src/layout.rs:7`): `MasterStack` (60/40), `Grid`, `Monocle`, `Floating` — pluggable via `[[layouts.my]] script="..."` (Rhai).
-- **Event-driven** (`src/main.rs:89`): `SetWinEventHook` for `FOREGROUND/MINIMIZE/MOVESIZE/OBJECT_*` (`WINEVENT_OUTOFCONTEXT`). 200ms `WM_TIMER` on `AltDWM_Host` (message-only) does `tile_windows_reserved`.
-- **Declarative panels DSL** (`src/config.rs:16`, `docs/EXTENSIBILITY.md`): TOML `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`. Multiple bars: `position=top|bottom|left|right`, `monitor=all|primary`, `widgets=[...]`. Example `examples/config.example.toml` has `bottom` (40px, `workspaces/title/spacer/tray/clock`) + `top` (28px, `launcher/spacer/cpu`).
-- **Widgets** (`src/widgets.rs:14` trait): `clock`, live `workspaces` status, `window_list`, `window_title` (foreground), `tray` placeholder, `spacer` (flex), `launcher`, `custom` (Rhai script returns text). `create_widget` factory + `extra` flattened map for forward-compat.
+- **Event-driven** (`src/main.rs`): `SetWinEventHook` for `FOREGROUND/MINIMIZE/MOVESIZE/OBJECT_*` (`WINEVENT_OUTOFCONTEXT`). Maximize and external location changes are folded back into the active managed layout; title-bar moves swap pre-drag tile slots on release; resizing moves shared tile boundaries so adjacent windows absorb the size change. A 200ms `WM_TIMER` on `AltDWM_Host` coalesces layout work.
+- **Coherent native shell bar** (`src/panel.rs`, `src/widgets.rs`): a rounded per-display bar with hover feedback, a live/clickable layout capsule, real application icons, active/minimized window states, overflow counts, compact system status, and a two-line clock.
+- **Searchable command center** (`src/command_center.rs`): open it from the AltDWM button or `Alt+Shift+Space`; type to filter, use arrows to select, and launch apps, edit/reload configuration, pause tiling, or change layouts without memorizing commands.
+- **Declarative panels DSL** (`src/config.rs:16`, `docs/EXTENSIBILITY.md`): TOML `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`. Multiple bars remain supported, while generated and example configs now start with one polished shell bar.
+- **Widgets** (`src/widgets.rs` trait): `clock`, live `layout`/`workspaces` status, `window_list` (including minimized windows; click to focus/minimize/restore), `window_title`, Explorer-backed clickable `tray`, `spacer`, `launcher`, and Rhai `custom` status widgets.
 - **Panels** (`src/panel.rs:47`): Each `[[panels]]` is a `WS_POPUP|WS_EX_TOPMOST` window (`AltDWM_Panel` class), flex layout for widgets, 1s + 250ms timers, click → `scripting::dispatch_action`.
 - **Scripting** (`src/scripting.rs:8`): Embedded, resource-limited `rhai` 1.26 engine. Exposes `launch(cmd)`, `log(msg)`, live `get_cpu_usage()`/`get_mem_usage()`, `window_count()`, `focused_title()`, `retile()`, `set_layout(name)`, focus and monitor movement. Scripts are trusted local configuration—not a security boundary—because command execution is intentionally exposed.
 - **Config** (`src/config.rs:109`): Search `exe_dir/config.toml` → `%APPDATA%/AltDWM/config.toml` → `./config.toml`. `general`+`ignore` + `panels/widgets/rules/keybinds/layouts` with `flatten` extras for easy extend. `--config`, `--generate-config`, `--check-config`, `Alt+Shift+C` hot-reload (configurable, `Win+Shift` collides with system e.g. `Win+Shift+S` = Snipping Tool). `validate()` warns on bad panels.
-- **Hotkeys** (`src/main.rs:170`): Dynamic `RegisterHotKey` from `[[keybinds]]` (default `Alt+Shift+` `R` retile, `T` toggle, `Q` quit, `G` grid, `M` monocle, `F` floating, `S` masterStack, `C` reload, `J/K` focus, `Y` toggle focused floating, `N/P` move monitor).
+- **Native taskbar ownership**: `general.hide_native_taskbar=true` hides Explorer taskbars on every monitor, re-hides them if Explorer recreates them, removes their stale work-area reservation, and restores them when AltDWM exits.
+- **Hotkeys** (`src/main.rs`): Dynamic `RegisterHotKey` from `[[keybinds]]` (default `Alt+Shift+Space` command center; `R` retile, `T` toggle, `Q` quit, `G/M/F/S` layouts, `C` reload, `J/K` focus, `Y` floating, `N/P` move monitor).
 
 ## Quick start
 
@@ -31,7 +34,7 @@ cargo run -- --config ./examples/config.example.toml  # panels DSL demo
 cargo run -- --generate-config   # writes %APPDATA%/AltDWM/config.toml
 cargo run -- --check-config      # validate
 
-# hotkeys: Alt+Shift+R/T/Q/G/M/F/S/C (reload) — change in config.toml [[keybinds]]
+# command center: Alt+Shift+Space; other hotkeys are configurable in [[keybinds]]
 ```
 
 ## Verify shell-replacement capability (no registry touched automatically)
@@ -58,18 +61,18 @@ See `docs/EXTENSIBILITY.md` + `examples/config.example.toml` + `scripts/*.rhai`.
 
 ```toml
 [[panels]]
-name = "bottom"
+name = "shell"
 position = "bottom"
-height = 40
+height = 58
 monitor = "all"
-widgets = ["workspaces", "window_title", "spacer", "tray", "clock"]
+margin = [0, 8, 8, 8]
+widgets = ["launcher", "layout", "window_list", "cpu", "tray", "clock"]
 
 [[widgets]]
-type = "clock"
-name = "clock"
-format = "%H:%M:%S"
-interval = 1000
-action = 'rhai: launch("explorer.exe")'
+type = "launcher"
+name = "launcher"
+label = "AltDWM"
+width = 120
 
 [[widgets]]
 type = "custom"
@@ -91,14 +94,17 @@ Panels reserve their own monitor's `top`+`bottom` heights before tiling. `monito
 ## Project layout
 
 ```
-Cargo.toml  # windows 0.61 + serde/toml/dirs + rhai 1.26 + regex 1.13
+Cargo.toml  # windows 0.62 + serde/toml/dirs + rhai + regex + notify
 src/main.rs      # host window, WinEventHook, message loop, config hot-reload, hotkeys (public statics for crate::)
+src/command_center.rs # searchable keyboard/mouse command surface
 src/config.rs    # Config{general,ignore,panels,widgets,rules,keybinds,layouts} + find/load/validate
 src/manager.rs   # collect_windows, tile_windows_reserved(top,bottom), per-monitor DeferWindowPos
 src/layout.rs    # MasterStack/Grid/Monocle/Floating + compute_layout
 src/taskbar.rs   # legacy AltDWM_Taskbar (fallback when no panels)
 src/panel.rs     # AltDWM_Panel — declarative panels from config
-src/widgets.rs   # Widget trait + clock/spacer/title/tray/workspaces/launcher/custom
+src/widgets.rs   # Widget trait + clock/layout/tasklist/tray/launcher/custom
+src/shell.rs     # reversible Explorer taskbar ownership
+src/tray.rs      # Explorer notification-area discovery/invocation bridge
 src/scripting.rs # rhai engine + dispatch_action
 src/util.rs      # is_cloaked, is_manageable (+ config ignore)
 docs/EXTENSIBILITY.md
@@ -106,14 +112,13 @@ examples/config.example.toml
 scripts/cpu.rhai, spiral.rhai
 ```
 
-## Key APIs proven (real log, 0.2.0 panels)
+## Key APIs proven (real log, 0.3.0 shell)
 
 ```
-[config] loaded C:\...\alt_test_cfg.toml
-[panel] 'bottom' @ 0,1040 1920x40 monitor=all widgets=workspaces,window_title,spacer,tray,clock
-[panel] 'top' @ 0,0 1920x28 monitor=primary widgets=launcher,spacer,cpu
-[manager] monitor 0x40079 area "(0,28 1920x964)"  # 28 top + 40 bottom reserved
-[manager] -> 0x2046a => 1148x948 @ 8,36
+[config] loaded C:\...\config.full-demo.toml
+[panel] 'shell' @ 8,1014 1904x58 monitor=all widgets=launcher,layout,window_list,cpu,tray,clock
+[hotkey] Alt+Shift+Space -> 'command_center'
+[main] message loop — Alt+Shift+Q quit, Alt+Shift+C reload
 ```
 
 Fallback (no panels) → `[taskbar] 1920x40 @ 0,1040` + `"(0,0 1920x992)"`.
@@ -126,9 +131,9 @@ Fallback (no panels) → `[taskbar] 1920x40 @ 0,1040` + `"(0,0 1920x992)"`.
 
 - `AltDHook.dll` (`WH_CBT`) for elevated windows
 - `IVirtualDesktopManager` + `IVirtualDesktopManagerInternal` workspaces
-- Real `Shell_NotifyIcon` systray sink
+- Explorer-free shell replacement and native notification-area hosting (design notes in `docs/EXTENSIBILITY.md`; the current tray bridges Explorer through UI Automation)
 - `uiAccess` manifest + signing
-- Rhai custom layouts (`fn layout(n, area) -> rects`)
+- richer settings surfaces and a native notification-area host
 
 ## Build
 

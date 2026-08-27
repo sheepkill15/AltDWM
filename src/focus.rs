@@ -9,8 +9,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SetWindowPos, HWND_TOP,
-    SWP_NOSIZE, SWP_NOZORDER,
+    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SetForegroundWindow, SetWindowPos,
+    ShowWindow, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE,
 };
 
 use crate::manager::collect_windows;
@@ -173,6 +173,23 @@ pub fn focus_prev() {
     let idx = wins.iter().position(|w| w.0 == fg.0).unwrap_or(0);
     let prev = if idx == 0 { wins.len() - 1 } else { idx - 1 };
     set_foreground(wins[prev]);
+}
+
+/// Task-list behavior: restore minimized windows, minimize the active window,
+/// and focus an inactive visible window.
+pub fn toggle_window_from_list(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            focus_hwnd(hwnd);
+            crate::request_retile();
+        } else if GetForegroundWindow() == hwnd {
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        } else {
+            focus_hwnd(hwnd);
+        }
+    }
+    crate::panel::invalidate_all();
 }
 
 pub fn focus_direction(dir: &str) {
