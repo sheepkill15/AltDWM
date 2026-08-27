@@ -38,12 +38,22 @@ pub fn compute_layout(n: usize, area: RECT, gap: i32, layout: Layout) -> Vec<REC
 /// The live master ratio, clamped to something that always leaves both columns
 /// usable.
 pub fn current_master_ratio() -> f32 {
-    crate::CURRENT_CONFIG
+    let configured = crate::CURRENT_CONFIG
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .general
-        .master_ratio
-        .clamp(0.1, 0.9)
+        .master_ratio;
+    sane_master_ratio(configured)
+}
+
+/// `f32::clamp` propagates NaN, and TOML will happily parse `master_ratio = nan`,
+/// which would otherwise reduce the master column to a single pixel.
+pub fn sane_master_ratio(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.1, 0.9)
+    } else {
+        0.6
+    }
 }
 
 pub fn compute_layout_with_ratio(
@@ -71,6 +81,25 @@ type LayoutCacheEntry = (SystemTime, rhai::AST, PathBuf, rhai::Scope<'static>);
 type LayoutCache = HashMap<String, LayoutCacheEntry>;
 
 static LAYOUT_CACHE: LazyLock<Mutex<LayoutCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Report a layout problem the first time only.
+///
+/// These paths run on every retile, for every monitor. A missing script or a
+/// script that fails to compile would otherwise print the same message five or
+/// ten times a second for as long as the configuration stayed broken, which
+/// buries everything else in the log.
+fn warn_once(key: String, message: String) {
+    use std::collections::HashSet;
+    static WARNED: LazyLock<Mutex<HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    if WARNED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key)
+    {
+        eprintln!("{message}");
+    }
+}
 
 /// True when `general.layout` names an entry in `[layouts]` that carries a
 /// script. Callers need this to tell "no layout" apart from "a custom layout
@@ -149,9 +178,11 @@ pub fn try_compute_custom(
         match found {
             Some((p, t, c)) => (p, t, c),
             None => {
-                eprintln!(
-                    "[layout] custom '{}' script not found: {} (tried {:?})",
-                    name, script_path, candidate_paths
+                warn_once(
+                    format!("missing:{name}:{script_path}"),
+                    format!(
+                        "[layout] custom '{name}' script not found: {script_path} (tried {candidate_paths:?})"
+                    ),
                 );
                 return None;
             }
@@ -173,13 +204,19 @@ pub fn try_compute_custom(
             let new_ast = match engine.compile(&code) {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("[layout] custom '{}' compile error: {}", name, e);
+                    warn_once(
+                        format!("compile:{name}:{code_mtime:?}"),
+                        format!("[layout] custom '{name}' compile error: {e}"),
+                    );
                     return None;
                 }
             };
             let mut new_scope = rhai::Scope::new();
             if let Err(e) = engine.eval_ast_with_scope::<()>(&mut new_scope, &new_ast) {
-                eprintln!("[layout] custom '{}' eval error: {}", name, e);
+                warn_once(
+                    format!("eval:{name}:{code_mtime:?}"),
+                    format!("[layout] custom '{name}' eval error: {e}"),
+                );
                 return None;
             }
             cache.insert(
@@ -268,7 +305,12 @@ pub fn try_compute_custom(
             Some(rects)
         }
         Err(e) => {
-            eprintln!("[layout] custom '{}' call error: {} — is fn layout(n,left,top,right,bottom,gap) defined?", name, e);
+            warn_once(
+                format!("call:{name}"),
+                format!(
+                    "[layout] custom '{name}' call error: {e} — is fn layout(n,left,top,right,bottom,gap) defined?"
+                ),
+            );
             None
         }
     }
@@ -290,6 +332,7 @@ fn shrink_rect(r: RECT, gap: i32) -> RECT {
 /// only, which put the stack's right edge exactly on the area boundary — the
 /// layout had a gap on its left and none on its right.
 fn master_stack_layout(n: usize, area: RECT, gap: i32, master_ratio: f32) -> Vec<RECT> {
+    let master_ratio = sane_master_ratio(master_ratio);
     let inner = shrink_rect(area, gap);
     if n <= 1 {
         return vec![inner];
@@ -297,8 +340,7 @@ fn master_stack_layout(n: usize, area: RECT, gap: i32, master_ratio: f32) -> Vec
     let width = (inner.right - inner.left).max(1);
     // Split the space that remains once the inner gap is accounted for.
     let content = width - gap;
-    let master_w =
-        ((content as f32 * master_ratio.clamp(0.1, 0.9)).round() as i32).clamp(1, content.max(1));
+    let master_w = ((content as f32 * master_ratio).round() as i32).clamp(1, content.max(1));
     let master_right = inner.left + master_w;
     let stack_left = master_right + gap;
 
@@ -372,6 +414,21 @@ mod tests {
         right: 1000,
         bottom: 800,
     };
+
+    #[test]
+    fn a_nonsense_master_ratio_falls_back_instead_of_collapsing_the_column() {
+        use super::sane_master_ratio;
+        assert_eq!(sane_master_ratio(0.6), 0.6);
+        assert_eq!(sane_master_ratio(0.05), 0.1, "clamped, not rejected");
+        assert_eq!(sane_master_ratio(2.0), 0.9);
+        // TOML parses `nan` happily, and f32::clamp propagates it — which would
+        // have reduced the master column to a single pixel.
+        assert_eq!(sane_master_ratio(f32::NAN), 0.6);
+        assert_eq!(sane_master_ratio(f32::INFINITY), 0.6);
+        let rects = compute_layout(2, AREA, 10, Layout::MasterStack);
+        let master_width = rects[0].right - rects[0].left;
+        assert!(master_width > 100, "master column collapsed: {master_width}");
+    }
 
     #[test]
     fn split_span_uses_every_pixel() {

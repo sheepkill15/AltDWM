@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect,
     SetForegroundWindow, SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST, SWP_SHOWWINDOW, SW_SHOW,
     WM_CHAR, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT,
-    WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 // All measurements below are device-independent pixels at 96 DPI, scaled for
@@ -874,7 +874,10 @@ pub fn toggle(anchor: HWND) {
     let placement = place_near(anchor);
     let created = unsafe {
         CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_APPWINDOW,
+            // TOOLWINDOW, not APPWINDOW: a shell flyout has no business in
+            // Alt+Tab or the task list, any more than the Start menu does. It
+            // can still take focus, which is what it needs for typing.
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             w!("AltDWM_CommandCenter"),
             w!("AltDWM Command Center"),
             WS_POPUP | WS_VISIBLE,

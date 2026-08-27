@@ -24,9 +24,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, SetForegroundWindow,
-    SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST, SWP_SHOWWINDOW, SW_SHOW, WM_DESTROY,
+    SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOW,
+    WM_DESTROY,
     WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::system::{self, NetworkStatus};
@@ -101,9 +102,12 @@ impl Row {
 #[derive(Default)]
 struct State {
     hwnd: isize,
-    /// Slider currently being dragged, so motion keeps updating it even when
-    /// the pointer leaves the track.
-    dragging: Option<Slider>,
+    /// Slider currently being dragged, with the track it was laid out on.
+    ///
+    /// Keeping the track means a drag does not re-derive every row — which reads
+    /// live system state and enumerates keyboard layouts — on each of the many
+    /// `WM_MOUSEMOVE` messages a drag produces.
+    dragging: Option<(Slider, RECT)>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
@@ -307,6 +311,37 @@ fn value_from_x(track: RECT, x: i32) -> u8 {
 
 // --------------------------------------------------------------- painting ----
 
+/// Resize the window if the rows no longer fit it.
+///
+/// The height is computed when the surface opens, but the row list is derived
+/// from live state: an audio endpoint appearing adds a Mute row, a battery
+/// appearing adds a status row. Without this a row could be laid out past the
+/// bottom of the window, drawn nowhere and clickable nowhere.
+fn fit_window_to_rows(hwnd: HWND, client: RECT, rows: &[Row], scale: f32) -> bool {
+    let wanted = content_height(rows, scale);
+    if (client.bottom - client.top) == wanted {
+        return false;
+    }
+    let mut frame = RECT::default();
+    unsafe {
+        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut frame).is_err() {
+            return false;
+        }
+        // Grow upward: the surface is anchored to the bottom-right corner.
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            frame.left,
+            frame.bottom - wanted,
+            frame.right - frame.left,
+            wanted,
+            SWP_NOACTIVATE,
+        );
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
+    true
+}
+
 fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
     let theme = crate::CURRENT_CONFIG
         .lock()
@@ -321,7 +356,6 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
     let title_font = font(17, 600);
     let body_font = font(theme.font_size, 500);
     let small_font = font((theme.font_size - 2).max(8), 400);
-    let radius = px(theme.rounding);
 
     ui::fill_rect(hdc, &client, theme.panel_bg("top"));
 
@@ -334,6 +368,10 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
     draw_label(hdc, &header, "Quick settings", title_font, theme.text_color());
 
     let rows = rows();
+    if fit_window_to_rows(hwnd, client, &rows, scale) {
+        // The resize repaints; this pass would draw against stale bounds.
+        return;
+    }
     let rects = row_rects(client, &rows, scale);
     for (row, rect) in rows.iter().zip(&rects) {
         match row {
@@ -344,8 +382,11 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
                 detail,
                 ..
             } => {
+                let track = track_rect(*rect, scale);
+                // The label band is whatever the track leaves, rather than a
+                // fixed height that clips at a larger theme font size.
                 let text = RECT {
-                    bottom: rect.top + px(24),
+                    bottom: track.top - px(2),
                     ..*rect
                 };
                 let color = if *available {
@@ -356,7 +397,6 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
                 draw_label(hdc, &text, label, body_font, color);
                 draw_right(hdc, &text, detail, small_font, theme.text_dim_color(), scale);
 
-                let track = track_rect(*rect, scale);
                 fill_round_rect(
                     hdc,
                     &track,
@@ -394,7 +434,7 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
                 let body = draw_control_row(hdc, rect, label, detail, &theme, body_font, small_font, scale);
                 // A pill switch: the same affordance Windows uses, so the state
                 // reads at a glance rather than needing the label.
-                let switch_w = px(38);
+                let switch_w = px(CONTROL_WIDTH - 6);
                 let switch_h = px(20);
                 let switch = RECT {
                     left: body.right - switch_w,
@@ -448,9 +488,11 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
                 draw_right(hdc, &text, detail, small_font, theme.text_dim_color(), scale);
             }
         }
-        let _ = radius;
     }
 }
+
+/// Width reserved at the right of a control row for its switch or chevron.
+const CONTROL_WIDTH: i32 = 44;
 
 /// Shared chrome for toggle and action rows: a hoverable surface with a label on
 /// the left and a detail line on the right. Returns the inner content box.
@@ -471,7 +513,7 @@ fn draw_control_row(
     let body = inset_rect(surface, px(12), 0);
     draw_label(hdc, &body, label, body_font, theme.text_color());
     let detail_box = RECT {
-        right: body.right - px(46),
+        right: body.right - px(CONTROL_WIDTH),
         ..body
     };
     draw_right(hdc, &detail_box, detail, small_font, theme.text_dim_color(), scale);
@@ -579,7 +621,7 @@ fn handle_click(hwnd: HWND, x: i32, y: i32) {
                 STATE
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .dragging = Some(*which);
+                    .dragging = Some((*which, track));
                 unsafe {
                     SetCapture(hwnd);
                 }
@@ -611,30 +653,16 @@ fn apply_slider(which: Slider, value: u8) {
     }
 }
 
-fn handle_drag(hwnd: HWND, x: i32) {
+fn handle_drag(x: i32) {
     let dragging = STATE
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .dragging;
-    let Some(which) = dragging else {
+    let Some((which, track)) = dragging else {
         return;
     };
-    let mut client = RECT::default();
-    unsafe {
-        let _ = GetClientRect(hwnd, &mut client);
-    }
-    let scale = ui::scale_for_window(hwnd);
-    let rows = rows();
-    let rects = row_rects(client, &rows, scale);
-    for (row, rect) in rows.iter().zip(&rects) {
-        if let Row::Slider { which: kind, .. } = row {
-            if *kind == which {
-                apply_slider(which, value_from_x(track_rect(*rect, scale), x));
-                invalidate();
-                return;
-            }
-        }
-    }
+    apply_slider(which, value_from_x(track, x));
+    invalidate();
 }
 
 fn handle_wheel(hwnd: HWND, x: i32, y: i32, delta: i16) {
@@ -715,7 +743,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_MOUSEMOVE => {
             let (x, _) = point(lparam);
-            handle_drag(hwnd, x);
+            handle_drag(x);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -728,11 +756,13 @@ unsafe extern "system" fn wndproc(
         }
         WM_MOUSEWHEEL => {
             // Wheel coordinates are screen-relative; the rows are not.
-            let mut origin = RECT::default();
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut origin);
-            let (screen_x, screen_y) = point(lparam);
+            let mut converted = windows::Win32::Foundation::POINT {
+                x: (lparam.0 & 0xFFFF) as i16 as i32,
+                y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+            };
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut converted);
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
-            handle_wheel(hwnd, screen_x - origin.left, screen_y - origin.top, delta);
+            handle_wheel(hwnd, converted.x, converted.y, delta);
             LRESULT(0)
         }
         WM_KEYDOWN => {
@@ -826,7 +856,8 @@ pub fn toggle_near(anchor: Option<HWND>) {
     let (x, y, width, height) = placement(anchor, &mut scale);
     let created = unsafe {
         CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_APPWINDOW,
+            // See the command center: a flyout does not belong in Alt+Tab.
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             w!("AltDWM_QuickSettings"),
             w!("AltDWM Quick Settings"),
             WS_POPUP | WS_VISIBLE,

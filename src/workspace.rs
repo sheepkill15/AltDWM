@@ -28,7 +28,6 @@
 //! to be recoverable from outside the process that caused it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use windows::Win32::Foundation::HWND;
@@ -50,9 +49,15 @@ static ASSIGNMENT: LazyLock<Mutex<HashMap<isize, usize>>> =
 static ACTIVE: LazyLock<Mutex<HashMap<isize, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Windows AltDWM hid, and only those.
 static HIDDEN: LazyLock<Mutex<HashSet<isize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-/// True while a switch is applying, so the resulting SHOW/HIDE events are not
-/// mistaken for the user rearranging windows.
-static SWITCHING: AtomicBool = AtomicBool::new(false);
+/// How long after a switch AltDWM's own show/hide events keep arriving.
+///
+/// A bool set around the `ShowWindow` calls did not work: WinEvent hooks are
+/// `WINEVENT_OUTOFCONTEXT`, so the SHOW and HIDE events are queued and delivered
+/// when the message loop next runs — by which time a flag cleared synchronously
+/// is already false, and every switch was mistaken for the user rearranging
+/// windows. A deadline covers the delivery window instead.
+static SUPPRESS_UNTIL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+const SUPPRESS_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 /// The display the user last worked on.
 ///
 /// Switching a workspace hides the window that had focus, which leaves the
@@ -76,10 +81,19 @@ pub fn is_enabled() -> bool {
     count() > 1
 }
 
-/// True while workspace visibility is being applied. The event hook uses this to
-/// ignore the show/hide traffic AltDWM itself generates.
+/// True while the show/hide traffic AltDWM just generated is still arriving.
 pub fn is_switching() -> bool {
-    SWITCHING.load(Ordering::SeqCst)
+    SUPPRESS_UNTIL
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .is_some_and(|deadline| std::time::Instant::now() < deadline)
+}
+
+fn begin_suppression() {
+    *SUPPRESS_UNTIL
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) =
+        Some(std::time::Instant::now() + SUPPRESS_WINDOW);
 }
 
 fn monitor_of(hwnd: HWND) -> isize {
@@ -159,11 +173,11 @@ pub fn visibility_plan(candidates: &[Candidate]) -> (Vec<isize>, Vec<isize>) {
 
 /// Hide or show each window to match its workspace.
 ///
-/// `windows` is the currently *visible* managed set. A window AltDWM has hidden
-/// fails `IsWindowVisible`, so it is not manageable and cannot appear in that
-/// list — the windows this function has to bring back are precisely the ones the
-/// caller cannot see. They are added here from `HIDDEN` rather than expected
-/// from the caller.
+/// `windows` is the currently *visible* managed set, which the caller has
+/// already enumerated. A window AltDWM has hidden fails `IsWindowVisible`, so it
+/// is not manageable and cannot appear in that list — the windows this function
+/// has to bring back are precisely the ones the caller cannot see. They are
+/// added here from `HIDDEN` rather than expected from the caller.
 pub fn apply_visibility(windows: &[HWND]) {
     if !is_enabled() {
         return;
@@ -206,7 +220,7 @@ pub fn apply_visibility(windows: &[HWND]) {
     if to_hide.is_empty() && to_show.is_empty() {
         return;
     }
-    SWITCHING.store(true, Ordering::SeqCst);
+    begin_suppression();
     {
         let mut hidden = HIDDEN.lock().unwrap_or_else(|error| error.into_inner());
         for key in &to_hide {
@@ -225,7 +239,8 @@ pub fn apply_visibility(windows: &[HWND]) {
         }
         persist(&hidden);
     }
-    SWITCHING.store(false, Ordering::SeqCst);
+    // Deliberately not cleared here: the events these calls produced have not
+    // been delivered yet.
 }
 
 /// Where the hidden set is journalled.
@@ -350,7 +365,7 @@ pub fn restore_all() {
         return;
     }
     println!("[workspace] restoring {} hidden window(s)", windows.len());
-    SWITCHING.store(true, Ordering::SeqCst);
+    begin_suppression();
     for hwnd in windows {
         unsafe {
             if IsWindow(Some(hwnd)).as_bool() {
@@ -363,7 +378,19 @@ pub fn restore_all() {
         hidden.clear();
         persist(&hidden);
     }
-    SWITCHING.store(false, Ordering::SeqCst);
+}
+
+/// Drop assignments for windows that are no longer live.
+///
+/// `HIDDEN` is intentionally left alone: an entry there is a window AltDWM owes
+/// a `ShowWindow` to, and a hidden window is not in the manageable set, so it
+/// would never appear in `live`. Pruning it would be exactly how a window gets
+/// lost.
+pub fn retain_windows(live: &HashSet<isize>) {
+    ASSIGNMENT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|key, _| live.contains(key));
 }
 
 /// Forget a destroyed window.
@@ -529,15 +556,25 @@ pub struct WorkspaceInfo {
 }
 
 /// Workspace strip for the monitor a panel is on.
-pub fn summary(monitor: isize, windows: &[HWND]) -> Vec<WorkspaceInfo> {
+///
+/// `visible` is the caller's managed set, which by construction contains only
+/// windows on the *active* workspace — a hidden window fails `IsWindowVisible`
+/// and is therefore not manageable. The occupied markers exist precisely to show
+/// where the windows the user cannot see are, so the hidden set has to be folded
+/// back in here or every inactive workspace would always read as empty.
+pub fn summary(monitor: isize, visible: &[HWND]) -> Vec<WorkspaceInfo> {
     let total = count();
     let active = active_for_monitor(monitor);
     let mut occupied = vec![false; total];
-    for hwnd in windows {
-        if monitor_of(*hwnd) != monitor {
+    let hidden = hidden_windows();
+    let candidates = visible.iter().copied().chain(hidden.into_iter().filter(|hwnd| unsafe {
+        IsWindow(Some(*hwnd)).as_bool()
+    }));
+    for hwnd in candidates {
+        if monitor_of(hwnd) != monitor {
             continue;
         }
-        let index = workspace_of(*hwnd);
+        let index = workspace_of(hwnd);
         if let Some(slot) = occupied.get_mut(index) {
             *slot = true;
         }

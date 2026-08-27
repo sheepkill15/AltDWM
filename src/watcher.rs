@@ -34,17 +34,13 @@ pub fn spawn_watcher(path: PathBuf) {
                 Ok(w) => w,
                 Err(e) => {
                     eprintln!("[watcher] failed to create watcher for {:?}: {:?}", dir, e);
-                    *WATCHED_DIR
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = None;
+                    release_claim(&dir);
                     return;
                 }
             };
         if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
             eprintln!("[watcher] watch failed {:?}: {:?}", dir, e);
-            *WATCHED_DIR
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = None;
+            release_claim(&dir);
             return;
         }
         // keep watcher alive (store in global)
@@ -84,10 +80,22 @@ pub fn spawn_watcher(path: PathBuf) {
                 Err(e) => eprintln!("[watcher] error: {:?}", e),
             }
         }
-        *WATCHED_DIR
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+        release_claim(&dir);
     });
+}
+
+/// Give up the claim on `dir`, but only if it is still ours.
+///
+/// When the config moves to a different directory a new watcher thread claims
+/// the new one, and replacing the stored `RecommendedWatcher` shuts the old
+/// thread down. The old thread then ran its cleanup — and clearing the claim
+/// unconditionally erased the *new* thread's, so a later `spawn_watcher` for the
+/// same directory would start a duplicate and every save would reload twice.
+fn release_claim(dir: &std::path::Path) {
+    let mut watched = WATCHED_DIR.lock().unwrap_or_else(|e| e.into_inner());
+    if watched.as_deref() == Some(dir) {
+        *watched = None;
+    }
 }
 
 pub fn should_reload() -> bool {

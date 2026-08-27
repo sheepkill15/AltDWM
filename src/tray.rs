@@ -49,10 +49,13 @@ fn start_worker() -> TrayWorker {
     let entries = Arc::new(Mutex::new(Vec::new()));
     let worker_entries = entries.clone();
     let (commands, receiver) = mpsc::channel();
-    std::thread::Builder::new()
+    // As with the status poller: an empty tray beats aborting the shell.
+    if let Err(error) = std::thread::Builder::new()
         .name("AltDWM-tray".into())
         .spawn(move || worker_loop(worker_entries, receiver))
-        .expect("failed to start tray worker");
+    {
+        eprintln!("[tray] Explorer bridge could not start: {error}");
+    }
     TrayWorker { entries, commands }
 }
 

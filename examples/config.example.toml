@@ -10,6 +10,13 @@ auto_float_utility_windows = true
 respect_window_size_constraints = true
 hide_native_taskbar = true
 filter_virtual_desktop = false
+# Workspaces per monitor. `1` (the default) keeps the feature off; switching away
+# from a workspace hides the windows on it. `alt-dwm --restore-windows` recovers
+# them if AltDWM is ever killed outright while any are hidden.
+workspaces = 1
+# The master column's share of the usable width, 0.1-0.9. Adjustable at runtime
+# with the `wider_master` and `narrower_master` actions.
+master_ratio = 0.6
 
 [ignore]
 classes = [

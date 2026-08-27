@@ -62,7 +62,10 @@ pub fn invalidate_window_snapshot() {
         .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
-pub fn window_snapshot() -> Vec<HWND> {
+/// Every managed window on the current virtual desktop, regardless of which
+/// workspace it belongs to. This is the cached enumeration; the workspace-filtered
+/// view derives from it rather than enumerating again.
+pub fn all_managed_windows() -> Vec<HWND> {
     let cached = WINDOW_SNAPSHOT
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -77,13 +80,19 @@ pub fn window_snapshot() -> Vec<HWND> {
     }
     let mut windows = collect_windows_including_minimized();
     windows.retain(|hwnd| crate::virtual_desktop::is_on_current_desktop(*hwnd));
-    windows.retain(|hwnd| crate::workspace::is_visible(*hwnd));
     *WINDOW_SNAPSHOT
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some((
         Instant::now(),
         windows.iter().map(|hwnd| hwnd.0 as isize).collect(),
     ));
+    windows
+}
+
+/// The managed windows that should currently be on screen.
+pub fn window_snapshot() -> Vec<HWND> {
+    let mut windows = all_managed_windows();
+    windows.retain(|hwnd| crate::workspace::is_visible(*hwnd));
     windows
 }
 
@@ -915,6 +924,13 @@ pub fn collect_windows_including_minimized() -> Vec<HWND> {
         IsWindow(Some(hwnd)).as_bool()
     });
     let live: HashSet<isize> = order.iter().copied().collect();
+    // Caches in other modules are keyed by HWND too, and are otherwise only
+    // pruned when EVENT_OBJECT_DESTROY arrives. A missed destroy — a dropped
+    // hook, a process killed outright — would leave those entries for the life
+    // of the session. This is the one place with an authoritative live set.
+    crate::rules::retain_windows(&live);
+    crate::workspace::retain_windows(&live);
+    crate::widgets::retain_icons(&live);
     EXPECTED_RECTS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -1209,9 +1225,10 @@ pub fn tile_windows_reserved(
     }
 
     // Workspaces are applied before anything else looks at the window list:
-    // hiding is what makes a window absent from the layout, and it has to happen
-    // against the full set, including windows the previous workspace hid.
-    crate::workspace::apply_visibility(&collect_windows_including_minimized());
+    // hiding is what makes a window absent from the layout. The cached
+    // enumeration is reused rather than walking every top-level window a second
+    // time in the same pass.
+    crate::workspace::apply_visibility(&all_managed_windows());
     let all_windows: Vec<HWND> = all_windows
         .into_iter()
         .filter(|hwnd| crate::workspace::is_visible(*hwnd))

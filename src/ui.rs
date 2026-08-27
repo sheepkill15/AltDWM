@@ -75,18 +75,14 @@ pub fn rect_height(rect: &RECT) -> i32 {
 /// Shrink a rectangle by independent horizontal and vertical insets, never past
 /// the point of inversion.
 pub fn inset_rect(rect: RECT, horizontal: i32, vertical: i32) -> RECT {
-    let horizontal = horizontal.min(rect_width(rect_ref(&rect)) / 2);
-    let vertical = vertical.min(rect_height(rect_ref(&rect)) / 2);
+    let horizontal = horizontal.min(rect_width(&rect) / 2);
+    let vertical = vertical.min(rect_height(&rect) / 2);
     RECT {
         left: rect.left + horizontal,
         top: rect.top + vertical,
         right: rect.right - horizontal,
         bottom: rect.bottom - vertical,
     }
-}
-
-fn rect_ref(rect: &RECT) -> &RECT {
-    rect
 }
 
 pub fn point_in_rect(x: i32, y: i32, rect: &RECT) -> bool {

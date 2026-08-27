@@ -6,12 +6,21 @@
 //! reentrant enough — that issuing them from `WM_PAINT` would stall the shell's
 //! message loop. Widgets read the snapshot; commands are sent to the worker.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+/// Cheap readings: a mutex lookup, a struct copy, and a WLAN query.
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// Expensive readings, kept well away from the fast path.
+///
+/// Brightness goes over DDC/CI, which is an I²C conversation with the display
+/// measured in tens of milliseconds. Polling it every second would keep the
+/// monitor's control bus permanently busy — some displays respond by flashing
+/// their OSD or stuttering — for a value that only changes when somebody
+/// deliberately changes it. It is read on this slow cadence, when quick settings
+/// opens, and after AltDWM writes it, and not otherwise.
+const SLOW_POLL_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VolumeStatus {
@@ -92,25 +101,37 @@ struct Worker {
     commands: Sender<Command>,
 }
 
+/// Started lazily: a configuration with no status widgets and no quick settings
+/// never touches this module, and so never starts the thread or its polling.
 static WORKER: LazyLock<Worker> = LazyLock::new(start_worker);
-/// Set once any widget or surface asks for system state, so the worker is not
-/// started for configurations that never display it.
-static WANTED: AtomicBool = AtomicBool::new(false);
+/// Set once the worker has published a reading, so callers can tell "not polled
+/// yet" apart from "this machine reports nothing".
+static POLLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True once the worker has completed at least one poll.
+pub fn has_polled() -> bool {
+    POLLED.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 fn start_worker() -> Worker {
     let status = Arc::new(Mutex::new(SystemStatus::default()));
     let worker_status = status.clone();
     let (commands, receiver) = mpsc::channel();
-    std::thread::Builder::new()
+    // A failure here used to panic — inside a `LazyLock` initialiser, reached
+    // from a widget's paint handler, in a window procedure. Status widgets
+    // reporting nothing is a far better outcome than the shell aborting because
+    // a thread could not be created.
+    if let Err(error) = std::thread::Builder::new()
         .name("AltDWM-system".into())
         .spawn(move || worker_loop(worker_status, receiver))
-        .expect("failed to start system worker");
+    {
+        eprintln!("[system] status poller could not start: {error}");
+    }
     Worker { status, commands }
 }
 
 /// Current snapshot. Cheap: a clone of a small struct behind a mutex.
 pub fn status() -> SystemStatus {
-    WANTED.store(true, Ordering::SeqCst);
     WORKER
         .status
         .lock()
@@ -119,7 +140,6 @@ pub fn status() -> SystemStatus {
 }
 
 fn send(command: Command) {
-    WANTED.store(true, Ordering::SeqCst);
     let _ = WORKER.commands.send(command);
 }
 
@@ -159,13 +179,26 @@ fn worker_loop(status: Arc<Mutex<SystemStatus>>, receiver: Receiver<Command>) {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let mut audio = audio::Endpoint::new();
+    let mut network = net::Reader::new();
+    // Carried between iterations so a fast poll does not have to re-read them.
+    let mut brightness = None;
+    let mut wifi_radio = None;
+    let mut slow_due = true;
+    let mut last_slow = Instant::now();
+
     loop {
+        if slow_due || last_slow.elapsed() >= SLOW_POLL_INTERVAL {
+            wifi_radio = network.radio_state();
+            brightness = brightness::read();
+            last_slow = Instant::now();
+            slow_due = false;
+        }
         let next = SystemStatus {
             volume: audio.read(),
             battery: power::read(),
-            network: net::read(),
-            brightness: brightness::read(),
-            wifi_radio_on: net::radio_state(),
+            network: network.read(),
+            brightness,
+            wifi_radio_on: wifi_radio,
         };
         let changed = {
             let mut current = status.lock().unwrap_or_else(|error| error.into_inner());
@@ -175,6 +208,7 @@ fn worker_loop(status: Arc<Mutex<SystemStatus>>, receiver: Receiver<Command>) {
             }
             changed
         };
+        POLLED.store(true, std::sync::atomic::Ordering::SeqCst);
         if changed {
             crate::panel::invalidate_all();
             crate::quick_settings::invalidate();
@@ -186,13 +220,25 @@ fn worker_loop(status: Arc<Mutex<SystemStatus>>, receiver: Receiver<Command>) {
                     Command::SetVolume(level) => audio.set_level(level),
                     Command::AdjustVolume(delta) => audio.adjust(delta),
                     Command::ToggleMute => audio.toggle_mute(),
-                    Command::SetBrightness(percent) => brightness::write(percent),
-                    Command::AdjustBrightness(delta) => brightness::adjust(delta),
-                    Command::SetWiFiRadio(enabled) => net::set_radio(enabled),
-                    Command::Refresh => {}
+                    // A write is the one time the slow readings are known to be
+                    // stale, so re-read them on the next turn of the loop.
+                    Command::SetBrightness(percent) => {
+                        brightness::write(percent);
+                        slow_due = true;
+                    }
+                    Command::AdjustBrightness(delta) => {
+                        brightness::adjust(delta, brightness);
+                        slow_due = true;
+                    }
+                    Command::SetWiFiRadio(enabled) => {
+                        net::set_radio(enabled);
+                        slow_due = true;
+                    }
+                    // Refresh is what quick settings sends when it opens.
+                    Command::Refresh => slow_due = true,
                 }
-                // Re-poll immediately so the UI reflects the change on the next
-                // paint rather than up to a second later.
+                // Loop straight back round so the UI reflects the change on the
+                // next paint rather than up to a second later.
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -334,6 +380,7 @@ mod power {
 
 mod net {
     use super::NetworkStatus;
+    use windows::Win32::Networking::NetworkListManager::INetworkListManager;
     use windows::Win32::NetworkManagement::WiFi::{
         WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
         WlanSetInterface, WLAN_API_VERSION_2_0,
@@ -413,73 +460,112 @@ mod net {
         Some(value)
     }
 
-    pub fn read() -> NetworkStatus {
-        if let Some(wlan) = Wlan::open() {
-            if let Some((guid, state)) = wlan.first_interface() {
-                if state == wlan_interface_state_connected {
-                    if let Some(attributes) = query::<WLAN_CONNECTION_ATTRIBUTES>(
-                        &wlan,
-                        &guid,
-                        wlan_intf_opcode_current_connection.0,
-                    ) {
-                        let association = attributes.wlanAssociationAttributes;
-                        let ssid = &association.dot11Ssid;
-                        let length = (ssid.uSSIDLength as usize).min(ssid.ucSSID.len());
-                        let name = String::from_utf8_lossy(&ssid.ucSSID[..length]).to_string();
-                        return NetworkStatus::WiFi {
-                            ssid: name,
-                            signal: association.wlanSignalQuality.min(100) as u8,
-                        };
-                    }
-                    return NetworkStatus::WiFi {
-                        ssid: String::new(),
-                        signal: 0,
-                    };
-                }
-            }
-        }
-        // No Wi-Fi association. Fall back to whether the machine has any route
-        // to the internet at all, which distinguishes a wired desktop from one
-        // that is genuinely offline.
-        match internet_connected() {
-            Some(true) => NetworkStatus::Wired,
-            Some(false) => NetworkStatus::Offline,
-            None => NetworkStatus::Unknown,
-        }
-    }
-
-    /// `INetworkListManager` is the documented connectivity oracle and does not
-    /// generate traffic of its own.
-    fn internet_connected() -> Option<bool> {
-        use windows::core::GUID;
-        use windows::Win32::Networking::NetworkListManager::{
-            INetworkListManager, NLM_CONNECTIVITY_IPV4_INTERNET, NLM_CONNECTIVITY_IPV6_INTERNET,
-        };
-        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
-        const CLSID_NETWORK_LIST_MANAGER: GUID =
-            GUID::from_u128(0xDCB00C01_570F_4A9B_8D69_199FDBA5723B);
-        unsafe {
-            let manager: INetworkListManager =
-                CoCreateInstance(&CLSID_NETWORK_LIST_MANAGER, None, CLSCTX_ALL).ok()?;
-            let connectivity = manager.GetConnectivity().ok()?;
-            Some(
-                connectivity.0 & (NLM_CONNECTIVITY_IPV4_INTERNET.0 | NLM_CONNECTIVITY_IPV6_INTERNET.0)
-                    != 0,
-            )
-        }
-    }
-
-    pub fn radio_state() -> Option<bool> {
-        let wlan = Wlan::open()?;
+    fn radio_state_with(wlan: &Wlan) -> Option<bool> {
         let (guid, _) = wlan.first_interface()?;
-        let state =
-            query::<WLAN_RADIO_STATE>(&wlan, &guid, wlan_intf_opcode_radio_state.0)?;
+        let state = query::<WLAN_RADIO_STATE>(wlan, &guid, wlan_intf_opcode_radio_state.0)?;
         let count = (state.dwNumberOfPhys as usize).min(state.PhyRadioState.len());
         Some(
             state.PhyRadioState[..count]
                 .iter()
                 .any(|phy| phy.dot11SoftwareRadioState == dot11_radio_state_on),
         )
+    }
+
+    /// The network readers, holding whatever they can keep open between polls.
+    pub struct Reader {
+        wlan: Option<Wlan>,
+        connectivity: Option<INetworkListManager>,
+    }
+
+    impl Reader {
+        pub fn new() -> Self {
+            Self {
+                wlan: None,
+                connectivity: None,
+            }
+        }
+
+        /// A machine can gain a Wi-Fi adapter mid-session (a USB dongle), so a
+        /// missing handle is retried rather than remembered as absent forever.
+        fn wlan(&mut self) -> Option<&Wlan> {
+            if self.wlan.is_none() {
+                self.wlan = Wlan::open();
+            }
+            self.wlan.as_ref()
+        }
+
+        pub fn read(&mut self) -> NetworkStatus {
+            if let Some(wlan) = self.wlan() {
+                if let Some((guid, state)) = wlan.first_interface() {
+                    if state == wlan_interface_state_connected {
+                        if let Some(attributes) = query::<WLAN_CONNECTION_ATTRIBUTES>(
+                            wlan,
+                            &guid,
+                            wlan_intf_opcode_current_connection.0,
+                        ) {
+                            let association = attributes.wlanAssociationAttributes;
+                            let ssid = &association.dot11Ssid;
+                            let length = (ssid.uSSIDLength as usize).min(ssid.ucSSID.len());
+                            let name =
+                                String::from_utf8_lossy(&ssid.ucSSID[..length]).to_string();
+                            return NetworkStatus::WiFi {
+                                ssid: name,
+                                signal: association.wlanSignalQuality.min(100) as u8,
+                            };
+                        }
+                        return NetworkStatus::WiFi {
+                            ssid: String::new(),
+                            signal: 0,
+                        };
+                    }
+                }
+            }
+            // No Wi-Fi association. Fall back to whether the machine has any
+            // route to the internet at all, which distinguishes a wired desktop
+            // from one that is genuinely offline.
+            match self.internet_connected() {
+                Some(true) => NetworkStatus::Wired,
+                Some(false) => NetworkStatus::Offline,
+                None => NetworkStatus::Unknown,
+            }
+        }
+
+        /// `INetworkListManager` is the documented connectivity oracle and
+        /// generates no traffic of its own. The instance is created once:
+        /// activating it per poll meant a COM activation every second forever.
+        fn internet_connected(&mut self) -> Option<bool> {
+            use windows::core::GUID;
+            use windows::Win32::Networking::NetworkListManager::{
+                NLM_CONNECTIVITY_IPV4_INTERNET, NLM_CONNECTIVITY_IPV6_INTERNET,
+            };
+            use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+            const CLSID_NETWORK_LIST_MANAGER: GUID =
+                GUID::from_u128(0xDCB00C01_570F_4A9B_8D69_199FDBA5723B);
+            if self.connectivity.is_none() {
+                self.connectivity = unsafe {
+                    CoCreateInstance(&CLSID_NETWORK_LIST_MANAGER, None, CLSCTX_ALL).ok()
+                };
+            }
+            let manager = self.connectivity.as_ref()?;
+            match unsafe { manager.GetConnectivity() } {
+                Ok(connectivity) => Some(
+                    connectivity.0
+                        & (NLM_CONNECTIVITY_IPV4_INTERNET.0 | NLM_CONNECTIVITY_IPV6_INTERNET.0)
+                        != 0,
+                ),
+                Err(_) => {
+                    // The service can restart; drop the instance so the next
+                    // poll rebinds instead of reporting Unknown forever.
+                    self.connectivity = None;
+                    None
+                }
+            }
+        }
+
+        pub fn radio_state(&mut self) -> Option<bool> {
+            let wlan = self.wlan()?;
+            radio_state_with(wlan)
+        }
     }
 
     pub fn set_radio(enabled: bool) {
@@ -615,11 +701,16 @@ mod brightness {
         release(monitors);
     }
 
-    pub fn adjust(delta: i32) {
-        if let Some(current) = read() {
-            let next = (i32::from(current.percent) + delta).clamp(0, 100) as u8;
-            write(next);
-        }
+    /// Nudge brightness relative to the value already on hand.
+    ///
+    /// Takes the last known reading rather than fetching a fresh one, so holding
+    /// a brightness key does not issue two DDC/CI conversations per step.
+    pub fn adjust(delta: i32, known: Option<BrightnessStatus>) {
+        let Some(current) = known.or_else(read) else {
+            return;
+        };
+        let next = (i32::from(current.percent) + delta).clamp(0, 100) as u8;
+        write(next);
     }
 }
 

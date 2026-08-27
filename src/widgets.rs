@@ -70,6 +70,14 @@ fn window_icon(hwnd: HWND) -> Option<windows::Win32::UI::WindowsAndMessaging::HI
     (raw != 0).then_some(HICON(raw as *mut std::ffi::c_void))
 }
 
+/// Drop cached icons for windows that are no longer live.
+pub fn retain_icons(live: &std::collections::HashSet<isize>) {
+    ICON_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|key, _| live.contains(key));
+}
+
 /// Drop cached icons for windows that no longer exist.
 pub fn forget_icon(hwnd: HWND) {
     ICON_CACHE
@@ -183,9 +191,19 @@ pub trait Widget: Send + Sync {
     fn interval_ms(&self) -> Option<u32> {
         None
     }
-    /// Refresh any state that costs real work. Called from the panel's timer,
-    /// never from `WM_PAINT`, so a slow script cannot stall painting.
-    fn tick(&self) {}
+    /// Refresh any state that costs real work, and report whether what the
+    /// widget displays actually changed.
+    ///
+    /// Called from the panel's timer, never from `WM_PAINT`, so a slow script
+    /// cannot stall painting. The return value is what stops a bar with a
+    /// sub-second widget from repainting continuously: the panel only
+    /// invalidates when a widget says its content moved. Widgets whose data is
+    /// pushed to them — anything reading `crate::system`, the tray, or the
+    /// window list — return `false` and rely on the invalidate that accompanies
+    /// the change.
+    fn tick(&self) -> bool {
+        false
+    }
 }
 
 /// The content box of a widget: full height minus the panel's inset.
@@ -213,6 +231,10 @@ fn draw_mark(hdc: HDC, anchor: &RECT, ctx: &PanelCtx, color: COLORREF) -> i32 {
 
 pub struct ClockWidget {
     pub cfg: WidgetConfig,
+    /// Rendered time and date, refreshed on the timer. A `%H:%M` clock changes
+    /// once a minute; formatting it on every paint and repainting regardless was
+    /// most of a bar's idle cost.
+    state: Mutex<(String, String)>,
 }
 
 fn format_time(format: &str) -> String {
@@ -275,9 +297,24 @@ impl Widget for ClockWidget {
             HoverPaint::None
         }
     }
+    fn tick(&self) -> bool {
+        let next = (
+            format_time(self.cfg.format.as_deref().unwrap_or("%H:%M")),
+            format_time("%a %d %b"),
+        );
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if *state == next {
+            return false;
+        }
+        *state = next;
+        true
+    }
     fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
         let body = content_rect(rect, ctx);
-        let time = format_time(self.cfg.format.as_deref().unwrap_or("%H:%M"));
+        let (time, date) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.clone()
+        };
         // A second line only appears when there is genuinely room for two, so a
         // short bar shows a single centred time instead of clipped text.
         let two_line = rect_height(&body) >= ctx.px(34);
@@ -311,7 +348,7 @@ impl Widget for ClockWidget {
         draw_label(
             hdc,
             &bottom_half,
-            &format_time("%a %d %b"),
+            &date,
             ctx.small_font(),
             ctx.theme.text_dim_color(),
         );
@@ -664,13 +701,14 @@ impl Widget for WorkspacesWidget {
     fn kind(&self) -> &'static str {
         "workspaces"
     }
-    fn width(&self, ctx: &PanelCtx) -> i32 {
-        // Sized from the workspace count rather than fixed, so the strip does
-        // not leave dead space or clip when the count changes.
+    fn width(&self, _ctx: &PanelCtx) -> i32 {
+        // Device-independent, like every other widget width: the panel scales it.
+        // Sized from the workspace count rather than fixed, so the strip does not
+        // leave dead space or clip when the count changes.
         self.cfg
             .width
             .unwrap_or_else(|| crate::workspace::count() as i32 * 30 + 8)
-            .max(ctx.px(1))
+            .max(1)
     }
     fn hover_paint(&self) -> HoverPaint {
         HoverPaint::SelfDrawn
@@ -1228,6 +1266,10 @@ impl Widget for NetworkWidget {
 /// Active keyboard layout. Clicking cycles through the installed layouts.
 pub struct InputWidget {
     pub cfg: WidgetConfig,
+    /// Last known layout tag. The active layout belongs to the foreground
+    /// window's thread, so it has to be polled — but only a change is worth a
+    /// repaint.
+    tag: Mutex<String>,
 }
 
 impl Widget for InputWidget {
@@ -1248,12 +1290,19 @@ impl Widget for InputWidget {
         // rather than pushed.
         Some(self.cfg.interval.unwrap_or(500))
     }
-    fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
-        let layout = crate::input::current();
-        let tag = layout
-            .as_ref()
-            .map(|layout| layout.tag.clone())
+    fn tick(&self) -> bool {
+        let next = crate::input::current()
+            .map(|layout| layout.tag)
             .unwrap_or_else(|| "--".into());
+        let mut tag = self.tag.lock().unwrap_or_else(|e| e.into_inner());
+        if *tag == next {
+            return false;
+        }
+        *tag = next;
+        true
+    }
+    fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
+        let tag = self.tag.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let body = inset_rect(content_rect(rect, ctx), ctx.px(token::PAD), 0);
         draw_label(hdc, &body, &tag, ctx.strong_font(), ctx.theme.text_color());
     }
@@ -1319,7 +1368,7 @@ impl Widget for CustomWidget {
             HoverPaint::None
         }
     }
-    fn tick(&self) {
+    fn tick(&self) -> bool {
         let due = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state
@@ -1327,14 +1376,16 @@ impl Widget for CustomWidget {
                 .is_none_or(|last| last.elapsed() >= self.interval())
         };
         if !due {
-            return;
+            return false;
         }
         // Evaluated without the state lock held: a script may take a while and
         // must not block a concurrent paint from reading the previous value.
         let text = self.evaluate();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = state.text != text;
         state.text = text;
         state.evaluated_at = Some(Instant::now());
+        changed
     }
     fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
         let text = {
@@ -1404,7 +1455,10 @@ fn read_widget_script(script: &str) -> Result<String, String> {
 
 pub fn create_widget(cfg: &WidgetConfig) -> Box<dyn Widget> {
     match cfg.widget_type.as_str() {
-        "clock" => Box::new(ClockWidget { cfg: cfg.clone() }),
+        "clock" => Box::new(ClockWidget {
+            cfg: cfg.clone(),
+            state: Mutex::new((String::new(), String::new())),
+        }),
         "spacer" => Box::new(SpacerWidget { cfg: cfg.clone() }),
         "window_title" | "title" => Box::new(WindowTitleWidget { cfg: cfg.clone() }),
         "window_list" | "tasklist" => Box::new(WindowListWidget { cfg: cfg.clone() }),
@@ -1415,7 +1469,10 @@ pub fn create_widget(cfg: &WidgetConfig) -> Box<dyn Widget> {
         "volume" | "audio" => Box::new(VolumeWidget { cfg: cfg.clone() }),
         "battery" | "power" => Box::new(BatteryWidget { cfg: cfg.clone() }),
         "network" | "wifi" => Box::new(NetworkWidget { cfg: cfg.clone() }),
-        "input" | "keyboard" | "language" => Box::new(InputWidget { cfg: cfg.clone() }),
+        "input" | "keyboard" | "language" => Box::new(InputWidget {
+            cfg: cfg.clone(),
+            tag: Mutex::new(String::new()),
+        }),
         "custom" => Box::new(CustomWidget {
             cfg: cfg.clone(),
             state: Mutex::new(CustomState::default()),

@@ -381,6 +381,23 @@ is never inert.
 `general.master_ratio` (default `0.6`) is the master column's share of the usable
 width. It was previously hardcoded.
 
+## Diagnostics
+
+`--check-config` reports what the runtime will actually build, including the bar
+synthesised for `taskbar = true`, and rejects out-of-range values: a negative
+gap, a workspace count above 9, a `master_ratio` outside 0.1–0.9, a rule with no
+conditions, and a `general.layout` that is neither a built-in nor a key in
+`[layouts]` — that last one used to fall back to MasterStack in silence, which
+reads as AltDWM ignoring the setting.
+
+`--status` prints what the system readers see, `--list-apps [query]` prints the
+application index and its ranking, and `--restore-windows` un-hides anything a
+killed run left on a workspace.
+
+Runtime logs warn once per distinct problem rather than on every retile. A
+missing layout script or a typo'd layout name previously printed the same line
+five to ten times a second for as long as the configuration stayed broken.
+
 ## Application search
 
 `src/apps.rs` indexes `shell:AppsFolder` on a worker thread at startup. That is

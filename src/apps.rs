@@ -44,16 +44,29 @@ pub fn begin_indexing() {
     let spawned = std::thread::Builder::new()
         .name("AltDWM-apps".into())
         .spawn(move || {
+            // Clears the in-progress flag however this thread ends, panic
+            // included. Without it a single failed enumeration left the flag set
+            // for the life of the process, and `refresh` — which returns early
+            // when indexing is already under way — could never retry.
+            let _guard = IndexingGuard;
             let mut entries = enumerate();
             entries.sort_by(|a, b| a.lowercase.cmp(&b.lowercase));
             entries.dedup_by(|a, b| a.id == b.id);
             println!("[apps] indexed {} applications", entries.len());
             *index.lock().unwrap_or_else(|error| error.into_inner()) = entries;
             INDEXED.store(true, Ordering::SeqCst);
-            INDEXING.store(false, Ordering::SeqCst);
             crate::command_center::invalidate();
         });
     if spawned.is_err() {
+        INDEXING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Resets `INDEXING` when the worker thread ends, for any reason.
+struct IndexingGuard;
+
+impl Drop for IndexingGuard {
+    fn drop(&mut self) {
         INDEXING.store(false, Ordering::SeqCst);
     }
 }
@@ -62,6 +75,24 @@ pub fn begin_indexing() {
 pub fn refresh() {
     INDEXED.store(false, Ordering::SeqCst);
     begin_indexing();
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::{IndexingGuard, INDEXING};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn the_guard_clears_the_in_progress_flag_on_any_exit() {
+        INDEXING.store(true, Ordering::SeqCst);
+        {
+            let _guard = IndexingGuard;
+        }
+        assert!(
+            !INDEXING.load(Ordering::SeqCst),
+            "a failed index must not block every later refresh"
+        );
+    }
 }
 
 pub fn is_ready() -> bool {

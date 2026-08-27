@@ -647,14 +647,15 @@ fn do_generate_config(explicit: Option<&std::path::Path>) {
 fn do_status() {
     // The worker polls on an interval; give it one cycle to publish.
     system::refresh();
-    let mut status = system::status();
-    for _ in 0..40 {
-        if status != Default::default() {
+    // Waiting for the status to differ from the default would mean waiting the
+    // full timeout on a machine that genuinely reports nothing.
+    for _ in 0..60 {
+        if system::has_polled() {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
-        status = system::status();
     }
+    let status = system::status();
     println!("audio      {}", match status.volume {
         Some(volume) if volume.muted => format!("{}% (muted)", volume.percent()),
         Some(volume) => format!("{}%", volume.percent()),

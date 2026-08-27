@@ -440,6 +440,25 @@ impl Config {
         }
     }
 
+    /// Names already reported as unknown.
+    ///
+    /// `layout_enum` is called on every retile, so an unadorned `eprintln` here
+    /// printed the same complaint several times a second for as long as the typo
+    /// stayed in the configuration.
+    fn warn_unknown_layout_once(name: &str) {
+        use std::collections::HashSet;
+        use std::sync::{LazyLock, Mutex};
+        static WARNED: LazyLock<Mutex<HashSet<String>>> =
+            LazyLock::new(|| Mutex::new(HashSet::new()));
+        if WARNED
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(name.to_string())
+        {
+            eprintln!("[config] unknown layout '{name}' -> MasterStack");
+        }
+    }
+
     pub fn layout_enum(&self) -> Layout {
         match self.general.layout.to_lowercase().as_str() {
             "grid" => Layout::Grid,
@@ -454,10 +473,7 @@ impl Config {
                 {
                     // custom layout — handled by try_compute_custom, keep MasterStack as fallback enum
                 } else {
-                    eprintln!(
-                        "[config] unknown layout '{}' -> MasterStack",
-                        self.general.layout
-                    );
+                    Self::warn_unknown_layout_once(&self.general.layout);
                 }
                 Layout::MasterStack
             }
@@ -510,6 +526,23 @@ impl Config {
             warns.push(format!(
                 "general.master_ratio must be between 0.1 and 0.9 ({})",
                 self.general.master_ratio
+            ));
+        }
+        // A typo'd layout name silently became MasterStack, which looks like
+        // AltDWM ignoring the setting. `--check-config` should say so.
+        let layout = self.general.layout.to_lowercase();
+        let known_builtin = matches!(
+            layout.as_str(),
+            "grid" | "monocle" | "floating" | "masterstack" | "master" | "bsp" | "tiling"
+        );
+        let known_custom = self
+            .layouts
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(&self.general.layout));
+        if !known_builtin && !known_custom {
+            warns.push(format!(
+                "general.layout '{}' is neither a built-in layout nor a key in [layouts]",
+                self.general.layout
             ));
         }
         let mut panel_names = std::collections::HashSet::new();
@@ -962,6 +995,41 @@ mod tests {
         let warnings = config.validate().join("\n");
         assert!(warnings.contains("duplicate keybind"));
         assert!(warnings.contains("invalid class regex"));
+    }
+
+    #[test]
+    fn validation_reports_out_of_range_and_unknown_values() {
+        let mut config = Config::default();
+        config.general.layout = "Gird".into();
+        config.general.workspaces = 12;
+        config.general.master_ratio = 1.5;
+        config.general.gap = -4;
+        let warns = config.validate();
+        let joined = warns.join(" | ");
+        // A typo'd layout silently became MasterStack, which reads as AltDWM
+        // ignoring the setting rather than as a mistake in the file.
+        assert!(joined.contains("general.layout 'Gird'"), "{joined}");
+        assert!(joined.contains("general.workspaces"), "{joined}");
+        assert!(joined.contains("general.master_ratio"), "{joined}");
+        assert!(joined.contains("general.gap"), "{joined}");
+    }
+
+    #[test]
+    fn a_custom_layout_name_is_not_reported_as_unknown() {
+        let mut config = Config::default();
+        config.general.layout = "spiral".into();
+        config.layouts.insert(
+            "spiral".into(),
+            crate::config::LayoutConfig {
+                script: Some("scripts/spiral.rhai".into()),
+                gap: None,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !config.validate().iter().any(|w| w.contains("general.layout")),
+            "a layout declared in [layouts] is legitimate"
+        );
     }
 
     #[test]

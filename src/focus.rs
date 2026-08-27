@@ -319,14 +319,26 @@ fn positioned_windows() -> Vec<(HWND, RECT)> {
         .collect()
 }
 
-fn focused_with_rect() -> Option<(HWND, RECT)> {
+/// The focused window's rectangle plus every other candidate, from one
+/// enumeration.
+///
+/// Resolving the two separately meant every direction key walked all top-level
+/// windows twice, re-running the manageability checks each time.
+fn focus_context() -> Option<(RECT, Vec<(HWND, RECT)>)> {
     let foreground = unsafe { GetForegroundWindow() };
     if foreground.0.is_null() {
         return None;
     }
-    positioned_windows()
-        .into_iter()
+    let all = positioned_windows();
+    let origin = all
+        .iter()
         .find(|(hwnd, _)| hwnd.0 == foreground.0)
+        .map(|(_, rect)| *rect)?;
+    let others = all
+        .into_iter()
+        .filter(|(hwnd, _)| hwnd.0 != foreground.0)
+        .collect();
+    Some((origin, others))
 }
 
 /// Move focus geometrically. Falls back to list order when there is no window in
@@ -336,14 +348,10 @@ pub fn focus_direction(dir: &str) {
         focus_next();
         return;
     };
-    let Some((focused, rect)) = focused_with_rect() else {
+    let Some((rect, candidates)) = focus_context() else {
         focus_next();
         return;
     };
-    let candidates: Vec<(HWND, RECT)> = positioned_windows()
-        .into_iter()
-        .filter(|(hwnd, _)| hwnd.0 != focused.0)
-        .collect();
     match neighbour(rect, direction, &candidates) {
         Some(target) => set_foreground(target),
         None => {
@@ -362,13 +370,10 @@ pub fn move_window_direction(dir: &str) {
     let Some(direction) = Direction::parse(dir) else {
         return;
     };
-    let Some((focused, rect)) = focused_with_rect() else {
+    let focused = unsafe { GetForegroundWindow() };
+    let Some((rect, candidates)) = focus_context() else {
         return;
     };
-    let candidates: Vec<(HWND, RECT)> = positioned_windows()
-        .into_iter()
-        .filter(|(hwnd, _)| hwnd.0 != focused.0)
-        .collect();
     let moved = match neighbour(rect, direction, &candidates) {
         Some(target) => crate::manager::swap_in_order(focused, target),
         // At the edge of the layout, fall back to stepping through the order so

@@ -243,18 +243,28 @@ unsafe extern "system" fn panel_wndproc(
             if wparam.0 == TIMER_TICK || wparam.0 == TIMER_FAST {
                 // Widgets refresh here, never in WM_PAINT: a Rhai script or a
                 // file read in the paint handler stalled the whole shell.
+                let mut changed = false;
                 if let Some(panel_arc) = panel_collection() {
                     if let Ok(panels) = panel_arc.try_lock() {
                         for panel in panels.iter().filter(|panel| panel.hwnd == hwnd) {
                             for widget in &panel.widgets {
-                                widget.tick();
+                                // Every widget ticks; `||` would short-circuit
+                                // and starve the ones after the first change.
+                                changed |= widget.tick();
                             }
                         }
                     }
                 }
-                // The paint path fills every pixel itself. Asking Windows to
-                // erase first exposes a blank frame on every widget tick.
-                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+                // Only repaint when something moved. A sub-second widget used to
+                // force the whole bar — window enumeration and all — to redraw
+                // at its interval whether or not anything had changed.
+                //
+                // The paint path fills every pixel itself, so erasing first
+                // would expose a blank frame.
+                if changed {
+                    let _ =
+                        windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+                }
             }
             LRESULT(0)
         }
@@ -324,11 +334,9 @@ unsafe extern "system" fn panel_wndproc(
         }
         WM_MOUSEWHEEL => {
             // Wheel messages carry screen coordinates, unlike the button and
-            // move messages.
-            let mut origin = RECT::default();
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut origin);
-            let (screen_x, screen_y) = client_point(lparam);
-            let point = (screen_x - origin.left, screen_y - origin.top);
+            // move messages. Subtracting the window rect's origin happens to work
+            // for a borderless popup; ScreenToClient is correct for any window.
+            let point = to_client(hwnd, client_point(lparam));
             let notches = ((wparam.0 >> 16) & 0xFFFF) as i16;
             let delta = if notches > 0 { 1 } else { -1 };
             let handled = match resolve_hit(hwnd, point) {
@@ -414,6 +422,18 @@ fn resolve_hit(
         .zip(rects)
         .find(|(_, item)| ui::point_in_rect(point.0, point.1, item))
         .map(|(widget, item)| (name, widget.clone(), item, ctx))
+}
+
+/// Convert a screen point to `hwnd`'s client coordinates.
+fn to_client(hwnd: HWND, point: (i32, i32)) -> (i32, i32) {
+    let mut converted = windows::Win32::Foundation::POINT {
+        x: point.0,
+        y: point.1,
+    };
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut converted);
+    }
+    (converted.x, converted.y)
 }
 
 fn client_point(lparam: LPARAM) -> (i32, i32) {

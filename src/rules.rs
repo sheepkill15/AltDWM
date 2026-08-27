@@ -420,6 +420,45 @@ pub fn maybe_run_on_create(hwnd: HWND) {
 static ON_CREATE_SEEN: LazyLock<Mutex<std::collections::HashSet<(isize, String)>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
+/// Drop cached state for windows that are no longer live.
+pub fn retain_windows(live: &std::collections::HashSet<isize>) {
+    CLASS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|key, _| live.contains(key));
+    PROCESS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|key, _| live.contains(key));
+    // LAYERED is deliberately not pruned here: an entry is the record of an
+    // ex-style that still has to be put back, and `restore_all_opacity` needs it
+    // even for a window that has left the managed set.
+    //
+    // ON_CREATE_SEEN is not pruned against `live` either, and for a sharper
+    // reason: it is keyed by *any* window that ever matched an on_create rule,
+    // including ones that are not manageable and so never appear in `live`.
+    // Dropping those entries would let the action fire again on the window's
+    // next SHOW event. It is bounded below instead.
+    prune_dead_on_create_entries();
+}
+
+/// `ON_CREATE_SEEN` records that an action has already run for a window, so it
+/// can only be pruned by whether the window still exists. That costs a syscall
+/// per entry, so it is done only once the set has grown enough to be worth it.
+fn prune_dead_on_create_entries() {
+    const THRESHOLD: usize = 512;
+    let mut seen = ON_CREATE_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < THRESHOLD {
+        return;
+    }
+    seen.retain(|(handle, _)| unsafe {
+        windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(HWND(
+            *handle as *mut std::ffi::c_void,
+        )))
+        .as_bool()
+    });
+}
+
 pub fn forget_window(hwnd: HWND) {
     let key = hwnd.0 as isize;
     ON_CREATE_SEEN
