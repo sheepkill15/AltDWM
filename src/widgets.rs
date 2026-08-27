@@ -100,7 +100,11 @@ pub enum HoverPaint {
 #[allow(dead_code)] // Public extension context; built-ins do not need every field.
 pub struct PanelCtx {
     pub panel_name: String,
+    /// The panel's configured monitor target, e.g. `all` or `primary`.
     pub monitor: String,
+    /// The `HMONITOR` this panel is actually on, as an integer key. Workspaces
+    /// are per monitor, so the strip has to know which display it belongs to.
+    pub monitor_key: isize,
     pub width: i32,
     pub height: i32,
     pub hwnd: HWND,
@@ -497,10 +501,12 @@ impl Widget for TrayWidget {
     }
 }
 
-pub struct WorkspacesWidget {
+/// Current layout and managed count. Named `layout` in configuration; this is
+/// not the workspace strip, which is `WorkspacesWidget` below.
+pub struct LayoutWidget {
     pub cfg: WidgetConfig,
 }
-impl Widget for WorkspacesWidget {
+impl Widget for LayoutWidget {
     fn name(&self) -> &str {
         &self.cfg.name
     }
@@ -584,6 +590,9 @@ impl Widget for WorkspacesWidget {
             .unwrap_or_else(|error| error.into_inner())
             .name()
             .to_lowercase();
+        // Cycling forward through the built-ins; a custom Rhai layout is
+        // selected by name from configuration or the command center.
+
         let next = match current.as_str() {
             "masterstack" => "Grid",
             "grid" => "Monocle",
@@ -593,6 +602,147 @@ impl Widget for WorkspacesWidget {
         // set_layout_by_name already requests a retile.
         crate::set_layout_by_name(next);
         None
+    }
+}
+
+/// The workspace strip: one pill per configured workspace, click to switch.
+///
+/// This is what the `workspaces` widget name has always promised. Until now it
+/// was an alias for the layout capsule, because AltDWM had no workspaces.
+pub struct WorkspacesWidget {
+    pub cfg: WidgetConfig,
+}
+
+impl WorkspacesWidget {
+    /// Pill rectangles, shared by draw and hit-testing.
+    fn pills(&self, rect: RECT, ctx: &PanelCtx) -> Vec<(usize, RECT)> {
+        let body = content_rect(rect, ctx);
+        let strip = crate::workspace::summary(ctx.monitor_key, &ctx.windows);
+        if strip.is_empty() {
+            return Vec::new();
+        }
+        let gap = ctx.px(token::ITEM_GAP);
+        let extent = if ctx.vertical {
+            rect_height(&body)
+        } else {
+            body.right - body.left
+        };
+        crate::ui::split_span(
+            if ctx.vertical { body.top } else { body.left },
+            extent,
+            strip.len(),
+            gap,
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start, end))| {
+            let pill = if ctx.vertical {
+                RECT {
+                    left: body.left,
+                    top: start,
+                    right: body.right,
+                    bottom: end,
+                }
+            } else {
+                RECT {
+                    left: start,
+                    top: body.top,
+                    right: end,
+                    bottom: body.bottom,
+                }
+            };
+            (index, pill)
+        })
+        .collect()
+    }
+}
+
+impl Widget for WorkspacesWidget {
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+    fn kind(&self) -> &'static str {
+        "workspaces"
+    }
+    fn width(&self, ctx: &PanelCtx) -> i32 {
+        // Sized from the workspace count rather than fixed, so the strip does
+        // not leave dead space or clip when the count changes.
+        self.cfg
+            .width
+            .unwrap_or_else(|| crate::workspace::count() as i32 * 30 + 8)
+            .max(ctx.px(1))
+    }
+    fn hover_paint(&self) -> HoverPaint {
+        HoverPaint::SelfDrawn
+    }
+    fn interval_ms(&self) -> Option<u32> {
+        None
+    }
+    fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
+        let strip = crate::workspace::summary(ctx.monitor_key, &ctx.windows);
+        let radius = ctx.radius();
+        for ((index, pill), info) in self.pills(rect, ctx).into_iter().zip(&strip) {
+            let hovered = ctx.pointer_in(&pill);
+            let background = if info.active {
+                ctx.theme.accent_active_color()
+            } else if hovered {
+                ctx.theme.surface_hover_color()
+            } else if info.occupied {
+                ctx.theme.surface_color()
+            } else {
+                // An empty, inactive workspace is drawn as an outline only, so
+                // the strip communicates where the windows are at a glance.
+                ctx.theme.panel_bg(&ctx.panel_name)
+            };
+            fill_round_rect(hdc, &pill, radius, background);
+            if !info.active && !info.occupied && !hovered {
+                // Hairline so an empty workspace is still a visible target.
+                let underline = RECT {
+                    left: pill.left + radius,
+                    top: pill.bottom - ctx.px(2),
+                    right: pill.right - radius,
+                    bottom: pill.bottom - ctx.px(1),
+                };
+                fill_rect(hdc, &underline, ctx.theme.border_color());
+            }
+            let color = if info.active || info.occupied || hovered {
+                ctx.theme.text_color()
+            } else {
+                ctx.theme.text_dim_color()
+            };
+            let label = format!("{}", info.number);
+            // Centred by measuring, so single and double digits both sit right.
+            let font = if info.active {
+                ctx.strong_font()
+            } else {
+                ctx.body_font()
+            };
+            let text_width = measure_label(hdc, &label, font);
+            let left = pill.left + ((pill.right - pill.left) - text_width) / 2;
+            draw_label(
+                hdc,
+                &RECT {
+                    left: left.max(pill.left),
+                    ..pill
+                },
+                &label,
+                font,
+                color,
+            );
+            let _ = index;
+        }
+    }
+    fn on_click(&self, point: (i32, i32), rect: RECT, ctx: &PanelCtx) -> Option<String> {
+        for (index, pill) in self.pills(rect, ctx) {
+            if point_in_rect(point.0, point.1, &pill) {
+                return Some(format!("workspace({})", index + 1));
+            }
+        }
+        None
+    }
+    fn on_scroll(&self, delta: i32, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> bool {
+        crate::workspace::cycle(if delta > 0 { -1 } else { 1 });
+        true
     }
 }
 
@@ -1259,9 +1409,8 @@ pub fn create_widget(cfg: &WidgetConfig) -> Box<dyn Widget> {
         "window_title" | "title" => Box::new(WindowTitleWidget { cfg: cfg.clone() }),
         "window_list" | "tasklist" => Box::new(WindowListWidget { cfg: cfg.clone() }),
         "tray" | "systray" => Box::new(TrayWidget { cfg: cfg.clone() }),
-        "workspaces" | "workspaces_pills" | "layout" | "layout_status" => {
-            Box::new(WorkspacesWidget { cfg: cfg.clone() })
-        }
+        "workspaces" | "workspaces_pills" => Box::new(WorkspacesWidget { cfg: cfg.clone() }),
+        "layout" | "layout_status" => Box::new(LayoutWidget { cfg: cfg.clone() }),
         "launcher" | "start" => Box::new(LauncherWidget { cfg: cfg.clone() }),
         "volume" | "audio" => Box::new(VolumeWidget { cfg: cfg.clone() }),
         "battery" | "power" => Box::new(BatteryWidget { cfg: cfg.clone() }),

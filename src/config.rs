@@ -65,6 +65,12 @@ pub struct General {
     /// filter tiling to current virtual desktop only (requires IVirtualDesktopManager)
     #[serde(default = "default_filter_vd")]
     pub filter_virtual_desktop: bool,
+    /// Workspaces per monitor. `1` disables the feature entirely.
+    #[serde(default = "default_workspaces")]
+    pub workspaces: usize,
+    /// Fraction of the usable width the master column takes, 0.1–0.9.
+    #[serde(default = "default_master_ratio")]
+    pub master_ratio: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -206,6 +212,18 @@ fn default_true() -> bool {
 fn default_filter_vd() -> bool {
     false
 }
+/// Workspaces are opt-in.
+///
+/// Switching away from a workspace hides windows, and a window the user cannot
+/// find is this program's worst failure mode. Someone who has not asked for
+/// workspaces should never be able to reach that state, so the default leaves
+/// the feature inert and the recovery paths untested-by-accident.
+fn default_workspaces() -> usize {
+    1
+}
+fn default_master_ratio() -> f32 {
+    0.6
+}
 fn default_layout() -> String {
     "MasterStack".to_string()
 }
@@ -233,6 +251,8 @@ impl Default for General {
             hide_native_taskbar: default_true(),
             outer_gap: None,
             filter_virtual_desktop: default_filter_vd(),
+            workspaces: default_workspaces(),
+            master_ratio: default_master_ratio(),
         }
     }
 }
@@ -478,6 +498,19 @@ impl Config {
         }
         if self.theme.rounding < 0 {
             warns.push("theme.rounding cannot be negative".to_string());
+        }
+        if !(1..=crate::workspace::MAX_WORKSPACES).contains(&self.general.workspaces) {
+            warns.push(format!(
+                "general.workspaces must be between 1 and {} ({})",
+                crate::workspace::MAX_WORKSPACES,
+                self.general.workspaces
+            ));
+        }
+        if !(0.1..=0.9).contains(&self.general.master_ratio) {
+            warns.push(format!(
+                "general.master_ratio must be between 0.1 and 0.9 ({})",
+                self.general.master_ratio
+            ));
         }
         let mut panel_names = std::collections::HashSet::new();
         for p in &self.panels {

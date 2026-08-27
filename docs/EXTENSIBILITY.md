@@ -327,6 +327,60 @@ and focus functions: `quick_settings()`, `cycle_input()`, `input_layout()`,
 `is_muted()`, `get_brightness()`, `set_brightness(percent)`, `get_battery()`,
 `network_name()`.
 
+## Workspaces
+
+`general.workspaces` sets how many workspaces each monitor has. It defaults to
+`1`, which leaves the feature inert — switching away from a workspace hides
+windows, and a window the user cannot find is this program's worst failure mode,
+so nobody reaches that state without asking for it.
+
+Each monitor has its own active workspace, so switching on one display leaves the
+other alone. A new window joins the active workspace of the display it appeared
+on. Switching applies visibility synchronously and then focuses a window on the
+revealed workspace, so the keyboard follows the switch.
+
+Windows' own virtual desktops are only usefully *switchable* through
+`IVirtualDesktopManagerInternal`, which is undocumented and changes shape between
+builds; `general.filter_virtual_desktop` still uses the documented read-only half
+of that API. Workspaces here are AltDWM's own, implemented by hiding windows.
+
+**Recovery.** Hiding someone else's windows is the most destructive thing AltDWM
+does, so three rules hold. Only windows AltDWM hid are ever shown again. Every
+in-process exit path restores them — normal shutdown, a Rust panic, an unhandled
+exception, Ctrl+C. And because none of those can catch `TerminateProcess` (Task
+Manager, `Stop-Process`, a hard kill), the hidden set is journalled to
+`%LOCALAPPDATA%\AltDWM\hidden-windows` the moment it changes. The next start
+replays it, and:
+
+```powershell
+alt-dwm --restore-windows    # un-hide everything, without starting the shell
+```
+
+The journal records each window's owning process alongside its handle, so a
+recycled handle can never cause an unrelated window to be shown.
+
+## Layout verbs
+
+| action | effect |
+| --- | --- |
+| `focus_direction("left"\|"right"\|"up"\|"down")` | Move focus geometrically |
+| `move_window("left"\|…)` | Swap the focused window with its neighbour that way |
+| `promote` | Make the focused window the master |
+| `wider_master` / `narrower_master` | Adjust `general.master_ratio` by 5% |
+| `set_master_ratio(percent)`, `adjust_master_ratio(delta)` | Same, from Rhai |
+| `workspace(n)` | Show workspace *n* on the focused monitor |
+| `move_to_workspace(n)` / `send_to_workspace(n)` | Send the focused window there, staying or following |
+| `next_workspace` / `prev_workspace` | Step through workspaces |
+
+Directional focus is geometric: a candidate qualifies only if it is on that side
+*and* its extent across the axis of travel overlaps the origin's. The overlap
+requirement is what stops Up from a full-height master window jumping sideways
+into the stack. When nothing qualifies, the key falls back to list order, so it
+is never inert.
+
+`general.master_ratio` (default `0.6`) is the master column's share of the usable
+width. It was previously hardcoded.
+
 ## Application search
 
 `src/apps.rs` indexes `shell:AppsFolder` on a worker thread at startup. That is

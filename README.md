@@ -18,7 +18,9 @@ Tested on Windows 11, 2 monitors, Rust 1.98 + `windows` 0.61.
 - **Focused window borders**: DWM border colors update on foreground changes without retiling. Configure `theme.border_active` and `theme.border_inactive` independently.
 - **Searchable command center** (`src/command_center.rs`): open it from the AltDWM button or `Alt+Shift+Space`; type to filter across both AltDWM's own commands and every installed application, use arrows to select, view every successfully registered shortcut, and launch apps, open quick settings, edit/reload configuration, pause tiling, or change layouts without memorizing commands.
 - **Declarative panels DSL** (`src/config.rs:16`, `docs/EXTENSIBILITY.md`): TOML `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`. Multiple bars remain supported, while generated and example configs now start with one polished shell bar.
-- **Widgets** (`src/widgets.rs` trait): `clock`, live `layout`/`workspaces` status, `window_list` (including minimized windows; click to focus/minimize/restore), `window_title`, Explorer-backed clickable `tray`, `volume` (scroll to change), `battery`, `network`, `input` (click to cycle keyboard layout), `spacer`, `launcher`, and Rhai `custom` status widgets.
+- **Workspaces** (`src/workspace.rs`): `general.workspaces` gives each monitor its own set, switched with `workspace(n)` or the `workspaces` widget's pills, with `send_to_workspace(n)` to move a window. Opt-in (`1` by default) because switching hides windows. Restored on every in-process exit path, and journalled to disk so a hard kill is recoverable with `--restore-windows`.
+- **Layout verbs** (`src/focus.rs`): geometric `focus_direction`, `move_window` to swap the focused window with its neighbour, `promote` to claim the master slot, and an adjustable `general.master_ratio`.
+- **Widgets** (`src/widgets.rs` trait): `clock`, live `layout` status, real `workspaces` pills, `window_list` (including minimized windows; click to focus/minimize/restore), `window_title`, Explorer-backed clickable `tray`, `volume` (scroll to change), `battery`, `network`, `input` (click to cycle keyboard layout), `spacer`, `launcher`, and Rhai `custom` status widgets.
 - **System status and quick settings** (`src/system.rs`, `src/quick_settings.rs`): volume through Core Audio, battery through `GetSystemPowerStatus`, connection and Wi-Fi radio through the WLAN API and `INetworkListManager`, brightness through DDC/CI, keyboard layout through `GetKeyboardLayoutList`. All polled on a worker thread and published as a snapshot, so no status call ever runs in a paint handler. The flyout offers volume and brightness sliders, mute and Wi-Fi toggles, and a layout switcher; what AltDWM cannot own end to end opens the matching `ms-settings:` page. `--status` prints exactly what the readers see.
 - **Application search** (`src/apps.rs`): `shell:AppsFolder` is indexed on a worker thread at startup, covering desktop and Store apps together. Search is tiered — exact, prefix, word start, initials (`vsc` → *Visual Studio Code*), substring, then a word-anchored fuzzy pass — and launching goes through `shell:AppsFolder\<AppUserModelID>`. `--list-apps [query]` shows the index and its ranking.
 - **Panels** (`src/panel.rs:47`): Each `[[panels]]` is a `WS_POPUP|WS_EX_TOPMOST` window (`AltDWM_Panel` class), flex layout for widgets, 1s + 250ms timers, click → `scripting::dispatch_action`.
@@ -39,6 +41,7 @@ cargo run -- --generate-config   # writes %APPDATA%/AltDWM/config.toml
 cargo run -- --check-config      # validate
 cargo run -- --status            # live audio/power/network/input readings
 cargo run -- --list-apps code    # application index and search ranking
+cargo run -- --restore-windows   # un-hide anything a killed run left on a workspace
 
 # command center: Alt+Shift+Space; other hotkeys are configurable in [[keybinds]]
 ```
@@ -112,6 +115,7 @@ src/system.rs    # audio/power/network/brightness poller + commands
 src/quick_settings.rs # volume/brightness/network/input control flyout
 src/input.rs     # keyboard layout reporting and switching
 src/apps.rs      # shell:AppsFolder index, ranked search, launch
+src/workspace.rs # per-monitor workspaces, hide/show, journalled recovery
 src/widgets.rs   # Widget trait + clock/layout/tasklist/tray/launcher/custom
 src/shell.rs     # reversible Explorer taskbar ownership
 src/tray.rs      # Explorer notification-area discovery/invocation bridge

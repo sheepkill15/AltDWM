@@ -118,6 +118,39 @@ fn build_engine() -> Engine {
     eng.register_fn("focus_direction", |dir: &str| {
         crate::focus::focus_direction(dir);
     });
+    eng.register_fn("move_window", |dir: &str| {
+        crate::focus::move_window_direction(dir);
+    });
+    eng.register_fn("promote", || {
+        crate::focus::promote_focused();
+    });
+    eng.register_fn("workspace", |index: i64| {
+        // Configuration and the UI are one-based; the module is zero-based.
+        crate::workspace::switch_to((index.max(1) - 1) as usize);
+    });
+    eng.register_fn("move_to_workspace", |index: i64| {
+        crate::workspace::move_focused_to((index.max(1) - 1) as usize, false);
+    });
+    eng.register_fn("send_to_workspace", |index: i64| {
+        crate::workspace::move_focused_to((index.max(1) - 1) as usize, true);
+    });
+    eng.register_fn("next_workspace", || {
+        crate::workspace::cycle(1);
+    });
+    eng.register_fn("prev_workspace", || {
+        crate::workspace::cycle(-1);
+    });
+    eng.register_fn("current_workspace", || -> i64 {
+        crate::workspace::current_number() as i64
+    });
+    eng.register_fn("adjust_master_ratio", |delta: i64| {
+        crate::adjust_master_ratio(delta as f32 / 100.0);
+    });
+    eng.register_fn("set_master_ratio", |percent: i64| {
+        let target = percent.clamp(10, 90) as f32 / 100.0;
+        let current = crate::layout::current_master_ratio();
+        crate::adjust_master_ratio(target - current);
+    });
     eng.register_fn("quick_settings", || {
         crate::quick_settings::toggle();
     });
@@ -262,6 +295,11 @@ pub fn dispatch_action(action: &str) {
         }
         "toggle_floating" => crate::focus::toggle_floating_focused(),
         "quick_settings" => crate::quick_settings::toggle(),
+        "promote" | "promote_to_master" => crate::focus::promote_focused(),
+        "next_workspace" => crate::workspace::cycle(1),
+        "prev_workspace" => crate::workspace::cycle(-1),
+        "wider_master" => crate::adjust_master_ratio(0.05),
+        "narrower_master" => crate::adjust_master_ratio(-0.05),
         "cycle_input" | "next_layout" => {
             crate::input::cycle();
         }

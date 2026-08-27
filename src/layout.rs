@@ -32,6 +32,27 @@ impl Layout {
 /// Compute tiled rectangles for `n` windows within `area`
 /// Returns vec of RECTs in same order as input windows
 pub fn compute_layout(n: usize, area: RECT, gap: i32, layout: Layout) -> Vec<RECT> {
+    compute_layout_with_ratio(n, area, gap, layout, current_master_ratio())
+}
+
+/// The live master ratio, clamped to something that always leaves both columns
+/// usable.
+pub fn current_master_ratio() -> f32 {
+    crate::CURRENT_CONFIG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .general
+        .master_ratio
+        .clamp(0.1, 0.9)
+}
+
+pub fn compute_layout_with_ratio(
+    n: usize,
+    area: RECT,
+    gap: i32,
+    layout: Layout,
+    master_ratio: f32,
+) -> Vec<RECT> {
     if n == 0 {
         return Vec::new();
     }
@@ -39,7 +60,7 @@ pub fn compute_layout(n: usize, area: RECT, gap: i32, layout: Layout) -> Vec<REC
         Layout::Floating => Vec::new(),
         Layout::Monocle => vec![shrink_rect(area, gap); n],
         Layout::Grid => grid_layout(n, area, gap),
-        Layout::MasterStack => master_stack_layout(n, area, gap),
+        Layout::MasterStack => master_stack_layout(n, area, gap, master_ratio),
     }
 }
 
@@ -268,19 +289,18 @@ fn shrink_rect(r: RECT, gap: i32) -> RECT {
 /// sides. The previous arithmetic subtracted the gap budget from the stack width
 /// only, which put the stack's right edge exactly on the area boundary — the
 /// layout had a gap on its left and none on its right.
-fn master_stack_layout(n: usize, area: RECT, gap: i32) -> Vec<RECT> {
+fn master_stack_layout(n: usize, area: RECT, gap: i32, master_ratio: f32) -> Vec<RECT> {
     let inner = shrink_rect(area, gap);
     if n <= 1 {
         return vec![inner];
     }
     let width = (inner.right - inner.left).max(1);
-    let columns = split_span(inner.left, width, 2, gap);
-    // 60/40 split of the space that remains once the inner gap is accounted for.
+    // Split the space that remains once the inner gap is accounted for.
     let content = width - gap;
-    let master_w = (content * 60 / 100).clamp(1, content.max(1));
+    let master_w =
+        ((content as f32 * master_ratio.clamp(0.1, 0.9)).round() as i32).clamp(1, content.max(1));
     let master_right = inner.left + master_w;
     let stack_left = master_right + gap;
-    let _ = columns;
 
     let mut rects = Vec::with_capacity(n);
     rects.push(RECT {

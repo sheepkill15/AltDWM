@@ -49,6 +49,7 @@ monitor = "all"
 margin = [0, 8, 8, 8]
 widgets = [
     "launcher",
+    "workspaces",
     "layout",
     "window_list",
     "cpu",

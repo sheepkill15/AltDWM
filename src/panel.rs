@@ -132,8 +132,9 @@ fn build_ctx(panel: &Panel, rect: RECT, hwnd: HWND, windows: Vec<HWND>) -> Panel
         .theme
         .clone();
     PanelCtx {
-        panel_name: panel.cfg.name.clone(),
+        panel_name: panel.cfg.position.clone(),
         monitor: panel.cfg.monitor.clone(),
+        monitor_key: panel.monitor.0 as isize,
         width: if vertical {
             rect.bottom - rect.top
         } else {

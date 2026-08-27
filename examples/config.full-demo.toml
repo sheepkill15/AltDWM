@@ -12,6 +12,11 @@ auto_float_utility_windows = true
 respect_window_size_constraints = true
 hide_native_taskbar = true
 filter_virtual_desktop = false
+# Workspaces hide the windows that are not on the visible one. Opt-in, because
+# `1` (the default) keeps the feature inert. If AltDWM is ever killed outright
+# while windows are hidden, `alt-dwm --restore-windows` brings them back.
+workspaces = 4        # per monitor
+master_ratio = 0.6    # master column's share of the usable width
 
 [ignore]
 classes = [
@@ -54,6 +59,7 @@ monitor = "all"
 margin = [0, 8, 8, 8]
 widgets = [
     "launcher",
+    "workspaces",
     "layout",
     "window_list",
     "cpu",
@@ -72,9 +78,14 @@ label = "AltDWM"
 width = 120
 
 [[widgets]]
+type = "workspaces"
+name = "workspaces"
+# Width is derived from the workspace count when omitted.
+
+[[widgets]]
 type = "layout"
 name = "layout"
-width = 216
+width = 180
 
 [[widgets]]
 type = "window_list"
@@ -182,7 +193,7 @@ action = "quick_settings"
 description = "Open quick settings"
 
 [[keybinds]]
-keys = "Alt+Shift+L"
+keys = "Alt+Shift+I"
 action = "cycle_input"
 description = "Cycle keyboard layout"
 
@@ -208,13 +219,105 @@ description = "Hot-reload this config"
 
 [[keybinds]]
 keys = "Alt+Shift+J"
-action = "focus_next()"
-description = "Focus next window"
+action = 'focus_direction("down")'
+description = "Focus the window below"
 
 [[keybinds]]
 keys = "Alt+Shift+K"
-action = "focus_prev()"
-description = "Focus previous window"
+action = 'focus_direction("up")'
+description = "Focus the window above"
+
+[[keybinds]]
+keys = "Alt+Shift+H"
+action = 'focus_direction("left")'
+description = "Focus the window to the left"
+
+[[keybinds]]
+keys = "Alt+Shift+L"
+action = 'focus_direction("right")'
+description = "Focus the window to the right"
+
+# Move the focused window through the layout without the mouse.
+[[keybinds]]
+keys = "Ctrl+Alt+Shift+H"
+action = 'move_window("left")'
+description = "Move window left in the layout"
+
+[[keybinds]]
+keys = "Ctrl+Alt+Shift+L"
+action = 'move_window("right")'
+description = "Move window right in the layout"
+
+[[keybinds]]
+keys = "Ctrl+Alt+Shift+J"
+action = 'move_window("down")'
+description = "Move window down in the layout"
+
+[[keybinds]]
+keys = "Ctrl+Alt+Shift+K"
+action = 'move_window("up")'
+description = "Move window up in the layout"
+
+[[keybinds]]
+keys = "Alt+Shift+Return"
+action = "promote"
+description = "Make the focused window master"
+
+[[keybinds]]
+keys = "Alt+Shift+."
+action = "wider_master"
+description = "Widen the master column"
+
+[[keybinds]]
+keys = "Alt+Shift+,"
+action = "narrower_master"
+description = "Narrow the master column"
+
+# Workspaces, per monitor.
+[[keybinds]]
+keys = "Alt+Shift+1"
+action = "workspace(1)"
+description = "Show workspace 1"
+
+[[keybinds]]
+keys = "Alt+Shift+2"
+action = "workspace(2)"
+description = "Show workspace 2"
+
+[[keybinds]]
+keys = "Alt+Shift+3"
+action = "workspace(3)"
+description = "Show workspace 3"
+
+[[keybinds]]
+keys = "Alt+Shift+4"
+action = "workspace(4)"
+description = "Show workspace 4"
+
+[[keybinds]]
+keys = "Ctrl+Alt+Shift+1"
+action = "send_to_workspace(1)"
+description = "Send window to workspace 1 and follow"
+
+[[keybinds]]
+keys = "Ctrl+Alt+Shift+2"
+action = "send_to_workspace(2)"
+description = "Send window to workspace 2 and follow"
+
+[[keybinds]]
+keys = "Ctrl+Alt+Shift+3"
+action = "send_to_workspace(3)"
+description = "Send window to workspace 3 and follow"
+
+[[keybinds]]
+keys = "Ctrl+Alt+Shift+4"
+action = "send_to_workspace(4)"
+description = "Send window to workspace 4 and follow"
+
+[[keybinds]]
+keys = "Alt+Shift+Tab"
+action = "next_workspace"
+description = "Next workspace"
 
 [[keybinds]]
 keys = "Alt+Shift+Y"

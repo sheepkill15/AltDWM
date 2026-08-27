@@ -77,6 +77,7 @@ pub fn window_snapshot() -> Vec<HWND> {
     }
     let mut windows = collect_windows_including_minimized();
     windows.retain(|hwnd| crate::virtual_desktop::is_on_current_desktop(*hwnd));
+    windows.retain(|hwnd| crate::workspace::is_visible(*hwnd));
     *WINDOW_SNAPSHOT
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some((
@@ -773,6 +774,103 @@ pub fn finish_interactive_move(hwnd: HWND) -> bool {
     changed
 }
 
+/// Move `hwnd` to the front of the stable order, making it the master window.
+///
+/// The layout reads the order positionally, so promotion is an order edit rather
+/// than a geometry edit — which is why it survives the next retile.
+fn promote_in_order(order: &mut Vec<isize>, key: isize) -> bool {
+    let Some(position) = order.iter().position(|candidate| *candidate == key) else {
+        return false;
+    };
+    if position == 0 {
+        return false;
+    }
+    let entry = order.remove(position);
+    order.insert(0, entry);
+    true
+}
+
+pub fn promote_to_master(hwnd: HWND) -> bool {
+    let changed = promote_in_order(
+        &mut WINDOW_ORDER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        hwnd.0 as isize,
+    );
+    if changed {
+        clear_layout_overrides();
+    }
+    changed
+}
+
+/// Swap two windows' positions in the stable order.
+pub fn swap_in_order(first: HWND, second: HWND) -> bool {
+    let changed = swap_window_order(
+        &mut WINDOW_ORDER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        first.0 as isize,
+        second.0 as isize,
+    );
+    if changed {
+        clear_layout_overrides();
+    }
+    changed
+}
+
+/// Step `hwnd` one place forward or backward in the stable order, among the
+/// windows currently sharing its monitor.
+fn shift_within_order(order: &mut [isize], key: isize, delta: isize) -> bool {
+    let Some(position) = order.iter().position(|candidate| *candidate == key) else {
+        return false;
+    };
+    let target = position as isize + delta;
+    if target < 0 || target as usize >= order.len() {
+        return false;
+    }
+    order.swap(position, target as usize);
+    true
+}
+
+pub fn shift_in_order(hwnd: HWND, delta: isize) -> bool {
+    let changed = shift_within_order(
+        &mut WINDOW_ORDER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        hwnd.0 as isize,
+        delta,
+    );
+    if changed {
+        clear_layout_overrides();
+    }
+    changed
+}
+
+/// Managed windows on `monitor`, in stable order, excluding minimized ones.
+///
+/// Used to give focus somewhere sensible after a workspace switch.
+pub fn windows_on_monitor(monitor: isize) -> Vec<HWND> {
+    window_snapshot()
+        .into_iter()
+        .filter(|hwnd| unsafe {
+            !windows::Win32::UI::WindowsAndMessaging::IsIconic(*hwnd).as_bool()
+        })
+        .filter(|hwnd| {
+            let hmon = unsafe { MonitorFromWindow(*hwnd, MONITOR_DEFAULTTONEAREST) };
+            hmon.0 as isize == monitor
+        })
+        .collect()
+}
+
+/// The rectangle AltDWM most recently assigned to a window, if it is tiled.
+pub fn assigned_rect(hwnd: HWND) -> Option<RECT> {
+    EXPECTED_RECTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&(hwnd.0 as isize))
+        .copied()
+}
+
 fn reconcile_window_order<F>(order: &mut Vec<isize>, eligible: &[isize], mut is_alive: F)
 where
     F: FnMut(isize) -> bool,
@@ -1105,6 +1203,19 @@ pub fn tile_windows_reserved(
         .clone();
     let verbose = std::env::var_os("ALT_DWM_VERBOSE").is_some();
     let all_windows = collect_windows();
+    if all_windows.is_empty() {
+        clear_auto_floating();
+        return;
+    }
+
+    // Workspaces are applied before anything else looks at the window list:
+    // hiding is what makes a window absent from the layout, and it has to happen
+    // against the full set, including windows the previous workspace hid.
+    crate::workspace::apply_visibility(&collect_windows_including_minimized());
+    let all_windows: Vec<HWND> = all_windows
+        .into_iter()
+        .filter(|hwnd| crate::workspace::is_visible(*hwnd))
+        .collect();
     if all_windows.is_empty() {
         clear_auto_floating();
         return;
@@ -1466,8 +1577,8 @@ pub fn tile_windows_reserved(
 mod tests {
     use super::{
         adjust_rects_for_resize, assign_slots, contained_floating_rect, panel_reserves_for_monitor,
-        reconcile_window_order, rect_violates_constraints, rects_are_close, swap_window_order,
-        WindowConstraints,
+        promote_in_order, reconcile_window_order, rect_violates_constraints, rects_are_close,
+        shift_within_order, swap_window_order, WindowConstraints,
     };
     use crate::config::{Config, PanelConfig};
     use windows::Win32::Foundation::RECT;
@@ -1671,6 +1782,30 @@ mod tests {
         let mut order = vec![10, 20, 30];
         reconcile_window_order(&mut order, &[40, 30, 10], |key| key != 20);
         assert_eq!(order, vec![10, 30, 40]);
+    }
+
+    #[test]
+    fn promoting_moves_a_window_to_the_master_slot_without_reordering_the_rest() {
+        let mut order = vec![10, 20, 30, 40];
+        assert!(promote_in_order(&mut order, 30));
+        assert_eq!(order, vec![30, 10, 20, 40]);
+        // Already master: nothing to do, and the caller must not retile.
+        assert!(!promote_in_order(&mut order, 30));
+        assert!(!promote_in_order(&mut order, 99), "unknown window");
+    }
+
+    #[test]
+    fn shifting_steps_one_place_and_stops_at_the_ends() {
+        let mut order = vec![10, 20, 30];
+        assert!(shift_within_order(&mut order, 20, 1));
+        assert_eq!(order, vec![10, 30, 20]);
+        assert!(shift_within_order(&mut order, 20, -1));
+        assert_eq!(order, vec![10, 20, 30]);
+        // At the ends the move is refused rather than wrapping, so a repeated
+        // key does not cycle a window around the layout unexpectedly.
+        assert!(!shift_within_order(&mut order, 10, -1));
+        assert!(!shift_within_order(&mut order, 30, 1));
+        assert_eq!(order, vec![10, 20, 30]);
     }
 
     #[test]
