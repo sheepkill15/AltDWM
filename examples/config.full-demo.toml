@@ -57,6 +57,10 @@ widgets = [
     "layout",
     "window_list",
     "cpu",
+    "input",
+    "volume",
+    "network",
+    "battery",
     "tray",
     "clock",
 ]
@@ -87,6 +91,28 @@ name = "clock"
 format = "%H:%M"
 interval = 500
 width = 136
+
+# System status. Each of these opens quick settings on click; volume also
+# responds to the scroll wheel, and the input indicator cycles layouts.
+[[widgets]]
+type = "input"
+name = "input"
+width = 56
+
+[[widgets]]
+type = "volume"
+name = "volume"
+width = 84
+
+[[widgets]]
+type = "network"
+name = "network"
+width = 132
+
+[[widgets]]
+type = "battery"
+name = "battery"
+width = 92
 
 [[widgets]]
 type = "custom"
@@ -149,6 +175,31 @@ description = "Floating layout"
 keys = "Alt+Shift+S"
 action = 'set_layout("spiral")'
 description = "Rhai custom layout"
+
+[[keybinds]]
+keys = "Alt+Shift+A"
+action = "quick_settings"
+description = "Open quick settings"
+
+[[keybinds]]
+keys = "Alt+Shift+L"
+action = "cycle_input"
+description = "Cycle keyboard layout"
+
+[[keybinds]]
+keys = "Alt+Shift+Up"
+action = "volume_up"
+description = "Volume up"
+
+[[keybinds]]
+keys = "Alt+Shift+Down"
+action = "volume_down"
+description = "Volume down"
+
+[[keybinds]]
+keys = "Alt+Shift+0"
+action = "toggle_mute"
+description = "Toggle mute"
 
 [[keybinds]]
 keys = "Alt+Shift+C"

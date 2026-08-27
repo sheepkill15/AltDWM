@@ -52,6 +52,9 @@ widgets = [
     "layout",
     "window_list",
     "cpu",
+    "input",
+    "volume",
+    "network",
     "tray",
     "clock",
 ]

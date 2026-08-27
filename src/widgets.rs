@@ -168,6 +168,11 @@ pub trait Widget: Send + Sync {
     fn on_click(&self, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> Option<String> {
         None
     }
+    /// Handle a mouse wheel notch over the widget. `delta` is +1 for a scroll
+    /// away from the user and -1 towards. Returning true consumes the event.
+    fn on_scroll(&self, _delta: i32, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> bool {
+        false
+    }
     fn hover_paint(&self) -> HoverPaint {
         HoverPaint::None
     }
@@ -860,14 +865,255 @@ impl Widget for LauncherWidget {
             ctx.theme.text_color(),
         );
     }
-    fn on_click(&self, _point: (i32, i32), _rect: RECT, ctx: &PanelCtx) -> Option<String> {
+    fn on_click(&self, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> Option<String> {
         // A configured action remains an escape hatch for launch-only widgets;
         // the built-in launcher opens AltDWM's discoverable command surface.
-        if let Some(action) = self.cfg.action.clone().or_else(|| self.cfg.command.clone()) {
-            return Some(action);
+        // Returned rather than opened here, so the panel dispatches it with no
+        // lock held — showing a window pumps messages.
+        Some(
+            self.cfg
+                .action
+                .clone()
+                .or_else(|| self.cfg.command.clone())
+                .unwrap_or_else(|| "command_center".into()),
+        )
+    }
+}
+
+/// A label with a leading status mark, which is the shape every system-status
+/// widget in the bar shares.
+fn draw_status(
+    hdc: HDC,
+    rect: RECT,
+    ctx: &PanelCtx,
+    mark: COLORREF,
+    primary: &str,
+    secondary: Option<&str>,
+) {
+    let body = inset_rect(content_rect(rect, ctx), ctx.px(token::PAD), 0);
+    let mark_width = draw_mark(hdc, &body, ctx, mark);
+    let text = RECT {
+        left: body.left + mark_width + ctx.px(8),
+        ..body
+    };
+    match secondary {
+        Some(secondary) if rect_height(&body) >= ctx.px(34) => {
+            let split = text.top + rect_height(&text) * 55 / 100;
+            draw_label(
+                hdc,
+                &RECT {
+                    bottom: split,
+                    ..text
+                },
+                primary,
+                ctx.strong_font(),
+                ctx.theme.text_color(),
+            );
+            draw_label(
+                hdc,
+                &RECT { top: split, ..text },
+                secondary,
+                ctx.small_font(),
+                ctx.theme.text_dim_color(),
+            );
         }
-        crate::command_center::toggle(ctx.hwnd);
+        _ => draw_label(hdc, &text, primary, ctx.body_font(), ctx.theme.text_color()),
+    }
+}
+
+/// Speaker level and mute state. Scrolling over it changes the volume; clicking
+/// opens quick settings, which is where the slider lives.
+pub struct VolumeWidget {
+    pub cfg: WidgetConfig,
+}
+
+impl Widget for VolumeWidget {
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+    fn kind(&self) -> &'static str {
+        "volume"
+    }
+    fn width(&self, _ctx: &PanelCtx) -> i32 {
+        self.cfg.width.unwrap_or(86)
+    }
+    fn hover_paint(&self) -> HoverPaint {
+        HoverPaint::Whole
+    }
+    fn interval_ms(&self) -> Option<u32> {
+        Some(self.cfg.interval.unwrap_or(1000))
+    }
+    fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
+        let volume = crate::system::status().volume;
+        let (mark, primary, secondary) = match volume {
+            Some(volume) if volume.muted => (
+                ctx.theme.text_dim_color(),
+                "Muted".to_string(),
+                Some("Volume".to_string()),
+            ),
+            Some(volume) => (
+                ctx.theme.accent_active_color(),
+                format!("{}%", volume.percent()),
+                Some("Volume".to_string()),
+            ),
+            None => (
+                ctx.theme.text_dim_color(),
+                "—".to_string(),
+                Some("No output".to_string()),
+            ),
+        };
+        draw_status(hdc, rect, ctx, mark, &primary, secondary.as_deref());
+    }
+    fn on_click(&self, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> Option<String> {
+        Some("quick_settings".into())
+    }
+    fn on_scroll(&self, delta: i32, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> bool {
+        crate::system::adjust_volume(delta as f32 * 0.05);
+        true
+    }
+}
+
+/// Charge level and whether the machine is running on mains.
+pub struct BatteryWidget {
+    pub cfg: WidgetConfig,
+}
+
+impl Widget for BatteryWidget {
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+    fn kind(&self) -> &'static str {
+        "battery"
+    }
+    fn width(&self, _ctx: &PanelCtx) -> i32 {
+        self.cfg.width.unwrap_or(92)
+    }
+    fn hover_paint(&self) -> HoverPaint {
+        HoverPaint::Whole
+    }
+    fn interval_ms(&self) -> Option<u32> {
+        Some(self.cfg.interval.unwrap_or(2000))
+    }
+    fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
+        let Some(battery) = crate::system::status().battery else {
+            draw_status(
+                hdc,
+                rect,
+                ctx,
+                ctx.theme.text_dim_color(),
+                "AC",
+                Some("No battery"),
+            );
+            return;
+        };
+        let percent = battery.percent.unwrap_or(0);
+        // Low charge on battery is the one state worth colouring differently.
+        let mark = if battery.charging || battery.on_ac {
+            ctx.theme.accent_active_color()
+        } else if percent <= 15 {
+            ctx.theme.color("#e06c5a")
+        } else {
+            ctx.theme.text_color()
+        };
+        let primary = battery
+            .percent
+            .map(|percent| format!("{percent}%"))
+            .unwrap_or_else(|| "—".into());
+        let secondary = if battery.charging {
+            "Charging".to_string()
+        } else if battery.on_ac {
+            "Plugged in".to_string()
+        } else if let Some(minutes) = battery.minutes_remaining {
+            format!("{}h {:02}m", minutes / 60, minutes % 60)
+        } else {
+            "On battery".to_string()
+        };
+        draw_status(hdc, rect, ctx, mark, &primary, Some(&secondary));
+    }
+    fn on_click(&self, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> Option<String> {
+        Some("quick_settings".into())
+    }
+}
+
+/// Connection name and signal.
+pub struct NetworkWidget {
+    pub cfg: WidgetConfig,
+}
+
+impl Widget for NetworkWidget {
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+    fn kind(&self) -> &'static str {
+        "network"
+    }
+    fn width(&self, _ctx: &PanelCtx) -> i32 {
+        self.cfg.width.unwrap_or(140)
+    }
+    fn hover_paint(&self) -> HoverPaint {
+        HoverPaint::Whole
+    }
+    fn interval_ms(&self) -> Option<u32> {
+        Some(self.cfg.interval.unwrap_or(2000))
+    }
+    fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
+        use crate::system::NetworkStatus;
+        let status = crate::system::status().network;
+        let (mark, secondary) = match &status {
+            NetworkStatus::WiFi { signal, .. } => (
+                ctx.theme.accent_active_color(),
+                format!("Wi-Fi · {signal}%"),
+            ),
+            NetworkStatus::Wired => (ctx.theme.accent_active_color(), "Connected".to_string()),
+            NetworkStatus::Offline => (ctx.theme.color("#e06c5a"), "No connection".to_string()),
+            NetworkStatus::Unknown => (ctx.theme.text_dim_color(), "Unknown".to_string()),
+        };
+        draw_status(hdc, rect, ctx, mark, &status.label(), Some(&secondary));
+    }
+    fn on_click(&self, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> Option<String> {
+        Some("quick_settings".into())
+    }
+}
+
+/// Active keyboard layout. Clicking cycles through the installed layouts.
+pub struct InputWidget {
+    pub cfg: WidgetConfig,
+}
+
+impl Widget for InputWidget {
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+    fn kind(&self) -> &'static str {
+        "input"
+    }
+    fn width(&self, _ctx: &PanelCtx) -> i32 {
+        self.cfg.width.unwrap_or(62)
+    }
+    fn hover_paint(&self) -> HoverPaint {
+        HoverPaint::Whole
+    }
+    fn interval_ms(&self) -> Option<u32> {
+        // The layout changes with the foreground window, so this is polled
+        // rather than pushed.
+        Some(self.cfg.interval.unwrap_or(500))
+    }
+    fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
+        let layout = crate::input::current();
+        let tag = layout
+            .as_ref()
+            .map(|layout| layout.tag.clone())
+            .unwrap_or_else(|| "--".into());
+        let body = inset_rect(content_rect(rect, ctx), ctx.px(token::PAD), 0);
+        draw_label(hdc, &body, &tag, ctx.strong_font(), ctx.theme.text_color());
+    }
+    fn on_click(&self, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> Option<String> {
+        crate::input::cycle();
         None
+    }
+    fn on_scroll(&self, _delta: i32, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> bool {
+        crate::input::cycle();
+        true
     }
 }
 
@@ -1017,6 +1263,10 @@ pub fn create_widget(cfg: &WidgetConfig) -> Box<dyn Widget> {
             Box::new(WorkspacesWidget { cfg: cfg.clone() })
         }
         "launcher" | "start" => Box::new(LauncherWidget { cfg: cfg.clone() }),
+        "volume" | "audio" => Box::new(VolumeWidget { cfg: cfg.clone() }),
+        "battery" | "power" => Box::new(BatteryWidget { cfg: cfg.clone() }),
+        "network" | "wifi" => Box::new(NetworkWidget { cfg: cfg.clone() }),
+        "input" | "keyboard" | "language" => Box::new(InputWidget { cfg: cfg.clone() }),
         "custom" => Box::new(CustomWidget {
             cfg: cfg.clone(),
             state: Mutex::new(CustomState::default()),

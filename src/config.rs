@@ -616,7 +616,7 @@ pub fn ensure_default_bar(cfg: &mut Config) {
 pub fn builtin_widget_config(name: &str) -> Option<WidgetConfig> {
     let widget_type = match name {
         "spacer" | "workspaces" | "layout" | "window_title" | "tray" | "clock" | "launcher"
-        | "window_list" => name,
+        | "window_list" | "volume" | "battery" | "network" | "input" => name,
         _ => return None,
     };
     Some(WidgetConfig {

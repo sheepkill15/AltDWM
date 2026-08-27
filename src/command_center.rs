@@ -54,6 +54,8 @@ enum CommandAction {
     Reload,
     ToggleTiling,
     Layout(&'static str),
+    QuickSettings,
+    RefreshApps,
 }
 
 #[derive(Clone, Copy)]
@@ -129,7 +131,73 @@ const ITEMS: &[CommandItem] = &[
         keywords: "layout fullscreen single focus",
         action: CommandAction::Layout("Monocle"),
     },
+    CommandItem {
+        badge: "QS",
+        title: "Quick settings",
+        description: "Volume, brightness, network, and battery",
+        keywords: "sound audio wifi bluetooth power display input language",
+        action: CommandAction::QuickSettings,
+    },
+    CommandItem {
+        badge: "AP",
+        title: "Rescan applications",
+        description: "Rebuild the app index after installing something",
+        keywords: "apps refresh reindex search launcher",
+        action: CommandAction::RefreshApps,
+    },
 ];
+
+/// One row of the result list: either a built-in command or an installed
+/// application. Commands are offered first because they are few and named
+/// exactly; applications fill the rest of the list.
+enum ResultRow {
+    Command(usize),
+    App(crate::apps::AppEntry),
+}
+
+impl ResultRow {
+    fn badge(&self) -> String {
+        match self {
+            ResultRow::Command(index) => ITEMS[*index].badge.to_string(),
+            ResultRow::App(entry) => entry
+                .name
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .take(2)
+                .collect::<String>()
+                .to_uppercase(),
+        }
+    }
+
+    fn title(&self) -> String {
+        match self {
+            ResultRow::Command(index) => ITEMS[*index].title.to_string(),
+            ResultRow::App(entry) => entry.name.clone(),
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            ResultRow::Command(index) => ITEMS[*index].description.to_string(),
+            ResultRow::App(entry) => describe_app(entry),
+        }
+    }
+}
+
+/// A short, honest hint about what an indexed entry actually is.
+fn describe_app(entry: &crate::apps::AppEntry) -> String {
+    if entry.id.contains('!') {
+        return "Store app".into();
+    }
+    if let Some(scheme) = entry.id.split_once("://") {
+        return format!("{} link", scheme.0);
+    }
+    let tail = entry.id.rsplit(['\\', '/']).next().unwrap_or(&entry.id);
+    if tail.eq_ignore_ascii_case(&entry.name) {
+        return "Application".into();
+    }
+    tail.to_string()
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum CenterView {
@@ -148,6 +216,17 @@ struct CenterState {
 
 static STATE: LazyLock<Mutex<CenterState>> = LazyLock::new(|| Mutex::new(CenterState::default()));
 
+/// Repaint the command center if it is open. Called when the application index
+/// finishes building, so results appear as soon as they are available.
+pub fn invalidate() {
+    let hwnd = STATE.lock().unwrap_or_else(|error| error.into_inner()).hwnd;
+    if hwnd != 0 {
+        unsafe {
+            let _ = InvalidateRect(Some(HWND(hwnd as *mut std::ffi::c_void)), None, false);
+        }
+    }
+}
+
 fn matching_indices(query: &str) -> Vec<usize> {
     let needle = query.trim().to_lowercase();
     ITEMS
@@ -161,6 +240,27 @@ fn matching_indices(query: &str) -> Vec<usize> {
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+/// The rows to show for `query`: matching built-in commands, then the best
+/// matching installed applications, capped at what the list can display.
+fn results(query: &str) -> Vec<ResultRow> {
+    let mut rows: Vec<ResultRow> = matching_indices(query)
+        .into_iter()
+        .map(ResultRow::Command)
+        .collect();
+    // With no query the palette shows its own commands; applications appear as
+    // soon as the user starts typing, which is when they are being searched for.
+    if !query.trim().is_empty() && rows.len() < MAX_VISIBLE_ITEMS {
+        let room = MAX_VISIBLE_ITEMS - rows.len();
+        rows.extend(
+            crate::apps::search(query, room)
+                .into_iter()
+                .map(ResultRow::App),
+        );
+    }
+    rows.truncate(MAX_VISIBLE_ITEMS);
+    rows
 }
 
 fn fill_rect(hdc: HDC, rect: RECT, color: COLORREF) {
@@ -258,10 +358,12 @@ unsafe fn paint(hwnd: HWND) {
         bottom: caret_top + caret_side,
     };
     fill_round_rect(hdc, caret, caret_side / 2, theme.accent_active_color());
-    let search_text = if query.is_empty() {
-        "Search apps, layouts, and actions…"
+    let search_text = if !query.is_empty() {
+        query.as_str()
+    } else if crate::apps::is_ready() {
+        "Search applications, layouts, and actions…"
     } else {
-        &query
+        "Indexing applications…"
     };
     let search_color = if query.is_empty() {
         theme.text_dim_color()
@@ -281,14 +383,12 @@ unsafe fn paint(hwnd: HWND) {
     );
 
     let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    let matches = matching_indices(&state.query);
-    let selected = state.selected.min(matches.len().saturating_sub(1));
+    let rows = results(&state.query);
+    let selected = state.selected.min(rows.len().saturating_sub(1));
     drop(state);
 
     let item_height = px(ITEM_HEIGHT);
-    let visible = matches.iter().take(MAX_VISIBLE_ITEMS);
-    for (row, item_index) in visible.enumerate() {
-        let item = ITEMS[*item_index];
+    for (row, item) in rows.iter().enumerate() {
         let top = px(ITEM_TOP) + row as i32 * item_height;
         let row_rect = RECT {
             left: px(18),
@@ -322,7 +422,7 @@ unsafe fn paint(hwnd: HWND) {
                 left: badge_rect.left + px(10),
                 ..badge_rect
             },
-            item.badge,
+            &item.badge(),
             badge_font,
             theme.text_color(),
         );
@@ -336,7 +436,7 @@ unsafe fn paint(hwnd: HWND) {
                 right: row_rect.right - px(12),
                 bottom: split,
             },
-            item.title,
+            &item.title(),
             body_font,
             theme.text_color(),
         );
@@ -348,13 +448,13 @@ unsafe fn paint(hwnd: HWND) {
                 right: row_rect.right - px(12),
                 bottom: row_rect.bottom - px(4),
             },
-            item.description,
+            &item.description(),
             small_font,
             theme.text_dim_color(),
         );
     }
 
-    if matches.is_empty() {
+    if rows.is_empty() {
         let empty = RECT {
             left: px(30),
             top: px(ITEM_TOP),
@@ -364,10 +464,19 @@ unsafe fn paint(hwnd: HWND) {
         label(
             hdc,
             empty,
-            "No matching commands",
+            "No matches",
             body_font,
             theme.text_color(),
         );
+        let hint = if crate::apps::is_ready() {
+            format!(
+                "Searched {} commands and {} applications.",
+                ITEMS.len(),
+                crate::apps::count()
+            )
+        } else {
+            "Still indexing applications…".to_string()
+        };
         label(
             hdc,
             RECT {
@@ -375,7 +484,7 @@ unsafe fn paint(hwnd: HWND) {
                 bottom: empty.bottom + px(24),
                 ..empty
             },
-            "Try “files”, “layout”, or “reload”.",
+            &hint,
             small_font,
             theme.text_dim_color(),
         );
@@ -513,6 +622,8 @@ fn paint_shortcuts(
 fn run_action(action: CommandAction) {
     match action {
         CommandAction::ShowShortcuts => {}
+        CommandAction::QuickSettings => crate::quick_settings::toggle(),
+        CommandAction::RefreshApps => crate::apps::refresh(),
         CommandAction::Launch(command) => {
             crate::scripting::dispatch_action(&format!("launch('{command}')"));
         }
@@ -532,12 +643,32 @@ fn run_action(action: CommandAction) {
 }
 
 fn invoke_selected(hwnd: HWND) {
-    let action = {
+    enum Chosen {
+        Command(CommandAction),
+        App(crate::apps::AppEntry),
+    }
+    let chosen = {
         let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
-        let matches = matching_indices(&state.query);
-        matches
-            .get(state.selected.min(matches.len().saturating_sub(1)))
-            .map(|index| ITEMS[*index].action)
+        let rows = results(&state.query);
+        let index = state.selected.min(rows.len().saturating_sub(1));
+        match rows.into_iter().nth(index) {
+            Some(ResultRow::Command(item)) => Some(Chosen::Command(ITEMS[item].action)),
+            Some(ResultRow::App(entry)) => Some(Chosen::App(entry)),
+            None => None,
+        }
+    };
+    let action = match chosen {
+        Some(Chosen::App(entry)) => {
+            // Close first: launching can take a moment, and leaving the palette
+            // on screen over the new window looks like it failed.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            crate::apps::launch(&entry);
+            return;
+        }
+        Some(Chosen::Command(action)) => Some(action),
+        None => None,
     };
     if let Some(action) = action {
         if matches!(action, CommandAction::ShowShortcuts) {
@@ -613,7 +744,7 @@ unsafe extern "system" fn wndproc(
                 }
                 KEY_UP | KEY_DOWN => {
                     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
-                    let count = matching_indices(&state.query).len().min(MAX_VISIBLE_ITEMS);
+                    let count = results(&state.query).len();
                     if count > 0 {
                         if wparam.0 as u16 == KEY_UP {
                             state.selected = state.selected.checked_sub(1).unwrap_or(count - 1);
@@ -644,7 +775,7 @@ unsafe extern "system" fn wndproc(
                 let row = ((y - item_top) / item_height) as usize;
                 let count = {
                     let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
-                    matching_indices(&state.query).len().min(MAX_VISIBLE_ITEMS)
+                    results(&state.query).len()
                 };
                 if row < count {
                     STATE
@@ -726,6 +857,9 @@ struct Placement {
 }
 
 pub fn toggle(anchor: HWND) {
+    // Idempotent: covers the case where indexing failed or has not run yet, so
+    // opening the palette a second time can still recover the app list.
+    crate::apps::begin_indexing();
     let existing = STATE.lock().unwrap_or_else(|error| error.into_inner()).hwnd;
     if existing != 0 {
         unsafe {

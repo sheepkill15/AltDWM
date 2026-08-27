@@ -1,12 +1,16 @@
+mod apps;
 mod command_center;
 mod config;
 mod focus;
+mod input;
 mod layout;
 mod manager;
 mod panel;
 mod rules;
 mod scripting;
+mod quick_settings;
 mod shell;
+mod system;
 mod theme;
 mod tray;
 mod ui;
@@ -560,6 +564,8 @@ Options:
   --config <path>     Use explicit config.toml path
   --generate-config   Write example config to default path and exit
   --check-config      Validate config and exit
+  --list-apps [q]     List indexed applications (optionally matching a query)
+  --status            Print live system state (audio, power, network, input)
   --no-taskbar        Disable taskbar/panels (only tiling)
   --gap <px>          Override gap (default from config)
   --layout <name>     Override layout: masterstack, grid, monocle, floating
@@ -588,6 +594,105 @@ fn do_generate_config(explicit: Option<&std::path::Path>) {
             eprintln!("Failed to generate config: {}", e);
             std::process::exit(1);
         }
+    }
+    std::process::exit(0);
+}
+
+/// Print what the system readers actually see.
+///
+/// Each of volume, brightness, network, and battery is optional, and a machine
+/// that cannot report one is indistinguishable from a bug in the reader unless
+/// there is a way to look.
+fn do_status() {
+    // The worker polls on an interval; give it one cycle to publish.
+    system::refresh();
+    let mut status = system::status();
+    for _ in 0..40 {
+        if status != Default::default() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        status = system::status();
+    }
+    println!("audio      {}", match status.volume {
+        Some(volume) if volume.muted => format!("{}% (muted)", volume.percent()),
+        Some(volume) => format!("{}%", volume.percent()),
+        None => "unavailable (no default render endpoint)".into(),
+    });
+    println!("brightness {}", match status.brightness {
+        Some(brightness) => format!("{}%", brightness.percent),
+        None => "unavailable (no monitor answered DDC/CI)".into(),
+    });
+    println!("network    {:?}", status.network);
+    println!("wifi radio {}", match status.wifi_radio_on {
+        Some(true) => "on".into(),
+        Some(false) => "off".into(),
+        None => "no wlan interface".to_string(),
+    });
+    println!("battery    {}", match status.battery {
+        Some(battery) => format!(
+            "{}{}{}",
+            battery
+                .percent
+                .map(|percent| format!("{percent}%"))
+                .unwrap_or_else(|| "unknown".into()),
+            if battery.charging {
+                " charging"
+            } else if battery.on_ac {
+                " on ac"
+            } else {
+                " discharging"
+            },
+            battery
+                .minutes_remaining
+                .map(|minutes| format!(" {}h{:02}m left", minutes / 60, minutes % 60))
+                .unwrap_or_default()
+        ),
+        None => "no battery".into(),
+    });
+    let layouts = input::installed();
+    println!(
+        "keyboard   {} ({} installed: {})",
+        input::current()
+            .map(|layout| layout.name)
+            .unwrap_or_else(|| "unknown".into()),
+        layouts.len(),
+        layouts
+            .iter()
+            .map(|layout| layout.tag.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    std::process::exit(0);
+}
+
+/// Print the application index, so a launcher problem can be told apart from a
+/// search-ranking problem without guessing.
+fn do_list_apps(query: &str) {
+    apps::begin_indexing();
+    for _ in 0..200 {
+        if apps::is_ready() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !apps::is_ready() {
+        eprintln!("application index did not finish in time");
+        std::process::exit(1);
+    }
+    let matches = apps::search(query, 200);
+    if query.is_empty() {
+        println!("{} applications indexed", apps::count());
+    } else {
+        println!(
+            "{} of {} applications match '{}', best first",
+            matches.len(),
+            apps::count(),
+            query
+        );
+    }
+    for entry in matches {
+        println!("  {:<44}  {}", entry.name, entry.id);
     }
     std::process::exit(0);
 }
@@ -810,6 +915,11 @@ fn main() {
             }
             "--generate-config" => do_generate = true,
             "--check-config" => do_check = true,
+            "--list-apps" => {
+                let query = iter.next().cloned().unwrap_or_default();
+                do_list_apps(&query);
+            }
+            "--status" => do_status(),
             "--replace-shell" => {
                 let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("alt-dwm.exe"));
                 println!("\nTo REPLACE explorer.exe (shell) with AltDWM:");
@@ -905,6 +1015,10 @@ fn main() {
             }
         }
     }
+
+    // The application index backs the command center's search. Building it
+    // takes a moment, so it starts now rather than on the first keystroke.
+    apps::begin_indexing();
 
     // hotkeys — dynamic from config.toml [[keybinds]]
     register_keybinds(&cfg);
@@ -1044,6 +1158,7 @@ fn main() {
         }
         panel::destroy_panels();
         command_center::close();
+        quick_settings::close();
         release_borrowed_system_state();
         let _ = host_hwnd;
         let _ = panel_handles;

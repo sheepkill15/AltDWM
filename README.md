@@ -16,11 +16,13 @@ Tested on Windows 11, 2 monitors, Rust 1.98 + `windows` 0.61.
 - **Coherent native shell bar** (`src/panel.rs`, `src/widgets.rs`): a rounded per-display bar with hover feedback, a live/clickable layout capsule, real application icons, active/minimized window states, overflow counts, compact system status, and a two-line clock.
 - **Constraint-aware window policy** (`src/manager.rs`, `src/rules.rs`): explicit floating rules win; owned/modal/fixed-size utilities float automatically; windows whose minimum tracking size cannot fit their proposed tile are floated and clamped inside the usable monitor area. `floating=false` forces a matching window back into tiling.
 - **Focused window borders**: DWM border colors update on foreground changes without retiling. Configure `theme.border_active` and `theme.border_inactive` independently.
-- **Searchable command center** (`src/command_center.rs`): open it from the AltDWM button or `Alt+Shift+Space`; type to filter, use arrows to select, view every successfully registered shortcut, and launch apps, edit/reload configuration, pause tiling, or change layouts without memorizing commands.
+- **Searchable command center** (`src/command_center.rs`): open it from the AltDWM button or `Alt+Shift+Space`; type to filter across both AltDWM's own commands and every installed application, use arrows to select, view every successfully registered shortcut, and launch apps, open quick settings, edit/reload configuration, pause tiling, or change layouts without memorizing commands.
 - **Declarative panels DSL** (`src/config.rs:16`, `docs/EXTENSIBILITY.md`): TOML `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`. Multiple bars remain supported, while generated and example configs now start with one polished shell bar.
-- **Widgets** (`src/widgets.rs` trait): `clock`, live `layout`/`workspaces` status, `window_list` (including minimized windows; click to focus/minimize/restore), `window_title`, Explorer-backed clickable `tray`, `spacer`, `launcher`, and Rhai `custom` status widgets.
+- **Widgets** (`src/widgets.rs` trait): `clock`, live `layout`/`workspaces` status, `window_list` (including minimized windows; click to focus/minimize/restore), `window_title`, Explorer-backed clickable `tray`, `volume` (scroll to change), `battery`, `network`, `input` (click to cycle keyboard layout), `spacer`, `launcher`, and Rhai `custom` status widgets.
+- **System status and quick settings** (`src/system.rs`, `src/quick_settings.rs`): volume through Core Audio, battery through `GetSystemPowerStatus`, connection and Wi-Fi radio through the WLAN API and `INetworkListManager`, brightness through DDC/CI, keyboard layout through `GetKeyboardLayoutList`. All polled on a worker thread and published as a snapshot, so no status call ever runs in a paint handler. The flyout offers volume and brightness sliders, mute and Wi-Fi toggles, and a layout switcher; what AltDWM cannot own end to end opens the matching `ms-settings:` page. `--status` prints exactly what the readers see.
+- **Application search** (`src/apps.rs`): `shell:AppsFolder` is indexed on a worker thread at startup, covering desktop and Store apps together. Search is tiered — exact, prefix, word start, initials (`vsc` → *Visual Studio Code*), substring, then a word-anchored fuzzy pass — and launching goes through `shell:AppsFolder\<AppUserModelID>`. `--list-apps [query]` shows the index and its ranking.
 - **Panels** (`src/panel.rs:47`): Each `[[panels]]` is a `WS_POPUP|WS_EX_TOPMOST` window (`AltDWM_Panel` class), flex layout for widgets, 1s + 250ms timers, click → `scripting::dispatch_action`.
-- **Scripting** (`src/scripting.rs:8`): Embedded, resource-limited `rhai` 1.26 engine. Exposes `launch(cmd)`, `log(msg)`, live `get_cpu_usage()`/`get_mem_usage()`, `window_count()`, `focused_title()`, `retile()`, `set_layout(name)`, focus and monitor movement. Scripts are trusted local configuration—not a security boundary—because command execution is intentionally exposed.
+- **Scripting** (`src/scripting.rs:8`): Embedded, resource-limited `rhai` 1.26 engine. Exposes `launch(cmd)`, `log(msg)`, live `get_cpu_usage()`/`get_mem_usage()`, `window_count()`, `focused_title()`, `retile()`, `set_layout(name)`, focus and monitor movement, plus `quick_settings()`, `cycle_input()`, `get_volume()`/`set_volume()`/`adjust_volume()`/`toggle_mute()`, `get_brightness()`/`set_brightness()`, `get_battery()`, and `network_name()`. An action shaped like a call is evaluated as a script; a bare word is a named verb; anything else is launched as a program. Scripts are trusted local configuration—not a security boundary—because command execution is intentionally exposed.
 - **Config** (`src/config.rs:109`): Search `exe_dir/config.toml` → `%APPDATA%/AltDWM/config.toml` → `./config.toml`. `general`+`ignore` + `panels/widgets/rules/keybinds/layouts` with `flatten` extras for easy extend. `--config`, `--generate-config`, `--check-config`, `Alt+Shift+C` hot-reload (configurable, `Win+Shift` collides with system e.g. `Win+Shift+S` = Snipping Tool). `validate()` warns on bad panels.
 - **Native taskbar ownership**: `general.hide_native_taskbar=true` hides Explorer taskbars on every monitor, re-hides them if Explorer recreates them, removes their stale work-area reservation, and restores them when AltDWM exits.
 - **Hotkeys** (`src/main.rs`): Dynamic `RegisterHotKey` from `[[keybinds]]` (default `Alt+Shift+Space` command center; `R` retile, `T` toggle, `Q` quit, `G/M/F/S` layouts, `C` reload, `J/K` focus, `Y` floating, `N/P` move monitor).
@@ -35,6 +37,8 @@ cargo run -- --no-taskbar --gap 12 --layout grid     # tiling only, no bar
 cargo run -- --config ./examples/config.example.toml  # panels DSL demo
 cargo run -- --generate-config   # writes %APPDATA%/AltDWM/config.toml
 cargo run -- --check-config      # validate
+cargo run -- --status            # live audio/power/network/input readings
+cargo run -- --list-apps code    # application index and search ranking
 
 # command center: Alt+Shift+Space; other hotkeys are configurable in [[keybinds]]
 ```
@@ -104,6 +108,10 @@ src/manager.rs   # collect_windows, tile_windows_reserved(top,bottom), fit-aware
 src/layout.rs    # MasterStack/Grid/Monocle/Floating + compute_layout
 src/panel.rs     # AltDWM_Panel — declarative panels from config, per-monitor DPI
 src/ui.rs        # shared drawing: DPI scale, measured text, tokens
+src/system.rs    # audio/power/network/brightness poller + commands
+src/quick_settings.rs # volume/brightness/network/input control flyout
+src/input.rs     # keyboard layout reporting and switching
+src/apps.rs      # shell:AppsFolder index, ranked search, launch
 src/widgets.rs   # Widget trait + clock/layout/tasklist/tray/launcher/custom
 src/shell.rs     # reversible Explorer taskbar ownership
 src/tray.rs      # Explorer notification-area discovery/invocation bridge

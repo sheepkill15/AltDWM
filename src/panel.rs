@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -17,8 +18,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TR
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::config::{Config, PanelConfig};
@@ -67,7 +68,11 @@ pub fn first_handle() -> Option<HWND> {
 pub struct Panel {
     pub cfg: PanelConfig,
     pub hwnd: HWND,
-    pub widgets: Vec<Box<dyn Widget>>,
+    /// Behind `Arc` so a hit widget can be cloned out and invoked *after* the
+    /// panel collection is unlocked. Opening the command center or quick
+    /// settings from a click pumps messages, which can re-enter `WM_PAINT` on
+    /// this same thread — and that would deadlock on a lock still held.
+    pub widgets: Vec<Arc<dyn Widget>>,
     pub background: COLORREF,
     /// Monitor this panel belongs to, kept so the panel can be re-placed after a
     /// DPI or resolution change without rebuilding the whole configuration.
@@ -300,35 +305,38 @@ unsafe extern "system" fn panel_wndproc(
             // The action is resolved under the lock and dispatched after it is
             // released. Dispatching while holding the panel collection would
             // deadlock the moment an action touched the panels themselves.
-            let mut pending: Option<(String, String, String)> = None;
-            let snapshot = crate::manager::window_snapshot();
-            if let Some(panel_arc) = panel_collection() {
-                let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(panel) = panels.iter().find(|panel| panel.hwnd == hwnd) {
-                    let mut rect = RECT::default();
-                    let _ = GetClientRect(hwnd, &mut rect);
-                    let ctx = build_ctx(panel, rect, hwnd, snapshot);
-                    let rects = widget_rects(panel, rect, &ctx);
-                    for (widget, item) in panel.widgets.iter().zip(rects) {
-                        if !ui::point_in_rect(point.0, point.1, &item) {
-                            continue;
-                        }
-                        if let Some(action) = widget.on_click(point, item, &ctx) {
-                            pending = Some((
-                                panel.cfg.name.clone(),
-                                widget.name().to_string(),
-                                action,
-                            ));
-                        }
-                        break;
-                    }
+            // Resolve which widget was hit under the lock, then release it
+            // before invoking anything: a widget may open a window, set the
+            // foreground window, or run a script, all of which pump messages.
+            let hit = resolve_hit(hwnd, point);
+            if let Some((panel_name, widget, item, ctx)) = hit {
+                if let Some(action) = widget.on_click(point, item, &ctx) {
+                    println!(
+                        "[panel {panel_name}] widget '{}' click -> {action}",
+                        widget.name()
+                    );
+                    crate::scripting::dispatch_action(&action);
                 }
             }
-            if let Some((panel_name, widget_name, action)) = pending {
-                println!("[panel {panel_name}] widget '{widget_name}' click -> {action}");
-                crate::scripting::dispatch_action(&action);
-            }
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            // Wheel messages carry screen coordinates, unlike the button and
+            // move messages.
+            let mut origin = RECT::default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut origin);
+            let (screen_x, screen_y) = client_point(lparam);
+            let point = (screen_x - origin.left, screen_y - origin.top);
+            let notches = ((wparam.0 >> 16) & 0xFFFF) as i16;
+            let delta = if notches > 0 { 1 } else { -1 };
+            let handled = match resolve_hit(hwnd, point) {
+                Some((_, widget, item, ctx)) => widget.on_scroll(delta, point, item, &ctx),
+                None => false,
+            };
+            if handled {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+            }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -379,6 +387,32 @@ unsafe extern "system" fn panel_wndproc(
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// The widget under `point`, resolved and cloned out so the caller can invoke it
+/// with no lock held. Returns the owning panel's name for logging.
+fn resolve_hit(
+    hwnd: HWND,
+    point: (i32, i32),
+) -> Option<(String, Arc<dyn Widget>, RECT, PanelCtx)> {
+    // Gathered before the lock for the same reason as in WM_PAINT.
+    let snapshot = crate::manager::window_snapshot();
+    let panel_arc = panel_collection()?;
+    let panels = panel_arc.lock().unwrap_or_else(|e| e.into_inner());
+    let panel = panels.iter().find(|panel| panel.hwnd == hwnd)?;
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rect);
+    }
+    let ctx = build_ctx(panel, rect, hwnd, snapshot);
+    let rects = widget_rects(panel, rect, &ctx);
+    let name = panel.cfg.name.clone();
+    panel
+        .widgets
+        .iter()
+        .zip(rects)
+        .find(|(_, item)| ui::point_in_rect(point.0, point.1, item))
+        .map(|(widget, item)| (name, widget.clone(), item, ctx))
 }
 
 fn client_point(lparam: LPARAM) -> (i32, i32) {
@@ -606,12 +640,12 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
             let w = (rect.right - rect.left).max(1);
             let h = (rect.bottom - rect.top).max(1);
 
-            let mut widgets_inst: Vec<Box<dyn Widget>> = Vec::new();
+            let mut widgets_inst: Vec<Arc<dyn Widget>> = Vec::new();
             for wname in &pc.widgets {
                 if let Some(wcfg) = widget_map.get(wname) {
-                    widgets_inst.push(widgets::create_widget(wcfg));
+                    widgets_inst.push(Arc::from(widgets::create_widget(wcfg)));
                 } else if let Some(wcfg) = crate::config::builtin_widget_config(wname) {
-                    widgets_inst.push(widgets::create_widget(&wcfg));
+                    widgets_inst.push(Arc::from(widgets::create_widget(&wcfg)));
                 } else {
                     eprintln!(
                         "[panel] unknown widget '{}' for panel '{}' — custom fallback",
@@ -630,7 +664,7 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
                         width: Some(80),
                         extra: HashMap::new(),
                     };
-                    widgets_inst.push(widgets::create_widget(&wcfg));
+                    widgets_inst.push(Arc::from(widgets::create_widget(&wcfg)));
                 }
             }
             let hwnd = unsafe {

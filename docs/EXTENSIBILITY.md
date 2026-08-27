@@ -69,7 +69,28 @@ Built-ins (v0.3):
 | `tray`         | Clickable Explorer notification-area bridge; requires Explorer until a native shell receiver is implemented | `width`                      |
 | `spacer`       | Flexible gap                                                                  | `width` (`0` means flexible) |
 | `launcher`     | Opens the searchable AltDWM command center; an explicit action overrides it   | `label`, `icon`, `action`    |
+| `volume` / `audio` | Output level and mute state; scroll to change, click for quick settings   | `width`, `interval`          |
+| `battery` / `power` | Charge, charging state, and estimated time left                         | `width`, `interval`          |
+| `network` / `wifi` | Connection name and signal, or `Offline`                                 | `width`, `interval`          |
+| `input` / `keyboard` / `language` | Active keyboard layout; click or scroll to cycle           | `width`, `interval`          |
 | `custom`       | Rhai-drawn widget                                                             | `script`, `interval`         |
+
+System-status widgets read a snapshot published by a background poller
+(`src/system.rs`), never by calling Core Audio, WLAN, or DDC/CI from the paint
+handler. A capability the machine does not expose reports itself as unavailable
+rather than showing a dead control: laptop panels that answer brightness only
+through WMI, for example, are reported as such.
+
+### 2a) Quick settings
+
+`src/quick_settings.rs` is the shell's control flyout: volume and brightness
+sliders, mute and Wi-Fi radio toggles, network and battery status, and a
+keyboard-layout switcher. Open it with the `quick_settings` action, from any of
+the status widgets, or from the command center.
+
+Sliders respond to click, drag, and the scroll wheel. Rows that AltDWM cannot
+own end to end — choosing a Wi-Fi network, pairing Bluetooth — open the matching
+`ms-settings:` page instead of offering a partial implementation.
 
 Widget registry is extensible:
 
@@ -88,6 +109,13 @@ pub trait Widget: Send + Sync {
   fn tick(&self);                                  // refresh state, never in WM_PAINT
 }
 ```
+
+Widgets are stored behind `Arc`, and the panel clones the hit widget out and
+releases its lock before calling `on_click` or `on_scroll`. Anything that shows a
+window or sets the foreground window pumps messages, which can re-enter
+`WM_PAINT` on the same thread — so a handler that ran under the lock could
+deadlock the shell. Prefer returning an action string and letting
+`dispatch_action` run it.
 
 Adding a widget = implement the trait and add its branch in `create_widget`.
 Dynamic DLL plugins are not implemented.
@@ -279,6 +307,47 @@ floating = true
 [[keybinds]]
 keys = "Alt+Shift+Return"
 action = "launch('wt.exe')"
+```
+
+## Actions
+
+Keybinds, widget clicks, and `on_create` rules all resolve through
+`scripting::dispatch_action`. An action written as a call — `set_layout("Grid")`,
+`adjust_volume(-5)` — is evaluated by the Rhai engine; a bare word is a named
+shell verb; anything else is launched as a program.
+
+Named verbs: `retile`, `toggle_tiling`, `quit`, `reload_config`,
+`command_center`, `quick_settings`, `toggle_floating`, `move_to_next_monitor`,
+`move_to_prev_monitor`, `cycle_input`, `volume_up`, `volume_down`,
+`toggle_mute`, `brightness_up`, `brightness_down`, `rescan_apps`.
+
+Rhai bindings, in addition to the existing `launch`/`log`/`retile`/`set_layout`
+and focus functions: `quick_settings()`, `cycle_input()`, `input_layout()`,
+`get_volume()`, `set_volume(percent)`, `adjust_volume(delta)`, `toggle_mute()`,
+`is_muted()`, `get_brightness()`, `set_brightness(percent)`, `get_battery()`,
+`network_name()`.
+
+## Application search
+
+`src/apps.rs` indexes `shell:AppsFolder` on a worker thread at startup. That is
+the folder behind the Start menu's "All apps" list, and the only place that
+reports desktop programs and Store apps together with the display names people
+recognise. Documentation shortcuts — manuals, changelogs, quick-start guides —
+are filtered out.
+
+Ranking is tiered so the obvious answer wins: exact name, then prefix, then word
+start, then initials (`vsc` finds *Visual Studio Code*), then substring, and
+finally a word-anchored fuzzy match. Launching is a single `ShellExecuteW` on
+`shell:AppsFolder\<AppUserModelID>`, which works identically for both kinds of
+app.
+
+Two diagnostics exist because "no results" and "wrong results" are different
+bugs:
+
+```powershell
+alt-dwm --list-apps          # everything indexed
+alt-dwm --list-apps code     # what matches, best first
+alt-dwm --status             # what the system readers actually see
 ```
 
 ## Roadmap (commits)

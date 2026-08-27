@@ -118,6 +118,57 @@ fn build_engine() -> Engine {
     eng.register_fn("focus_direction", |dir: &str| {
         crate::focus::focus_direction(dir);
     });
+    eng.register_fn("quick_settings", || {
+        crate::quick_settings::toggle();
+    });
+    eng.register_fn("cycle_input", || {
+        crate::input::cycle();
+    });
+    eng.register_fn("input_layout", || -> String {
+        crate::input::current()
+            .map(|layout| layout.tag)
+            .unwrap_or_default()
+    });
+    eng.register_fn("adjust_volume", |delta: i64| {
+        crate::system::adjust_volume(delta as f32 / 100.0);
+    });
+    eng.register_fn("set_volume", |percent: i64| {
+        crate::system::set_volume(percent.clamp(0, 100) as f32 / 100.0);
+    });
+    eng.register_fn("toggle_mute", || {
+        crate::system::toggle_mute();
+    });
+    eng.register_fn("get_volume", || -> i64 {
+        crate::system::status()
+            .volume
+            .map(|volume| i64::from(volume.percent()))
+            .unwrap_or(-1)
+    });
+    eng.register_fn("is_muted", || -> bool {
+        crate::system::status()
+            .volume
+            .map(|volume| volume.muted)
+            .unwrap_or(false)
+    });
+    eng.register_fn("set_brightness", |percent: i64| {
+        crate::system::set_brightness(percent.clamp(0, 100) as u8);
+    });
+    eng.register_fn("get_brightness", || -> i64 {
+        crate::system::status()
+            .brightness
+            .map(|value| i64::from(value.percent))
+            .unwrap_or(-1)
+    });
+    eng.register_fn("get_battery", || -> i64 {
+        crate::system::status()
+            .battery
+            .and_then(|battery| battery.percent)
+            .map(i64::from)
+            .unwrap_or(-1)
+    });
+    eng.register_fn("network_name", || -> String {
+        crate::system::status().network.label()
+    });
     eng.register_fn("focus_window", |substr: &str| {
         crate::focus::focus_window_by_title_substr(substr);
     });
@@ -175,6 +226,11 @@ pub fn eval_action(code: &str) -> Result<(), String> {
 }
 
 /// Dispatch string action: "retile" | "quit" | "reload_config" | "launch('...')" | "rhai: ..."
+/// True for actions written as a call, e.g. `set_layout("Grid")` or `retile()`.
+fn looks_like_call(action: &str) -> bool {
+    action.ends_with(')') && action.contains('(')
+}
+
 pub fn dispatch_action(action: &str) {
     let act = action.trim();
     if act.starts_with("rhai:") {
@@ -184,15 +240,15 @@ pub fn dispatch_action(action: &str) {
         }
         return;
     }
-    if (act.contains("launch(")
-        || act.contains("log(")
-        || act.contains("set_layout")
-        || act.contains("focus_")
-        || act.contains("toggle_floating")
-        || act.contains("move_to_")
-        || act.contains("retile"))
-        && eval_action(act).is_ok()
-    {
+    // A bare word is a named shell action; anything shaped like `name(args)` is
+    // a script expression. Deciding structurally rather than from a keyword
+    // whitelist means a new Rhai binding works without being registered in two
+    // places — and, more importantly, an unrecognised call is reported rather
+    // than handed to cmd.exe as a program name by the fallback below.
+    if looks_like_call(act) {
+        if let Err(error) = eval_action(act) {
+            eprintln!("[scripting] '{act}' failed: {error}");
+        }
         return;
     }
     match act {
@@ -205,6 +261,16 @@ pub fn dispatch_action(action: &str) {
             crate::reload_config_async();
         }
         "toggle_floating" => crate::focus::toggle_floating_focused(),
+        "quick_settings" => crate::quick_settings::toggle(),
+        "cycle_input" | "next_layout" => {
+            crate::input::cycle();
+        }
+        "volume_up" => crate::system::adjust_volume(0.05),
+        "volume_down" => crate::system::adjust_volume(-0.05),
+        "toggle_mute" => crate::system::toggle_mute(),
+        "brightness_up" => crate::system::adjust_brightness(5),
+        "brightness_down" => crate::system::adjust_brightness(-5),
+        "rescan_apps" => crate::apps::refresh(),
         "move_to_next_monitor" => crate::focus::move_focused_to_monitor("next"),
         "move_to_prev_monitor" => crate::focus::move_focused_to_monitor("prev"),
         _ if act.starts_with("set_layout") => {
@@ -243,6 +309,21 @@ pub fn dispatch_action(action: &str) {
 #[cfg(test)]
 mod tests {
     use super::engine;
+
+    #[test]
+    fn call_shaped_actions_go_to_the_script_engine() {
+        use super::looks_like_call;
+        assert!(looks_like_call("focus_next()"));
+        assert!(looks_like_call("set_layout(\"Grid\")"));
+        assert!(looks_like_call("launch('wt.exe')"));
+        assert!(looks_like_call("adjust_volume(-5)"));
+        // Named verbs and plain programs are not calls.
+        assert!(!looks_like_call("retile"));
+        assert!(!looks_like_call("toggle_tiling"));
+        assert!(!looks_like_call("notepad.exe"));
+        // A path that merely contains parentheses is still a program to launch.
+        assert!(!looks_like_call(r"C:\Program Files (x86)\app\app.exe"));
+    }
 
     #[test]
     fn scripts_have_finite_resource_limits() {
