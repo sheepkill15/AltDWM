@@ -200,7 +200,7 @@ pub fn try_compute_custom(
         if let Some(cached) = cached {
             cached
         } else {
-            let engine = crate::scripting::engine().lock().ok()?;
+            let engine = crate::scripting::engine();
             let new_ast = match engine.compile(&code) {
                 Ok(a) => a,
                 Err(e) => {
@@ -231,7 +231,7 @@ pub fn try_compute_custom(
             (new_ast, new_scope)
         }
     };
-    let engine = crate::scripting::engine().lock().ok()?;
+    let engine = crate::scripting::engine();
     // call fn layout(n, left, top, right, bottom, gap)
     let res: Result<rhai::Array, _> = engine.call_fn(
         &mut scope,

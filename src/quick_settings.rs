@@ -21,14 +21,19 @@ use windows::Win32::Graphics::Gdi::{
     HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT,
     SRCCOPY,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, SetForegroundWindow,
-    SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOW,
-    WM_DESTROY,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect,
+    SetForegroundWindow, SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SW_SHOW, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+};
+// WM_MOUSELEAVE lives under UI::Controls in the windows crate, whose feature is
+// not enabled; the value is stable, so name it directly rather than pull in the
+// whole module for one constant.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 use crate::system::{self, NetworkStatus};
 use crate::ui::{self, draw_label, fill_round_rect, inset_rect, px, rect_height, rect_width};
@@ -82,11 +87,13 @@ enum Row {
         which: Control,
         label: &'static str,
         detail: String,
+        expanded: bool,
     },
     /// Read-only status.
-    Info {
-        label: &'static str,
-        detail: String,
+    Info { label: &'static str, detail: String },
+    LayoutChoice {
+        layout: crate::input::Layout,
+        selected: bool,
     },
 }
 
@@ -94,6 +101,7 @@ impl Row {
     fn height(&self) -> i32 {
         match self {
             Row::Slider { .. } => SLIDER_ROW,
+            Row::LayoutChoice { .. } => CONTROL_ROW - 4,
             _ => CONTROL_ROW,
         }
     }
@@ -108,6 +116,12 @@ struct State {
     /// live system state and enumerates keyboard layouts — on each of the many
     /// `WM_MOUSEMOVE` messages a drag produces.
     dragging: Option<(Slider, RECT)>,
+    input_target: isize,
+    input_expanded: bool,
+    anchor_edge: Option<String>,
+    /// Row under the pointer, so interactive rows can light up on hover. Indexes
+    /// the `rows()` list current at the last mouse move.
+    hovered: Option<usize>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
@@ -153,6 +167,10 @@ fn describe_network(status: &NetworkStatus) -> String {
 fn rows() -> Vec<Row> {
     let status = system::status();
     let mut rows = Vec::new();
+    let (input_target, input_expanded) = {
+        let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+        (state.input_target, state.input_expanded)
+    };
 
     let volume = status.volume;
     rows.push(Row::Slider {
@@ -209,30 +227,48 @@ fn rows() -> Vec<Row> {
         which: Control::WiFiSettings,
         label: "Networks",
         detail: "Choose a network".into(),
+        expanded: false,
     });
     rows.push(Row::Action {
         which: Control::BluetoothSettings,
         label: "Bluetooth",
         detail: "Devices and pairing".into(),
+        expanded: false,
     });
 
     let layouts = crate::input::installed();
-    let current = crate::input::current();
+    let input_hwnd = HWND(input_target as *mut std::ffi::c_void);
+    let current = if input_target != 0 {
+        crate::input::current_for(input_hwnd)
+    } else {
+        crate::input::current()
+    };
     rows.push(match (&current, layouts.len()) {
         (Some(current), count) if count > 1 => Row::Action {
             which: Control::KeyboardLayout,
-            label: "Keyboard",
-            detail: format!("{} · {} installed", current.name, count),
+            label: "Input language",
+            detail: current.tag.clone(),
+            expanded: input_expanded,
         },
         (Some(current), _) => Row::Info {
-            label: "Keyboard",
+            label: "Input language",
             detail: current.name.clone(),
         },
         (None, _) => Row::Info {
-            label: "Keyboard",
+            label: "Input language",
             detail: "Unknown".into(),
         },
     });
+    if input_expanded {
+        rows.extend(layouts.into_iter().take(6).map(|layout| {
+            Row::LayoutChoice {
+                selected: current
+                    .as_ref()
+                    .is_some_and(|active| active.handle == layout.handle),
+                layout,
+            }
+        }));
+    }
 
     if let Some(battery) = status.battery {
         let percent = battery
@@ -258,6 +294,7 @@ fn rows() -> Vec<Row> {
         which: Control::SoundSettings,
         label: "Sound",
         detail: "Output devices and mixer".into(),
+        expanded: false,
     });
 
     rows
@@ -306,7 +343,9 @@ fn track_rect(row: RECT, scale: f32) -> RECT {
 fn value_from_x(track: RECT, x: i32) -> u8 {
     let width = rect_width(&track).max(1);
     let offset = (x - track.left).clamp(0, width);
-    ((offset as f32 / width as f32) * 100.0).round().clamp(0.0, 100.0) as u8
+    ((offset as f32 / width as f32) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u8
 }
 
 // --------------------------------------------------------------- painting ----
@@ -324,15 +363,26 @@ fn fit_window_to_rows(hwnd: HWND, client: RECT, rows: &[Row], scale: f32) -> boo
     }
     let mut frame = RECT::default();
     unsafe {
-        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut frame).is_err() {
+        if GetWindowRect(hwnd, &mut frame).is_err() {
             return false;
         }
-        // Grow upward: the surface is anchored to the bottom-right corner.
+        let edge = STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .anchor_edge
+            .clone();
+        // A top panel grows down and a bottom panel grows up. Side panels keep
+        // the flyout centred on the same point as rows expand or collapse.
+        let y = match edge.as_deref() {
+            Some("top") => frame.top,
+            Some("left" | "right") => (frame.top + frame.bottom - wanted) / 2,
+            _ => frame.bottom - wanted,
+        };
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
             frame.left,
-            frame.bottom - wanted,
+            y,
             frame.right - frame.left,
             wanted,
             SWP_NOACTIVATE,
@@ -343,6 +393,7 @@ fn fit_window_to_rows(hwnd: HWND, client: RECT, rows: &[Row], scale: f32) -> boo
 }
 
 fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
+    let _antialias = ui::begin_antialiased_paint(hdc);
     let theme = crate::CURRENT_CONFIG
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -350,12 +401,12 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
         .clone();
     let scale = ui::scale_for_window(hwnd);
     let px = |value: i32| ui::px(value, scale);
-    let font = |size: i32, weight: i32| {
-        crate::theme::get_cached_font_variant(&theme, px(size), weight)
-    };
+    let font =
+        |size: i32, weight: i32| crate::theme::get_cached_font_variant(&theme, px(size), weight);
     let title_font = font(17, 600);
     let body_font = font(theme.font_size, 500);
     let small_font = font((theme.font_size - 2).max(8), 400);
+    let symbol_font = crate::theme::get_cached_symbol_font(px(16));
 
     ui::fill_rect(hdc, &client, theme.panel_bg("top"));
 
@@ -365,15 +416,23 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
         right: client.right - px(EDGE),
         bottom: client.top + px(14) + px(26),
     };
-    draw_label(hdc, &header, "Quick settings", title_font, theme.text_color());
+    draw_label(
+        hdc,
+        &header,
+        "Quick settings",
+        title_font,
+        theme.text_color(),
+    );
 
     let rows = rows();
     if fit_window_to_rows(hwnd, client, &rows, scale) {
         // The resize repaints; this pass would draw against stale bounds.
         return;
     }
+    let hovered = STATE.lock().unwrap_or_else(|error| error.into_inner()).hovered;
     let rects = row_rects(client, &rows, scale);
-    for (row, rect) in rows.iter().zip(&rects) {
+    for (index, (row, rect)) in rows.iter().zip(&rects).enumerate() {
+        let is_hovered = hovered == Some(index);
         match row {
             Row::Slider {
                 label,
@@ -395,14 +454,16 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
                     theme.text_dim_color()
                 };
                 draw_label(hdc, &text, label, body_font, color);
-                draw_right(hdc, &text, detail, small_font, theme.text_dim_color(), scale);
-
-                fill_round_rect(
+                draw_right(
                     hdc,
-                    &track,
-                    rect_height(&track) / 2,
-                    theme.surface_color(),
+                    &text,
+                    detail,
+                    small_font,
+                    theme.text_dim_color(),
+                    scale,
                 );
+
+                fill_round_rect(hdc, &track, rect_height(&track) / 2, theme.surface_color());
                 if *available {
                     let width = rect_width(&track);
                     let filled = width * i32::from(*value) / 100;
@@ -431,7 +492,9 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
             Row::Toggle {
                 label, detail, on, ..
             } => {
-                let body = draw_control_row(hdc, rect, label, detail, &theme, body_font, small_font, scale);
+                let body = draw_control_row(
+                    hdc, rect, label, detail, &theme, body_font, small_font, scale, is_hovered,
+                );
                 // A pill switch: the same affordance Windows uses, so the state
                 // reads at a glance rather than needing the label.
                 let switch_w = px(CONTROL_WIDTH - 6);
@@ -466,26 +529,93 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
                 };
                 fill_round_rect(hdc, &knob, knob_side / 2, theme.text_color());
             }
-            Row::Action { label, detail, .. } => {
-                let body = draw_control_row(hdc, rect, label, detail, &theme, body_font, small_font, scale);
-                // A chevron drawn from two blocks: no icon font to depend on.
-                let arrow = px(4);
-                let center_y = (body.top + body.bottom) / 2;
-                for step in 0..2 {
-                    let offset = step * arrow;
-                    let mark = RECT {
-                        left: body.right - arrow * 2 + offset,
-                        top: center_y - arrow + offset,
-                        right: body.right - arrow * 2 + offset + arrow,
-                        bottom: center_y + offset,
-                    };
-                    ui::fill_rect(hdc, &mark, theme.text_dim_color());
-                }
+            Row::Action {
+                label,
+                detail,
+                expanded,
+                ..
+            } => {
+                let body = draw_control_row(
+                    hdc, rect, label, detail, &theme, body_font, small_font, scale, is_hovered,
+                );
+                let glyph = if *expanded { "\u{e70e}" } else { "\u{e70d}" };
+                let width = ui::measure_label(hdc, glyph, symbol_font);
+                draw_label(
+                    hdc,
+                    &RECT {
+                        left: body.right - width,
+                        ..body
+                    },
+                    glyph,
+                    symbol_font,
+                    theme.text_dim_color(),
+                );
             }
             Row::Info { label, detail } => {
                 let text = inset_rect(*rect, 0, px(6));
                 draw_label(hdc, &text, label, body_font, theme.text_dim_color());
-                draw_right(hdc, &text, detail, small_font, theme.text_dim_color(), scale);
+                draw_right(
+                    hdc,
+                    &text,
+                    detail,
+                    small_font,
+                    theme.text_dim_color(),
+                    scale,
+                );
+            }
+            Row::LayoutChoice { layout, selected } => {
+                let surface = inset_rect(*rect, 0, px(3));
+                fill_round_rect(
+                    hdc,
+                    &surface,
+                    px(theme.rounding),
+                    if *selected || is_hovered {
+                        theme.surface_hover_color()
+                    } else {
+                        theme.surface_color()
+                    },
+                );
+                let body = inset_rect(surface, px(12), 0);
+                let tag_box = RECT {
+                    right: body.left + px(38),
+                    ..body
+                };
+                draw_label(
+                    hdc,
+                    &tag_box,
+                    &layout.tag,
+                    body_font,
+                    if *selected {
+                        theme.accent_active_color()
+                    } else {
+                        theme.text_dim_color()
+                    },
+                );
+                draw_label(
+                    hdc,
+                    &RECT {
+                        left: tag_box.right,
+                        right: body.right - px(24),
+                        ..body
+                    },
+                    &layout.name,
+                    body_font,
+                    theme.text_color(),
+                );
+                if *selected {
+                    let check = "\u{e73e}";
+                    let width = ui::measure_label(hdc, check, symbol_font);
+                    draw_label(
+                        hdc,
+                        &RECT {
+                            left: body.right - width,
+                            ..body
+                        },
+                        check,
+                        symbol_font,
+                        theme.accent_active_color(),
+                    );
+                }
             }
         }
     }
@@ -506,17 +636,30 @@ fn draw_control_row(
     body_font: HFONT,
     small_font: HFONT,
     scale: f32,
+    hovered: bool,
 ) -> RECT {
     let px = |value: i32| ui::px(value, scale);
     let surface = inset_rect(*rect, 0, px(3));
-    fill_round_rect(hdc, &surface, px(theme.rounding), theme.surface_color());
+    let background = if hovered {
+        theme.surface_hover_color()
+    } else {
+        theme.surface_color()
+    };
+    fill_round_rect(hdc, &surface, px(theme.rounding), background);
     let body = inset_rect(surface, px(12), 0);
     draw_label(hdc, &body, label, body_font, theme.text_color());
     let detail_box = RECT {
         right: body.right - px(CONTROL_WIDTH),
         ..body
     };
-    draw_right(hdc, &detail_box, detail, small_font, theme.text_dim_color(), scale);
+    draw_right(
+        hdc,
+        &detail_box,
+        detail,
+        small_font,
+        theme.text_dim_color(),
+        scale,
+    );
     body
 }
 
@@ -534,16 +677,7 @@ fn draw_right(
     }
     let width = ui::measure_label(hdc, text, font) + ui::px(2, scale);
     let left = (rect.right - width).max(rect.left);
-    draw_label(
-        hdc,
-        &RECT {
-            left,
-            ..*rect
-        },
-        text,
-        font,
-        color,
-    );
+    draw_label(hdc, &RECT { left, ..*rect }, text, font, color);
 }
 
 // ------------------------------------------------------------------ input ----
@@ -588,9 +722,9 @@ fn activate_control(which: Control, on: bool) -> bool {
             true
         }
         Control::KeyboardLayout => {
-            // Switching targets the foreground window, so the surface has to go
-            // away first or it would be the foreground window itself.
-            true
+            let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+            state.input_expanded = !state.input_expanded;
+            false
         }
     }
 }
@@ -632,14 +766,24 @@ fn handle_click(hwnd: HWND, x: i32, y: i32) {
                 }
             }
             Row::Action { which, .. } => {
-                if *which == Control::KeyboardLayout {
-                    close();
-                    crate::input::cycle();
-                } else if activate_control(*which, false) {
+                if activate_control(*which, false) {
                     close();
                 }
             }
             Row::Info { .. } => {}
+            Row::LayoutChoice { layout, .. } => {
+                let target = STATE
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .input_target;
+                if target != 0 {
+                    crate::input::activate_for(HWND(target as *mut std::ffi::c_void), layout);
+                }
+                STATE
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .input_expanded = false;
+            }
         }
         invalidate();
         return;
@@ -651,6 +795,46 @@ fn apply_slider(which: Slider, value: u8) {
         Slider::Volume => system::set_volume(f32::from(value) / 100.0),
         Slider::Brightness => system::set_brightness(value),
     }
+}
+
+/// Track the row under the pointer for hover highlighting, and arm a
+/// `WM_MOUSELEAVE` so the highlight clears when the pointer leaves the window.
+fn update_hover(hwnd: HWND, x: i32, y: i32) {
+    unsafe {
+        let mut tme = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        let _ = TrackMouseEvent(&mut tme);
+    }
+    let mut client = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut client);
+    }
+    let scale = ui::scale_for_window(hwnd);
+    let rows = rows();
+    let rects = row_rects(client, &rows, scale);
+    let hovered = rows
+        .iter()
+        .zip(&rects)
+        .position(|(row, rect)| ui::point_in_rect(x, y, rect) && row_takes_hover(row));
+    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    if state.hovered != hovered {
+        state.hovered = hovered;
+        drop(state);
+        invalidate();
+    }
+}
+
+/// Rows that render a hover background. Sliders own their whole row visual and
+/// info rows are not interactive, so neither lights up.
+fn row_takes_hover(row: &Row) -> bool {
+    matches!(
+        row,
+        Row::Toggle { .. } | Row::Action { .. } | Row::LayoutChoice { .. }
+    )
 }
 
 fn handle_drag(x: i32) {
@@ -697,12 +881,7 @@ fn handle_wheel(hwnd: HWND, x: i32, y: i32, delta: i16) {
 
 // ----------------------------------------------------------------- window ----
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let point = |lparam: LPARAM| {
         (
             (lparam.0 & 0xFFFF) as i16 as i32,
@@ -742,8 +921,25 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let (x, _) = point(lparam);
-            handle_drag(x);
+            let (x, y) = point(lparam);
+            let dragging = STATE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .dragging
+                .is_some();
+            if dragging {
+                handle_drag(x);
+            } else {
+                update_hover(hwnd, x, y);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+            if state.hovered.take().is_some() {
+                drop(state);
+                invalidate();
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -767,7 +963,17 @@ unsafe extern "system" fn wndproc(
         }
         WM_KEYDOWN => {
             if wparam.0 as u16 == VK_ESCAPE.0 {
-                let _ = DestroyWindow(hwnd);
+                let collapsed = {
+                    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+                    let expanded = state.input_expanded;
+                    state.input_expanded = false;
+                    expanded
+                };
+                if collapsed {
+                    invalidate();
+                } else {
+                    let _ = DestroyWindow(hwnd);
+                }
             }
             LRESULT(0)
         }
@@ -780,6 +986,7 @@ unsafe extern "system" fn wndproc(
             let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
             state.hwnd = 0;
             state.dragging = None;
+            state.hovered = None;
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -792,8 +999,50 @@ fn ensure_class() -> Result<(), String> {
 
 /// Bottom-right of the work area on the monitor holding `anchor`, matching where
 /// Windows puts its own quick settings.
-fn placement(anchor: Option<HWND>, scale_of: &mut f32) -> (i32, i32, i32, i32) {
-    let monitor = match anchor {
+fn placement_rect(
+    work: RECT,
+    anchor: Option<RECT>,
+    edge: Option<&str>,
+    width: i32,
+    height: i32,
+    margin: i32,
+) -> RECT {
+    let (mut x, mut y) = match (anchor, edge) {
+        (Some(anchor), Some("top")) => (anchor.right - width, anchor.bottom + margin),
+        (Some(anchor), Some("bottom")) => (anchor.right - width, anchor.top - height - margin),
+        (Some(anchor), Some("left")) => (
+            anchor.right + margin,
+            (anchor.top + anchor.bottom - height) / 2,
+        ),
+        (Some(anchor), Some("right")) => (
+            anchor.left - width - margin,
+            (anchor.top + anchor.bottom - height) / 2,
+        ),
+        _ => (work.right - width - margin, work.bottom - height - margin),
+    };
+    x = x.clamp(
+        work.left + margin,
+        (work.right - width - margin).max(work.left + margin),
+    );
+    y = y.clamp(
+        work.top + margin,
+        (work.bottom - height - margin).max(work.top + margin),
+    );
+    RECT {
+        left: x,
+        top: y,
+        right: x + width,
+        bottom: y + height,
+    }
+}
+
+fn placement(
+    anchor_hwnd: Option<HWND>,
+    anchor_rect: Option<RECT>,
+    edge: Option<&str>,
+    scale_of: &mut f32,
+) -> (i32, i32, i32, i32) {
+    let monitor = match anchor_hwnd {
         Some(anchor) if !anchor.0.is_null() => unsafe {
             MonitorFromWindow(anchor, MONITOR_DEFAULTTONEAREST)
         },
@@ -826,9 +1075,8 @@ fn placement(anchor: Option<HWND>, scale_of: &mut f32) -> (i32, i32, i32, i32) {
     let width = px(WIDTH, scale);
     let height = content_height(&rows, scale);
     let margin = px(12, scale);
-    let x = (work.right - width - margin).max(work.left + margin);
-    let y = (work.bottom - height - margin).max(work.top + margin);
-    (x, y, width, height)
+    let placed = placement_rect(work, anchor_rect, edge, width, height, margin);
+    (placed.left, placed.top, width, height)
 }
 
 /// Open the surface, or close it if it is already open.
@@ -841,6 +1089,14 @@ pub fn toggle() {
 }
 
 pub fn toggle_near(anchor: Option<HWND>) {
+    toggle_anchored(anchor, None, None);
+}
+
+pub fn toggle_from_panel(panel: HWND, widget: RECT, edge: &str) {
+    toggle_anchored(Some(panel), Some(widget), Some(edge));
+}
+
+fn toggle_anchored(anchor: Option<HWND>, anchor_rect: Option<RECT>, edge: Option<&str>) {
     if is_open() {
         close();
         return;
@@ -852,8 +1108,9 @@ pub fn toggle_near(anchor: Option<HWND>) {
     // Ask for a fresh reading so the surface opens with current values rather
     // than whatever the last poll saw.
     system::refresh();
+    let input_target = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
     let mut scale = 1.0f32;
-    let (x, y, width, height) = placement(anchor, &mut scale);
+    let (x, y, width, height) = placement(anchor, anchor_rect, edge, &mut scale);
     let created = unsafe {
         CreateWindowExW(
             // See the command center: a flyout does not belong in Alt+Tab.
@@ -878,7 +1135,14 @@ pub fn toggle_near(anchor: Option<HWND>) {
         );
         return;
     };
-    STATE.lock().unwrap_or_else(|error| error.into_inner()).hwnd = hwnd.0 as isize;
+    {
+        let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+        state.hwnd = hwnd.0 as isize;
+        state.input_target = input_target.0 as isize;
+        state.input_expanded = false;
+        state.anchor_edge = edge.map(str::to_string);
+        state.hovered = None;
+    }
     unsafe {
         const DWMWA_WINDOW_CORNER_PREFERENCE_RAW: i32 = 33;
         const DWMWCP_ROUND: u32 = 2;
@@ -916,7 +1180,9 @@ pub fn toggle_near(anchor: Option<HWND>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_height, describe_network, row_rects, rows, track_rect, value_from_x};
+    use super::{
+        content_height, describe_network, placement_rect, row_rects, rows, track_rect, value_from_x,
+    };
     use crate::system::NetworkStatus;
     use windows::Win32::Foundation::RECT;
 
@@ -957,6 +1223,32 @@ mod tests {
             "Kitchen · 82%"
         );
         assert_eq!(describe_network(&NetworkStatus::Offline), "Offline");
+    }
+
+    #[test]
+    fn panel_edges_place_the_flyout_on_the_inside() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let top = RECT {
+            left: 1500,
+            top: 0,
+            right: 1600,
+            bottom: 40,
+        };
+        let below = placement_rect(work, Some(top), Some("top"), 344, 600, 12);
+        assert_eq!(below.top, 52);
+        let bottom = RECT {
+            left: 1500,
+            top: 1040,
+            right: 1600,
+            bottom: 1080,
+        };
+        let above = placement_rect(work, Some(bottom), Some("bottom"), 344, 600, 12);
+        assert_eq!(above.bottom, 1028);
     }
 
     /// Every row must be reachable inside the window the surface sizes itself to,

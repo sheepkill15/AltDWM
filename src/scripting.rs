@@ -5,7 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
+// The engine is stored bare rather than behind a `Mutex`. Rhai is built with
+// the `sync` feature, so `Engine` is `Send + Sync` and every method used after
+// construction takes `&self` — a lock would buy nothing and would deadlock the
+// one path that needs it: a script action (evaluated under the lock) can call
+// `switch_to`, which retiles synchronously, which evaluates a custom layout
+// script — re-entering the very same engine on the same thread.
+static ENGINE: OnceLock<Engine> = OnceLock::new();
 
 // ---- real CPU usage via GetSystemTimes ---------------------------------
 static PREV_IDLE: AtomicU64 = AtomicU64::new(0);
@@ -229,13 +235,13 @@ fn build_engine() -> Engine {
     eng
 }
 
-pub fn engine() -> &'static Mutex<Engine> {
-    ENGINE.get_or_init(|| Mutex::new(build_engine()))
+pub fn engine() -> &'static Engine {
+    ENGINE.get_or_init(build_engine)
 }
 
 /// Evaluate Rhai expression that returns text (for custom widget)
 pub fn eval_text(code: &str) -> Result<String, String> {
-    let eng = engine().lock().map_err(|e| format!("engine lock: {}", e))?;
+    let eng = engine();
     let scope = Scope::new();
     let res: Result<Dynamic, _> = eng.eval_with_scope(&mut scope.clone(), code);
     match res {
@@ -252,7 +258,7 @@ pub fn eval_text(code: &str) -> Result<String, String> {
 
 /// Evaluate for side effects (action)
 pub fn eval_action(code: &str) -> Result<(), String> {
-    let eng = engine().lock().map_err(|e| format!("engine lock: {}", e))?;
+    let eng = engine();
     let mut scope = Scope::new();
     eng.run_with_scope(&mut scope, code)
         .map_err(|e| format!("{}", e))
@@ -278,7 +284,12 @@ pub fn dispatch_action(action: &str) {
     // whitelist means a new Rhai binding works without being registered in two
     // places — and, more importantly, an unrecognised call is reported rather
     // than handed to cmd.exe as a program name by the fallback below.
-    if looks_like_call(act) {
+    // `launch('program')` predates the Rhai bridge, and every shipped config
+    // quotes its argument with '…' — which Rhai reads as a char literal, not a
+    // string, so handing it to the engine is a guaranteed syntax error. Its
+    // dedicated spawner below understands both quote styles, so keep it off the
+    // script path.
+    if looks_like_call(act) && !act.starts_with("launch(") {
         if let Err(error) = eval_action(act) {
             eprintln!("[scripting] '{act}' failed: {error}");
         }
@@ -364,8 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn the_engine_can_be_used_re_entrantly() {
+        // Regression: a `workspace(N)` / `next_workspace()` action is evaluated
+        // by the engine, and — because the switch retiles synchronously — a
+        // custom Rhai layout is evaluated again during that same call, on the
+        // same thread. Behind a non-reentrant `Mutex<Engine>` this deadlocked
+        // the whole window manager. Holding one `&Engine` live and evaluating
+        // through another, as that nesting does, must simply return.
+        let outer = engine();
+        let a: i64 = outer.eval("40 + 2").expect("outer eval");
+        let b: i64 = engine().eval("1 + 1").expect("nested eval");
+        assert_eq!((a, b), (42, 2));
+    }
+
+    #[test]
     fn scripts_have_finite_resource_limits() {
-        let engine = engine().lock().expect("engine lock");
+        let engine = engine();
         assert_eq!(engine.max_operations(), 100_000);
         assert_eq!(engine.max_call_levels(), 32);
         assert_eq!(engine.max_string_size(), 64 * 1024);

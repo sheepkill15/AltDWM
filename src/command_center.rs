@@ -9,17 +9,18 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, HDC, HFONT,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+    EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, SelectObject, HDC, HFONT,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SetFocus, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect,
-    SetForegroundWindow, SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST, SWP_SHOWWINDOW, SW_SHOW,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect, KillTimer,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST, SWP_SHOWWINDOW,
+    SW_SHOW, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE,
+    WM_PAINT, WM_TIMER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 // All measurements below are device-independent pixels at 96 DPI, scaled for
@@ -212,7 +213,16 @@ struct CenterState {
     query: String,
     selected: usize,
     view: CenterView,
+    /// Blink phase of the search caret. Toggled on a timer so the text field
+    /// reads as a live, focused input rather than a static label.
+    caret_on: bool,
 }
+
+/// Timer that drives the search caret's blink.
+const CARET_TIMER: usize = 1;
+/// Caret blink half-period. Matches the Windows text-cursor cadence closely
+/// enough without querying it per keystroke.
+const CARET_BLINK_MS: u32 = 530;
 
 static STATE: LazyLock<Mutex<CenterState>> = LazyLock::new(|| Mutex::new(CenterState::default()));
 
@@ -279,11 +289,8 @@ fn label(hdc: HDC, rect: RECT, value: &str, font: HFONT, color: COLORREF) {
     crate::ui::draw_label(hdc, &rect, value, font, color);
 }
 
-unsafe fn paint(hwnd: HWND) {
-    let mut ps = PAINTSTRUCT::default();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    let mut client = RECT::default();
-    let _ = GetClientRect(hwnd, &mut client);
+unsafe fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
+    let antialias = crate::ui::begin_antialiased_paint(hdc);
     let theme = crate::CURRENT_CONFIG
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -291,9 +298,8 @@ unsafe fn paint(hwnd: HWND) {
         .clone();
     let scale = scale(hwnd);
     let px = |value: i32| crate::ui::px(value, scale);
-    let font = |size: i32, weight: i32| {
-        crate::theme::get_cached_font_variant(&theme, px(size), weight)
-    };
+    let font =
+        |size: i32, weight: i32| crate::theme::get_cached_font_variant(&theme, px(size), weight);
 
     fill_rect(hdc, client, theme.panel_bg("top"));
 
@@ -330,15 +336,13 @@ unsafe fn paint(hwnd: HWND) {
 
     if view == CenterView::Shortcuts {
         paint_shortcuts(hdc, client, &theme, scale, body_font, small_font);
-        let _ = EndPaint(hwnd, &ps);
         return;
     }
 
-    let query = STATE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .query
-        .clone();
+    let (query, caret_on) = {
+        let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+        (state.query.clone(), state.caret_on)
+    };
     let search_rect = RECT {
         left: edge,
         top: px(SEARCH_TOP),
@@ -370,10 +374,11 @@ unsafe fn paint(hwnd: HWND) {
     } else {
         theme.text_color()
     };
+    let text_left = caret.right + px(12);
     label(
         hdc,
         RECT {
-            left: caret.right + px(12),
+            left: text_left,
             right: search_rect.right - px(12),
             ..search_rect
         },
@@ -381,6 +386,25 @@ unsafe fn paint(hwnd: HWND) {
         body_font,
         search_color,
     );
+    // A blinking text cursor at the end of the query, so the field reads as a
+    // focused input. When empty it sits at the start, ahead of the placeholder.
+    if caret_on {
+        let cursor_x = text_left
+            + if query.is_empty() {
+                0
+            } else {
+                crate::ui::measure_label(hdc, &query, body_font)
+            };
+        let cursor_h = px(24);
+        let center_y = (search_rect.top + search_rect.bottom) / 2;
+        let cursor = RECT {
+            left: cursor_x + px(1),
+            top: center_y - cursor_h / 2,
+            right: cursor_x + px(3),
+            bottom: center_y + cursor_h / 2,
+        };
+        fill_rect(hdc, cursor, theme.text_color());
+    }
 
     let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     let rows = results(&state.query);
@@ -416,16 +440,55 @@ unsafe fn paint(hwnd: HWND) {
                 theme.surface_color()
             },
         );
-        label(
-            hdc,
-            RECT {
-                left: badge_rect.left + px(10),
-                ..badge_rect
-            },
-            &item.badge(),
-            badge_font,
-            theme.text_color(),
-        );
+        let app_icon = match item {
+            ResultRow::App(entry) => entry.icon,
+            ResultRow::Command(_) => 0,
+        };
+        if app_icon != 0 {
+            use windows::Win32::Graphics::Gdi::{
+                AlphaBlend, CreateCompatibleDC, DeleteDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER,
+                BLENDFUNCTION, HBITMAP,
+            };
+            let side = px(24).min(badge_side - px(8)).max(1);
+            let left = badge_rect.left + (badge_side - side) / 2;
+            let top = badge_rect.top + (badge_side - side) / 2;
+            let source = CreateCompatibleDC(Some(hdc));
+            if !source.0.is_null() {
+                let previous =
+                    SelectObject(source, HBITMAP(app_icon as *mut std::ffi::c_void).into());
+                let _ = AlphaBlend(
+                    hdc,
+                    left,
+                    top,
+                    side,
+                    side,
+                    source,
+                    0,
+                    0,
+                    32,
+                    32,
+                    BLENDFUNCTION {
+                        BlendOp: AC_SRC_OVER as u8,
+                        BlendFlags: 0,
+                        SourceConstantAlpha: 255,
+                        AlphaFormat: AC_SRC_ALPHA as u8,
+                    },
+                );
+                let _ = SelectObject(source, previous);
+                let _ = DeleteDC(source);
+            }
+        } else {
+            label(
+                hdc,
+                RECT {
+                    left: badge_rect.left + px(10),
+                    ..badge_rect
+                },
+                &item.badge(),
+                badge_font,
+                theme.text_color(),
+            );
+        }
         let text_left = badge_rect.right + px(14);
         let split = row_rect.top + (row_rect.bottom - row_rect.top) / 2;
         label(
@@ -461,13 +524,7 @@ unsafe fn paint(hwnd: HWND) {
             right: client.right - px(30),
             bottom: px(ITEM_TOP) + px(28),
         };
-        label(
-            hdc,
-            empty,
-            "No matches",
-            body_font,
-            theme.text_color(),
-        );
+        label(hdc, empty, "No matches", body_font, theme.text_color());
         let hint = if crate::apps::is_ready() {
             format!(
                 "Searched {} commands and {} applications.",
@@ -498,7 +555,7 @@ unsafe fn paint(hwnd: HWND) {
         small_font,
         "↑ ↓  SELECT     ENTER  OPEN     ESC  CLOSE",
     );
-    let _ = EndPaint(hwnd, &ps);
+    drop(antialias);
 }
 
 /// Footer strip, shared by both views.
@@ -689,6 +746,25 @@ fn invoke_selected(hwnd: HWND) {
     }
 }
 
+/// Row index under a client-area `y`, if it lands on a populated result row.
+///
+/// Row geometry is scaled when painted, so hit-testing has to scale identically
+/// or the pointer lands on a different row than the one under it above 100%.
+fn row_at(hwnd: HWND, y: i32) -> Option<usize> {
+    let scale = scale(hwnd);
+    let item_top = crate::ui::px(ITEM_TOP, scale);
+    let item_height = crate::ui::px(ITEM_HEIGHT, scale).max(1);
+    if y < item_top {
+        return None;
+    }
+    let row = ((y - item_top) / item_height) as usize;
+    let count = {
+        let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+        results(&state.query).len()
+    };
+    (row < count).then_some(row)
+}
+
 unsafe extern "system" fn wndproc(
     hwnd: HWND,
     message: u32,
@@ -697,7 +773,44 @@ unsafe extern "system" fn wndproc(
 ) -> LRESULT {
     match message {
         WM_PAINT => {
-            paint(hwnd);
+            // Double-buffered so the full repaint that fires when the app index
+            // finishes loading does not flash the palette.
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let width = (client.right - client.left).max(1);
+            let height = (client.bottom - client.top).max(1);
+            let buffer_dc = CreateCompatibleDC(Some(hdc));
+            let buffer_bitmap = CreateCompatibleBitmap(hdc, width, height);
+            let buffered = !buffer_dc.0.is_null() && !buffer_bitmap.0.is_null();
+            let old_bitmap = buffered.then(|| SelectObject(buffer_dc, buffer_bitmap.into()));
+            let draw_dc = if buffered { buffer_dc } else { hdc };
+            paint(hwnd, draw_dc, client);
+            if let Some(old_bitmap) = old_bitmap {
+                let _ = BitBlt(hdc, 0, 0, width, height, Some(buffer_dc), 0, 0, SRCCOPY);
+                let _ = SelectObject(buffer_dc, old_bitmap);
+            }
+            if !buffer_bitmap.0.is_null() {
+                let _ = DeleteObject(buffer_bitmap.into());
+            }
+            if !buffer_dc.0.is_null() {
+                let _ = DeleteDC(buffer_dc);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == CARET_TIMER {
+                let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+                // The caret only shows in the command view; no need to repaint the
+                // shortcuts list on every blink.
+                if state.view == CenterView::Commands {
+                    state.caret_on = !state.caret_on;
+                    drop(state);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
             LRESULT(0)
         }
         WM_CHAR => {
@@ -711,6 +824,8 @@ unsafe extern "system" fn wndproc(
                 if state.query.chars().count() < 64 {
                     state.query.push(character);
                     state.selected = 0;
+                    // Keep the caret solid while typing rather than mid-blink.
+                    state.caret_on = true;
                 }
                 drop(state);
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -759,31 +874,34 @@ unsafe extern "system" fn wndproc(
             }
             LRESULT(0)
         }
+        WM_MOUSEMOVE => {
+            // Highlight the row under the pointer, so the mouse and the keyboard
+            // drive the same selection. Only repaint when it actually changes.
+            if STATE.lock().unwrap_or_else(|error| error.into_inner()).view == CenterView::Shortcuts
+            {
+                return LRESULT(0);
+            }
+            if let Some(row) = row_at(hwnd, ((lparam.0 >> 16) & 0xffff) as i16 as i32) {
+                let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+                if state.selected != row {
+                    state.selected = row;
+                    drop(state);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
             if STATE.lock().unwrap_or_else(|error| error.into_inner()).view == CenterView::Shortcuts
             {
                 return LRESULT(0);
             }
-            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-            // Row geometry is scaled when painted, so hit-testing has to scale
-            // identically or a click lands on a different row than the one under
-            // the pointer on any display above 100%.
-            let scale = scale(hwnd);
-            let item_top = crate::ui::px(ITEM_TOP, scale);
-            let item_height = crate::ui::px(ITEM_HEIGHT, scale).max(1);
-            if y >= item_top {
-                let row = ((y - item_top) / item_height) as usize;
-                let count = {
-                    let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
-                    results(&state.query).len()
-                };
-                if row < count {
-                    STATE
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .selected = row;
-                    invoke_selected(hwnd);
-                }
+            if let Some(row) = row_at(hwnd, ((lparam.0 >> 16) & 0xffff) as i16 as i32) {
+                STATE
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .selected = row;
+                invoke_selected(hwnd);
             }
             LRESULT(0)
         }
@@ -792,12 +910,14 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = KillTimer(Some(hwnd), CARET_TIMER);
             let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
             if state.hwnd == hwnd.0 as isize {
                 state.hwnd = 0;
                 state.query.clear();
                 state.selected = 0;
                 state.view = CenterView::Commands;
+                state.caret_on = false;
             }
             LRESULT(0)
         }
@@ -898,8 +1018,14 @@ pub fn toggle(anchor: HWND) {
         );
         return;
     };
-    STATE.lock().unwrap_or_else(|error| error.into_inner()).hwnd = hwnd.0 as isize;
+    {
+        let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+        state.hwnd = hwnd.0 as isize;
+        state.caret_on = true;
+    }
     unsafe {
+        // Drive the search caret's blink. Killed in WM_DESTROY.
+        let _ = SetTimer(Some(hwnd), CARET_TIMER, CARET_BLINK_MS, None);
         const DWMWA_WINDOW_CORNER_PREFERENCE_RAW: i32 = 33;
         const DWMWCP_ROUND: u32 = 2;
         let corner = DWMWCP_ROUND;
