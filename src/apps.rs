@@ -370,27 +370,51 @@ pub fn search(query: &str, limit: usize) -> Vec<AppEntry> {
 
 /// Launch an indexed application.
 pub fn launch(entry: &AppEntry) {
+    shell_launch(entry, None);
+}
+
+/// Launch an indexed application elevated, prompting UAC.
+///
+/// The AppsFolder item exposes the same `runas` verb the Start menu's "Run as
+/// administrator" uses, so classic desktop apps elevate through it. Store apps
+/// have no such verb and simply cannot run elevated; the request fails
+/// harmlessly there rather than doing anything unexpected.
+pub fn launch_as_admin(entry: &AppEntry) {
+    shell_launch(entry, Some(windows::core::w!("runas")));
+}
+
+fn shell_launch(entry: &AppEntry, verb: Option<windows::core::PCWSTR>) {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let target = format!("shell:AppsFolder\\{}", entry.id);
     let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
-    println!("[apps] launch {} ({})", entry.name, entry.id);
+    let elevated = verb.is_some();
+    println!(
+        "[apps] launch{} {} ({})",
+        if elevated { " as admin" } else { "" },
+        entry.name,
+        entry.id
+    );
     unsafe {
         let result = ShellExecuteW(
             None,
-            PCWSTR::null(),
+            verb.unwrap_or_else(PCWSTR::null),
             PCWSTR(wide.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
             SW_SHOWNORMAL,
         );
-        // ShellExecuteW reports failure as a pseudo-handle of 32 or less.
+        // ShellExecuteW reports failure as a pseudo-handle of 32 or less. A user
+        // declining the UAC prompt lands here too, which is not an error worth
+        // shouting about, but the log line is still useful.
         if (result.0 as isize) <= 32 {
             eprintln!(
-                "[apps] failed to launch {}: {}",
-                entry.name, result.0 as isize
+                "[apps] failed to launch{} {}: {}",
+                if elevated { " as admin" } else { "" },
+                entry.name,
+                result.0 as isize
             );
         }
     }

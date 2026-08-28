@@ -411,18 +411,12 @@ unsafe fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
     let selected = state.selected.min(rows.len().saturating_sub(1));
     drop(state);
 
-    let item_height = px(ITEM_HEIGHT);
     for (row, item) in rows.iter().enumerate() {
-        let top = px(ITEM_TOP) + row as i32 * item_height;
-        let row_rect = RECT {
-            left: px(18),
-            top,
-            right: client.right - px(18),
-            bottom: top + item_height - px(6),
-        };
+        let row_rect = row_rect_at(client, scale, row);
         if row == selected {
             fill_round_rect(hdc, row_rect, px(12), theme.surface_hover_color());
         }
+        let is_app = matches!(item, ResultRow::App(_));
         let badge_side = row_rect.bottom - row_rect.top - px(8);
         let badge_rect = RECT {
             left: row_rect.left + px(12),
@@ -506,12 +500,19 @@ unsafe fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
         }
         let text_left = badge_rect.right + px(14);
         let split = row_rect.top + (row_rect.bottom - row_rect.top) / 2;
+        // Applications carry an admin button on the right; reserve room for it so
+        // the title and description never run under it. Built-in commands do not.
+        let text_right = if is_app {
+            admin_button_rect(row_rect, scale).left - px(10)
+        } else {
+            row_rect.right - px(12)
+        };
         label(
             hdc,
             RECT {
                 left: text_left,
                 top: row_rect.top + px(4),
-                right: row_rect.right - px(12),
+                right: text_right,
                 bottom: split,
             },
             &item.title(),
@@ -523,13 +524,42 @@ unsafe fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
             RECT {
                 left: text_left,
                 top: split,
-                right: row_rect.right - px(12),
+                right: text_right,
                 bottom: row_rect.bottom - px(4),
             },
             &item.description(),
             small_font,
             theme.text_dim_color(),
         );
+        if is_app {
+            let button = admin_button_rect(row_rect, scale);
+            // Lift the button off the row so it reads as its own control,
+            // brighter on the selected row where the row itself is highlighted.
+            fill_round_rect(
+                hdc,
+                button,
+                px(10),
+                if row == selected {
+                    theme.accent_active_color()
+                } else {
+                    theme.surface_color()
+                },
+            );
+            let shield_font = crate::theme::get_cached_symbol_font(px(16));
+            let shield = "\u{e7ef}"; // Admin: the UAC shield.
+            let glyph_width = crate::ui::measure_label(hdc, shield, shield_font);
+            let glyph_left = button.left + ((button.right - button.left - glyph_width) / 2).max(0);
+            label(
+                hdc,
+                RECT {
+                    left: glyph_left,
+                    ..button
+                },
+                shield,
+                shield_font,
+                theme.text_color(),
+            );
+        }
     }
 
     if rows.is_empty() {
@@ -761,6 +791,45 @@ fn invoke_selected(hwnd: HWND) {
     }
 }
 
+/// The full rectangle of result row `row`, in client coordinates. Drawing and
+/// hit-testing both derive geometry here so they cannot disagree.
+fn row_rect_at(client: RECT, scale: f32, row: usize) -> RECT {
+    let px = |value: i32| crate::ui::px(value, scale);
+    let item_height = px(ITEM_HEIGHT);
+    let top = px(ITEM_TOP) + row as i32 * item_height;
+    RECT {
+        left: px(18),
+        top,
+        right: client.right - px(18),
+        bottom: top + item_height - px(6),
+    }
+}
+
+/// The "run as administrator" button at the right of an application row. Present
+/// only for applications, but the geometry is pure so both the painter and the
+/// click handler agree on where it is.
+fn admin_button_rect(row_rect: RECT, scale: f32) -> RECT {
+    let px = |value: i32| crate::ui::px(value, scale);
+    let side = (row_rect.bottom - row_rect.top - px(14)).max(px(20));
+    let right = row_rect.right - px(10);
+    let top = row_rect.top + (row_rect.bottom - row_rect.top - side) / 2;
+    RECT {
+        left: right - side,
+        top,
+        right,
+        bottom: top + side,
+    }
+}
+
+/// The application on result row `index`, if that row is an application.
+fn app_at(index: usize) -> Option<crate::apps::AppEntry> {
+    let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    match results(&state.query).into_iter().nth(index) {
+        Some(ResultRow::App(entry)) => Some(entry),
+        _ => None,
+    }
+}
+
 /// Row index under a client-area `y`, if it lands on a populated result row.
 ///
 /// Row geometry is scaled when painted, so hit-testing has to scale identically
@@ -911,7 +980,21 @@ unsafe extern "system" fn wndproc(
             {
                 return LRESULT(0);
             }
-            if let Some(row) = row_at(hwnd, ((lparam.0 >> 16) & 0xffff) as i16 as i32) {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            if let Some(row) = row_at(hwnd, y) {
+                // The admin button sits inside the row, so test it first and let
+                // it win — otherwise the row's plain launch would fire underneath.
+                if let Some(entry) = app_at(row) {
+                    let mut client = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut client);
+                    let button = admin_button_rect(row_rect_at(client, scale(hwnd), row), scale(hwnd));
+                    if crate::ui::point_in_rect(x, y, &button) {
+                        let _ = DestroyWindow(hwnd);
+                        crate::apps::launch_as_admin(&entry);
+                        return LRESULT(0);
+                    }
+                }
                 STATE
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -1096,7 +1179,29 @@ pub fn close() {
 
 #[cfg(test)]
 mod tests {
-    use super::matching_indices;
+    use super::{admin_button_rect, matching_indices, row_rect_at};
+    use windows::Win32::Foundation::RECT;
+
+    #[test]
+    fn the_admin_button_sits_inside_its_row_at_every_scale() {
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 520,
+            bottom: 548,
+        };
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let row = row_rect_at(client, scale, 2);
+            let button = admin_button_rect(row, scale);
+            // Fully within the row, and hard against its right edge.
+            assert!(button.top >= row.top && button.bottom <= row.bottom);
+            assert!(button.left > row.left && button.right <= row.right);
+            assert!(button.right > button.left && button.bottom > button.top);
+            // The title/description reserve stops before the button starts.
+            let text_right = button.left - crate::ui::px(10, scale);
+            assert!(text_right > row.left, "no room left for the row's text");
+        }
+    }
 
     #[test]
     fn command_search_matches_titles_descriptions_and_keywords() {
