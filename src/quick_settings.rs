@@ -796,13 +796,18 @@ fn handle_click(hwnd: HWND, x: i32, y: i32) {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .input_target;
+                let layout = layout.clone();
+                // A keyboard-layout change only takes on the *foreground* window.
+                // The flyout is holding focus, so change it while the flyout is
+                // foreground and Windows discards it the moment focus returns to
+                // the app. Close first, hand focus back to the target, then apply.
+                close();
                 if target != 0 {
-                    crate::input::activate_for(HWND(target as *mut std::ffi::c_void), layout);
+                    let hwnd = HWND(target as *mut std::ffi::c_void);
+                    crate::focus::focus_hwnd(hwnd);
+                    crate::input::activate_for(hwnd, &layout);
                 }
-                STATE
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .input_expanded = false;
+                return;
             }
         }
         invalidate();
