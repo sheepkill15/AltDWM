@@ -488,13 +488,17 @@ fn rect_union(rects: impl Iterator<Item = RECT>) -> Option<RECT> {
     })
 }
 
-fn ranges_overlap(start_a: i32, end_a: i32, start_b: i32, end_b: i32) -> bool {
-    start_a < end_b && start_b < end_a
-}
-
-/// Apply the changed edges of one tile to the neighbors that shared those
-/// boundaries. Outer layout edges stay anchored so a resize cannot intrude into
-/// panels or outside the monitor's managed area.
+/// Apply the changed edges of one tile to every tile that shares the boundary
+/// the user moved. A boundary is a full column or row divider — the tiles that
+/// touch it are not only the dragged tile's immediate neighbours — so each edge
+/// co-linear with a moved edge is shifted by the same delta. That is what lets a
+/// left-column window follow the divider even when it does not sit directly
+/// beside the dragged tile (e.g. one tall window on the left, two stacked on the
+/// right: widening the lower-right window must move the left window's edge *and*
+/// the upper-right window's edge, not just one of them).
+///
+/// Outer layout edges stay anchored so a resize cannot intrude into panels or
+/// outside the monitor's managed area.
 fn adjust_rects_for_resize(
     slots: &[(isize, RECT)],
     dragged: isize,
@@ -502,7 +506,9 @@ fn adjust_rects_for_resize(
     mut final_rect: RECT,
 ) -> Option<(RECT, HashMap<isize, RECT>)> {
     const MIN_TILE: i32 = 80;
-    const MAX_SHARED_GAP: i32 = 64;
+    // How far apart two edges can be and still count as the same divider — a
+    // little more than any reasonable inter-tile gap.
+    const SHARED_EDGE_SLACK: i32 = 64;
     let bounds = rect_union(slots.iter().map(|(_, rect)| *rect))?;
 
     if start.left == bounds.left {
@@ -530,41 +536,54 @@ fn adjust_rects_for_resize(
         .bottom
         .clamp(final_rect.top + MIN_TILE, bounds.bottom);
 
+    // Deltas of the edges the drag actually moved (after clamping), so every
+    // co-linear edge can be shifted to keep the divider straight.
+    let delta_left = final_rect.left - start.left;
+    let delta_right = final_rect.right - start.right;
+    let delta_top = final_rect.top - start.top;
+    let delta_bottom = final_rect.bottom - start.bottom;
+    let near = |a: i32, b: i32| (a - b).abs() <= SHARED_EDGE_SLACK;
+
     let mut adjusted: HashMap<isize, RECT> = slots.iter().copied().collect();
     adjusted.insert(dragged, final_rect);
 
     for (key, original) in slots.iter().copied().filter(|(key, _)| *key != dragged) {
         let mut rect = original;
-        let vertical_overlap = ranges_overlap(start.top, start.bottom, rect.top, rect.bottom);
-        let horizontal_overlap = ranges_overlap(start.left, start.right, rect.left, rect.right);
-
-        let right_gap = rect.left - start.right;
-        if final_rect.right != start.right
-            && vertical_overlap
-            && (0..=MAX_SHARED_GAP).contains(&right_gap)
-        {
-            rect.left = (final_rect.right + right_gap).min(rect.right - MIN_TILE);
+        // A vertical divider moved: shift every left/right edge sitting on it,
+        // whether it faces the divider from the same side as the dragged tile or
+        // the opposite side.
+        if delta_left != 0 {
+            if near(rect.left, start.left) {
+                rect.left = (rect.left + delta_left).clamp(bounds.left, rect.right - MIN_TILE);
+            }
+            if near(rect.right, start.left) {
+                rect.right = (rect.right + delta_left).clamp(rect.left + MIN_TILE, bounds.right);
+            }
         }
-        let left_gap = start.left - rect.right;
-        if final_rect.left != start.left
-            && vertical_overlap
-            && (0..=MAX_SHARED_GAP).contains(&left_gap)
-        {
-            rect.right = (final_rect.left - left_gap).max(rect.left + MIN_TILE);
+        if delta_right != 0 {
+            if near(rect.left, start.right) {
+                rect.left = (rect.left + delta_right).clamp(bounds.left, rect.right - MIN_TILE);
+            }
+            if near(rect.right, start.right) {
+                rect.right = (rect.right + delta_right).clamp(rect.left + MIN_TILE, bounds.right);
+            }
         }
-        let bottom_gap = rect.top - start.bottom;
-        if final_rect.bottom != start.bottom
-            && horizontal_overlap
-            && (0..=MAX_SHARED_GAP).contains(&bottom_gap)
-        {
-            rect.top = (final_rect.bottom + bottom_gap).min(rect.bottom - MIN_TILE);
+        if delta_top != 0 {
+            if near(rect.top, start.top) {
+                rect.top = (rect.top + delta_top).clamp(bounds.top, rect.bottom - MIN_TILE);
+            }
+            if near(rect.bottom, start.top) {
+                rect.bottom = (rect.bottom + delta_top).clamp(rect.top + MIN_TILE, bounds.bottom);
+            }
         }
-        let top_gap = start.top - rect.bottom;
-        if final_rect.top != start.top
-            && horizontal_overlap
-            && (0..=MAX_SHARED_GAP).contains(&top_gap)
-        {
-            rect.bottom = (final_rect.top - top_gap).max(rect.top + MIN_TILE);
+        if delta_bottom != 0 {
+            if near(rect.top, start.bottom) {
+                rect.top = (rect.top + delta_bottom).clamp(bounds.top, rect.bottom - MIN_TILE);
+            }
+            if near(rect.bottom, start.bottom) {
+                rect.bottom =
+                    (rect.bottom + delta_bottom).clamp(rect.top + MIN_TILE, bounds.bottom);
+            }
         }
         adjusted.insert(key, rect);
     }
@@ -1971,6 +1990,46 @@ mod tests {
         let (_, adjusted) = adjust_rects_for_resize(&slots, 10, slots[0].1, resized).unwrap();
         assert_eq!(adjusted[&10].right, 700);
         assert_eq!(adjusted[&20].left, 710);
+        assert_eq!(adjusted[&20].right, 990);
+    }
+
+    #[test]
+    fn resizing_a_column_divider_moves_every_tile_on_it() {
+        use windows::Win32::Foundation::RECT;
+        // One tall window on the left, two stacked on the right, sharing one
+        // vertical divider at x≈600/610.
+        let left = RECT {
+            left: 10,
+            top: 10,
+            right: 600,
+            bottom: 990,
+        };
+        let top_right = RECT {
+            left: 610,
+            top: 10,
+            right: 990,
+            bottom: 490,
+        };
+        let bottom_right = RECT {
+            left: 610,
+            top: 510,
+            right: 990,
+            bottom: 990,
+        };
+        let slots = vec![(10, left), (20, top_right), (30, bottom_right)];
+        // Widen the *lower* right window leftward: drag its left edge 610 -> 510.
+        let resized = RECT {
+            left: 510,
+            ..bottom_right
+        };
+        let (_, adjusted) = adjust_rects_for_resize(&slots, 30, bottom_right, resized).unwrap();
+        // The dragged window took the new edge...
+        assert_eq!(adjusted[&30].left, 510);
+        // ...the tall left window's shared edge followed it...
+        assert_eq!(adjusted[&10].right, 500);
+        // ...and — the bug this guards — so did the *other* right-column window,
+        // even though it never overlapped the dragged tile.
+        assert_eq!(adjusted[&20].left, 510);
         assert_eq!(adjusted[&20].right, 990);
     }
 

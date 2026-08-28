@@ -216,26 +216,50 @@ fn worker_loop(status: Arc<Mutex<SystemStatus>>, receiver: Receiver<Command>) {
 
         match receiver.recv_timeout(POLL_INTERVAL) {
             Ok(command) => {
-                match command {
-                    Command::SetVolume(level) => audio.set_level(level),
-                    Command::AdjustVolume(delta) => audio.adjust(delta),
-                    Command::ToggleMute => audio.toggle_mute(),
+                // Drain everything queued right now and coalesce it. A brightness
+                // drag posts a command per mouse step, and each brightness write
+                // is a full DDC/CI conversation (~tens of ms); applied one by one
+                // they back the queue up and the display crawls seconds behind the
+                // pointer. Collapsing the batch to a single final brightness (and
+                // volume) write keeps the hardware in step with the drag.
+                let mut batch = vec![command];
+                while let Ok(next) = receiver.try_recv() {
+                    batch.push(next);
+                }
+                let mut brightness_target: Option<u8> = None;
+                for command in batch {
+                    match command {
+                        Command::SetVolume(level) => audio.set_level(level),
+                        Command::AdjustVolume(delta) => audio.adjust(delta),
+                        Command::ToggleMute => audio.toggle_mute(),
+                        // Fold successive brightness commands into one target; the
+                        // running value is the base for a relative nudge so a mix
+                        // of set and adjust in the same batch still composes.
+                        Command::SetBrightness(percent) => {
+                            brightness_target = Some(percent.min(100));
+                        }
+                        Command::AdjustBrightness(delta) => {
+                            let base = brightness_target
+                                .or_else(|| brightness.map(|status| status.percent))
+                                .or_else(|| brightness::read().map(|status| status.percent));
+                            if let Some(base) = base {
+                                brightness_target =
+                                    Some((i32::from(base) + delta).clamp(0, 100) as u8);
+                            }
+                        }
+                        Command::SetWiFiRadio(enabled) => {
+                            net::set_radio(enabled);
+                            slow_due = true;
+                        }
+                        // Refresh is what quick settings sends when it opens.
+                        Command::Refresh => slow_due = true,
+                    }
+                }
+                if let Some(percent) = brightness_target {
                     // A write is the one time the slow readings are known to be
                     // stale, so re-read them on the next turn of the loop.
-                    Command::SetBrightness(percent) => {
-                        brightness::write(percent);
-                        slow_due = true;
-                    }
-                    Command::AdjustBrightness(delta) => {
-                        brightness::adjust(delta, brightness);
-                        slow_due = true;
-                    }
-                    Command::SetWiFiRadio(enabled) => {
-                        net::set_radio(enabled);
-                        slow_due = true;
-                    }
-                    // Refresh is what quick settings sends when it opens.
-                    Command::Refresh => slow_due = true,
+                    brightness::write(percent);
+                    slow_due = true;
                 }
                 // Loop straight back round so the UI reflects the change on the
                 // next paint rather than up to a second later.
@@ -699,18 +723,6 @@ mod brightness {
             }
         }
         release(monitors);
-    }
-
-    /// Nudge brightness relative to the value already on hand.
-    ///
-    /// Takes the last known reading rather than fetching a fresh one, so holding
-    /// a brightness key does not issue two DDC/CI conversations per step.
-    pub fn adjust(delta: i32, known: Option<BrightnessStatus>) {
-        let Some(current) = known.or_else(read) else {
-            return;
-        };
-        let next = (i32::from(current.percent) + delta).clamp(0, 100) as u8;
-        write(next);
     }
 }
 

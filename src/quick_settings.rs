@@ -116,6 +116,10 @@ struct State {
     /// live system state and enumerates keyboard layouts — on each of the many
     /// `WM_MOUSEMOVE` messages a drag produces.
     dragging: Option<(Slider, RECT)>,
+    /// Value the pointer indicates during an active drag. The slider draws from
+    /// this so the knob tracks the pointer immediately, while the hardware value
+    /// it reports back catches up asynchronously (brightness reads are slow).
+    drag_value: Option<u8>,
     input_target: isize,
     input_expanded: bool,
     anchor_edge: Option<String>,
@@ -429,18 +433,32 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
         // The resize repaints; this pass would draw against stale bounds.
         return;
     }
-    let hovered = STATE.lock().unwrap_or_else(|error| error.into_inner()).hovered;
+    let (hovered, drag_which, drag_value) = {
+        let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            state.hovered,
+            state.dragging.map(|(which, _)| which),
+            state.drag_value,
+        )
+    };
     let rects = row_rects(client, &rows, scale);
     for (index, (row, rect)) in rows.iter().zip(&rects).enumerate() {
         let is_hovered = hovered == Some(index);
         match row {
             Row::Slider {
+                which,
                 label,
                 value,
                 available,
                 detail,
-                ..
             } => {
+                // While this slider is being dragged, show the pointer's value so
+                // the knob tracks the cursor instead of the slow hardware reading.
+                let value = if drag_which == Some(*which) {
+                    drag_value.unwrap_or(*value)
+                } else {
+                    *value
+                };
                 let track = track_rect(*rect, scale);
                 // The label band is whatever the track leaves, rather than a
                 // fixed height that clips at a larger theme font size.
@@ -466,7 +484,7 @@ fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
                 fill_round_rect(hdc, &track, rect_height(&track) / 2, theme.surface_color());
                 if *available {
                     let width = rect_width(&track);
-                    let filled = width * i32::from(*value) / 100;
+                    let filled = width * i32::from(value) / 100;
                     let done = RECT {
                         right: track.left + filled,
                         ..track
@@ -751,11 +769,13 @@ fn handle_click(hwnd: HWND, x: i32, y: i32) {
                 let track = track_rect(*rect, scale);
                 // Clicking anywhere in the row jumps to that value and starts a
                 // drag, which is what every slider does.
-                apply_slider(*which, value_from_x(track, x));
-                STATE
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .dragging = Some((*which, track));
+                let value = value_from_x(track, x);
+                apply_slider(*which, value);
+                {
+                    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+                    state.dragging = Some((*which, track));
+                    state.drag_value = Some(value);
+                }
                 unsafe {
                     SetCapture(hwnd);
                 }
@@ -845,7 +865,12 @@ fn handle_drag(x: i32) {
     let Some((which, track)) = dragging else {
         return;
     };
-    apply_slider(which, value_from_x(track, x));
+    let value = value_from_x(track, x);
+    apply_slider(which, value);
+    STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .drag_value = Some(value);
     invalidate();
 }
 
@@ -943,10 +968,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            STATE
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .dragging = None;
+            {
+                let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+                state.dragging = None;
+                state.drag_value = None;
+            }
             let _ = ReleaseCapture();
             LRESULT(0)
         }
@@ -986,6 +1012,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
             state.hwnd = 0;
             state.dragging = None;
+            state.drag_value = None;
             state.hovered = None;
             LRESULT(0)
         }
