@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -17,9 +16,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::config::{Config, PanelConfig};
@@ -207,6 +206,7 @@ fn paint_panel(
     rect: RECT,
     windows: Vec<HWND>,
 ) {
+    let _antialias = ui::begin_antialiased_paint(hdc);
     let ctx = build_ctx(panel, rect, hwnd, windows);
     fill_rect(hdc, &rect, panel.background);
     let rects = widget_rects(panel, rect, &ctx);
@@ -217,7 +217,12 @@ fn paint_panel(
                 .is_some_and(|(x, y)| ui::point_in_rect(x, y, &item))
         {
             let highlight = widgets::widget_content_rect(item, &ctx);
-            fill_round_rect(hdc, &highlight, ctx.radius(), ctx.theme.surface_hover_color());
+            fill_round_rect(
+                hdc,
+                &highlight,
+                ctx.radius(),
+                ctx.theme.surface_hover_color(),
+            );
         }
         widget.draw(hdc, item, &ctx);
     }
@@ -262,8 +267,7 @@ unsafe extern "system" fn panel_wndproc(
                 // The paint path fills every pixel itself, so erasing first
                 // would expose a blank frame.
                 if changed {
-                    let _ =
-                        windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -418,10 +422,8 @@ unsafe extern "system" fn panel_wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            let _ =
-                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_TICK);
-            let _ =
-                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_FAST);
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_TICK);
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_FAST);
             POINTERS
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -435,10 +437,7 @@ unsafe extern "system" fn panel_wndproc(
 
 /// The widget under `point`, resolved and cloned out so the caller can invoke it
 /// with no lock held. Returns the owning panel's name for logging.
-fn resolve_hit(
-    hwnd: HWND,
-    point: (i32, i32),
-) -> Option<(String, Arc<dyn Widget>, RECT, PanelCtx)> {
+fn resolve_hit(hwnd: HWND, point: (i32, i32)) -> Option<(String, Arc<dyn Widget>, RECT, PanelCtx)> {
     // Gathered before the lock for the same reason as in WM_PAINT.
     let snapshot = crate::manager::window_snapshot();
     let panel_arc = panel_collection()?;

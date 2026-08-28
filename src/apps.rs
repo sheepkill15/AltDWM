@@ -11,6 +11,7 @@
 //! `ShellExecuteW` on `shell:AppsFolder\<id>` — no COM activation, and it works
 //! identically for both kinds of app.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -20,6 +21,9 @@ pub struct AppEntry {
     pub name: String,
     /// AppUserModelID, the folder-relative parsing name.
     pub id: String,
+    /// Small shell icon owned by the application index. Stored as a raw value
+    /// so search results can be cloned without duplicating or freeing it.
+    pub icon: isize,
     /// Lowercased name, kept so scoring does not re-allocate per keystroke.
     lowercase: String,
     /// First letter of each word, e.g. `vsc` for `Visual Studio Code`.
@@ -51,9 +55,25 @@ pub fn begin_indexing() {
             let _guard = IndexingGuard;
             let mut entries = enumerate();
             entries.sort_by(|a, b| a.lowercase.cmp(&b.lowercase));
-            entries.dedup_by(|a, b| a.id == b.id);
-            println!("[apps] indexed {} applications", entries.len());
-            *index.lock().unwrap_or_else(|error| error.into_inner()) = entries;
+            let mut ids = HashSet::new();
+            entries.retain(|entry| {
+                if ids.insert(entry.id.clone()) {
+                    true
+                } else {
+                    release_icon(entry.icon);
+                    false
+                }
+            });
+            let icon_count = entries.iter().filter(|entry| entry.icon != 0).count();
+            println!(
+                "[apps] indexed {} applications ({icon_count} icons)",
+                entries.len()
+            );
+            let mut index = index.lock().unwrap_or_else(|error| error.into_inner());
+            for previous in index.drain(..) {
+                release_icon(previous.icon);
+            }
+            *index = entries;
             INDEXED.store(true, Ordering::SeqCst);
             crate::command_center::invalidate();
         });
@@ -139,9 +159,39 @@ fn make_entry(name: String, id: String) -> Option<AppEntry> {
     Some(AppEntry {
         name,
         id: id.trim().to_string(),
+        icon: 0,
         lowercase,
         initials,
     })
+}
+
+fn shell_icon(item: &windows::Win32::UI::Shell::IShellItem) -> isize {
+    use windows::core::Interface;
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::UI::Shell::{IShellItemImageFactory, SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT};
+
+    let Ok(factory) = item.cast::<IShellItemImageFactory>() else {
+        return 0;
+    };
+    unsafe {
+        factory
+            .GetImage(
+                SIZE { cx: 32, cy: 32 },
+                SIIGBF_ICONONLY | SIIGBF_RESIZETOFIT,
+            )
+            .map(|bitmap| bitmap.0 as isize)
+            .unwrap_or(0)
+    }
+}
+
+fn release_icon(icon: isize) {
+    if icon != 0 {
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(
+                windows::Win32::Graphics::Gdi::HBITMAP(icon as *mut std::ffi::c_void).into(),
+            );
+        }
+    }
 }
 
 fn enumerate() -> Vec<AppEntry> {
@@ -158,21 +208,21 @@ fn enumerate() -> Vec<AppEntry> {
     }
     let mut entries = Vec::new();
     unsafe {
-        let folder: IShellItem =
-            match SHCreateItemFromParsingName(w!("shell:AppsFolder"), None) {
-                Ok(folder) => folder,
-                Err(error) => {
-                    eprintln!("[apps] cannot open shell:AppsFolder: {error:?}");
-                    return entries;
-                }
-            };
-        let enumerator: IEnumShellItems = match folder.BindToHandler(None, &windows::Win32::UI::Shell::BHID_EnumItems) {
-            Ok(enumerator) => enumerator,
+        let folder: IShellItem = match SHCreateItemFromParsingName(w!("shell:AppsFolder"), None) {
+            Ok(folder) => folder,
             Err(error) => {
-                eprintln!("[apps] cannot enumerate shell:AppsFolder: {error:?}");
+                eprintln!("[apps] cannot open shell:AppsFolder: {error:?}");
                 return entries;
             }
         };
+        let enumerator: IEnumShellItems =
+            match folder.BindToHandler(None, &windows::Win32::UI::Shell::BHID_EnumItems) {
+                Ok(enumerator) => enumerator,
+                Err(error) => {
+                    eprintln!("[apps] cannot enumerate shell:AppsFolder: {error:?}");
+                    return entries;
+                }
+            };
         loop {
             let mut fetched: [Option<IShellItem>; 1] = [None];
             let mut count = 0u32;
@@ -200,7 +250,8 @@ fn enumerate() -> Vec<AppEntry> {
                     text
                 })
                 .unwrap_or_default();
-            if let Some(entry) = make_entry(name, id) {
+            if let Some(mut entry) = make_entry(name, id) {
+                entry.icon = shell_icon(&item);
                 entries.push(entry);
             }
         }
@@ -328,7 +379,10 @@ pub fn launch(entry: &AppEntry) {
         );
         // ShellExecuteW reports failure as a pseudo-handle of 32 or less.
         if (result.0 as isize) <= 32 {
-            eprintln!("[apps] failed to launch {}: {}", entry.name, result.0 as isize);
+            eprintln!(
+                "[apps] failed to launch {}: {}",
+                entry.name, result.0 as isize
+            );
         }
     }
 }

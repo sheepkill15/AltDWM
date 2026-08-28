@@ -196,20 +196,26 @@ static FONT_CACHE: LazyLock<Mutex<HashMap<String, isize>>> =
 /// Cached font variant used by richer shell surfaces without creating GDI
 /// objects during every paint.
 pub fn get_cached_font_variant(theme: &Theme, size: i32, weight: i32) -> HFONT {
+    get_cached_font_family_variant(&theme.font_name, size, weight)
+}
+
+/// Windows 11's native symbol face. Keeping it separate from the configured
+/// text face prevents private-use icon codepoints from turning into tofu.
+pub fn get_cached_symbol_font(size: i32) -> HFONT {
+    get_cached_font_family_variant("Segoe Fluent Icons", size, 400)
+}
+
+fn get_cached_font_family_variant(family: &str, size: i32, weight: i32) -> HFONT {
     use windows::Win32::Graphics::Gdi::{
-        CreateFontW, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, FF_DONTCARE,
-        OUT_DEFAULT_PRECIS, VARIABLE_PITCH,
+        CreateFontW, CLEARTYPE_NATURAL_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, FF_DONTCARE,
+        FONT_QUALITY, OUT_DEFAULT_PRECIS, VARIABLE_PITCH,
     };
-    let key = format!("{}:{size}:{weight}", theme.font_name);
+    let key = format!("{family}:{size}:{weight}");
     let mut cache = FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&v) = cache.get(&key) {
         return HFONT(v as *mut std::ffi::c_void);
     }
-    let name_wide: Vec<u16> = theme
-        .font_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let name_wide: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
     let h = unsafe {
         CreateFontW(
             -size,
@@ -223,7 +229,7 @@ pub fn get_cached_font_variant(theme: &Theme, size: i32, weight: i32) -> HFONT {
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            DEFAULT_QUALITY,
+            FONT_QUALITY(CLEARTYPE_NATURAL_QUALITY as u8),
             VARIABLE_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
             windows::core::PCWSTR(name_wide.as_ptr()),
         )

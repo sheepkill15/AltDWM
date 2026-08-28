@@ -508,7 +508,10 @@ impl Config {
     pub fn validate(&self) -> Vec<String> {
         let mut warns = Vec::new();
         if self.general.gap < 0 {
-            warns.push(format!("general.gap cannot be negative ({})", self.general.gap));
+            warns.push(format!(
+                "general.gap cannot be negative ({})",
+                self.general.gap
+            ));
         }
         if self.general.outer_gap.is_some_and(|gap| gap < 0) {
             warns.push("general.outer_gap cannot be negative".to_string());
@@ -546,7 +549,15 @@ impl Config {
         // ignored unless `--check-config` says so.
         if !matches!(
             self.general.tray.trim().to_ascii_lowercase().as_str(),
-            "auto" | "native" | "host" | "shell" | "explorer" | "uia" | "mirror" | "off" | "none"
+            "auto"
+                | "native"
+                | "host"
+                | "shell"
+                | "explorer"
+                | "uia"
+                | "mirror"
+                | "off"
+                | "none"
                 | "disabled"
         ) {
             warns.push(format!(
@@ -663,7 +674,10 @@ impl Config {
                     index + 1
                 ));
             }
-            if rule.opacity.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+            if rule
+                .opacity
+                .is_some_and(|value| !(0.0..=1.0).contains(&value))
+            {
                 warns.push(format!(
                     "rule #{} opacity must be between 0.0 and 1.0",
                     index + 1
@@ -698,6 +712,7 @@ pub fn ensure_default_bar(cfg: &mut Config) {
             "launcher".into(),
             "layout".into(),
             "window_list".into(),
+            "system".into(),
             "tray".into(),
             "clock".into(),
         ],
@@ -708,7 +723,7 @@ pub fn ensure_default_bar(cfg: &mut Config) {
 pub fn builtin_widget_config(name: &str) -> Option<WidgetConfig> {
     let widget_type = match name {
         "spacer" | "workspaces" | "layout" | "window_title" | "tray" | "clock" | "launcher"
-        | "window_list" | "volume" | "battery" | "network" | "input" => name,
+        | "window_list" | "volume" | "battery" | "network" | "input" | "system" => name,
         _ => return None,
     };
     Some(WidgetConfig {
@@ -1055,7 +1070,10 @@ mod tests {
             },
         );
         assert!(
-            !config.validate().iter().any(|w| w.contains("general.layout")),
+            !config
+                .validate()
+                .iter()
+                .any(|w| w.contains("general.layout")),
             "a layout declared in [layouts] is legitimate"
         );
     }

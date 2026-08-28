@@ -71,10 +71,7 @@ widgets = [
     "layout",
     "window_list",
     "cpu",
-    "input",
-    "volume",
-    "network",
-    "battery",
+    "system",
     "tray",
     "clock",
 ]
@@ -106,7 +103,7 @@ name = "tray"
 # geometry. `max_items` caps how many reach the bar — the rest go to the
 # overflow button.
 # width = 176
-# max_items = 8
+# max_items = 3 # default
 
 [[widgets]]
 type = "clock"
@@ -115,27 +112,15 @@ format = "%H:%M"
 interval = 500
 width = 136
 
-# System status. Each of these opens quick settings on click; volume also
-# responds to the scroll wheel, and the input indicator cycles layouts.
+# One configurable system cluster. Click opens quick settings anchored below
+# this top panel; scrolling changes volume. Disable any part independently.
 [[widgets]]
-type = "input"
-name = "input"
-width = 56
-
-[[widgets]]
-type = "volume"
-name = "volume"
-width = 84
-
-[[widgets]]
-type = "network"
-name = "network"
-width = 132
-
-[[widgets]]
-type = "battery"
-name = "battery"
-width = 92
+type = "system_status"
+name = "system"
+show_volume = true
+show_network = true
+show_battery = true
+show_input = true
 
 [[widgets]]
 type = "custom"
@@ -151,13 +136,6 @@ match_class_regex = "(?i)spotify"
 floating = true
 opacity = 0.94
 on_create = 'rhai: log("Spotify matched the full-demo rule")'
-
-# Steam's friends/chat utility is an independent top-level window, but it is
-# better treated as a persistent floating palette than a member of the layout.
-[[rules]]
-match_process = "steamwebhelper.exe"
-match_title_regex = "(?i)(friends list|steam chat|friends & chat)"
-floating = true
 
 [[keybinds]]
 keys = "Alt+Shift+R"

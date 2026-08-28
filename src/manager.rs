@@ -9,6 +9,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowRect, IsWindow, IsZoomed, SendMessageTimeoutW, SetWindowPos,
     ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_TOP, MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, WM_GETMINMAXINFO, WS_EX_DLGMODALFRAME,
+    WS_EX_TOOLWINDOW,
 };
 
 use crate::layout::{compute_layout, Layout};
@@ -221,7 +222,8 @@ fn is_utility_window_at_birth(hwnd: HWND) -> bool {
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let owned = GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.0.is_null());
         let modal_frame = (ex_style & WS_EX_DLGMODALFRAME.0) != 0;
-        owned || modal_frame
+        let tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
+        owned || modal_frame || tool_window
     }
 }
 
@@ -237,17 +239,69 @@ fn has_fixed_size(constraints: WindowConstraints) -> bool {
         && constraints.min_height >= constraints.max_height.saturating_sub(2)
 }
 
+/// A secondary window that opens as a compact palette is usually transient even
+/// when its toolkit did not set an owner or WS_EX_TOOLWINDOW. This is evaluated
+/// only on first sight, before AltDWM has assigned a tile, so our own geometry
+/// can never turn a normal window into a utility window later.
+fn is_compact_secondary_window(hwnd: HWND, sibling_count: usize) -> bool {
+    if sibling_count < 2 {
+        return false;
+    }
+    let mut window = RECT::default();
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        if GetWindowRect(hwnd, &mut window).is_err()
+            || !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut _).as_bool()
+        {
+            return false;
+        }
+    }
+    compact_secondary_rect(window, info.rcWork)
+}
+
+fn compact_secondary_rect(window: RECT, work: RECT) -> bool {
+    let width = (window.right - window.left).max(0) as i64;
+    let height = (window.bottom - window.top).max(0) as i64;
+    let work_width = (work.right - work.left).max(1) as i64;
+    let work_height = (work.bottom - work.top).max(1) as i64;
+    width > 0
+        && height > 0
+        && width * 100 <= work_width * 70
+        && height * 100 <= work_height * 90
+        && width * height * 100 <= work_width * work_height * 45
+}
+
 /// Decide once per window whether it is an automatic utility window.
 ///
-/// Two rules keep this stable. Nothing derived from the window's geometry is
-/// consulted, because AltDWM sets that geometry and would otherwise reinforce
-/// its own verdict forever. And the size-limit test is deferred by one pass:
-/// at EVENT_OBJECT_CREATE many applications have not finished applying styles
-/// or answering WM_GETMINMAXINFO, and a normal application window read too
-/// early looks exactly like a fixed-size dialog.
-fn classify_utility_window(hwnd: HWND, constraints: WindowConstraints) -> bool {
+/// Two rules keep this stable. Compact geometry is consulted only on the first
+/// sighting, before AltDWM can have placed the window, and that verdict is then
+/// cached. The size-limit test is deferred by one pass: at EVENT_OBJECT_CREATE
+/// many applications have not finished applying styles or answering
+/// WM_GETMINMAXINFO, and a normal application window read too early looks
+/// exactly like a fixed-size dialog.
+fn classify_utility_window(
+    hwnd: HWND,
+    constraints: WindowConstraints,
+    sibling_count: usize,
+) -> bool {
     let key = hwnd.0 as isize;
     if is_utility_window_at_birth(hwnd) {
+        UTILITY_CLASS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, Some(true));
+        return true;
+    }
+    if !UTILITY_CLASS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(&key)
+        && is_compact_secondary_window(hwnd, sibling_count)
+    {
         UTILITY_CLASS
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -624,9 +678,7 @@ fn assign_slots(limits: &[WindowConstraints], slots: &[RECT]) -> SlotAssignment 
     let n = limits.len().min(slots.len());
     let mut slot_for_window: Vec<usize> = (0..n).collect();
     let mut unplaceable: Vec<usize> = Vec::new();
-    let fits = |window: usize, slot: usize| {
-        !rect_violates_constraints(slots[slot], limits[window])
-    };
+    let fits = |window: usize, slot: usize| !rect_violates_constraints(slots[slot], limits[window]);
 
     // Each clean trade settles one window permanently and each failure marks one
     // unplaceable, so `2n + 2` rounds is generous; the bound exists so
@@ -637,9 +689,8 @@ fn assign_slots(limits: &[WindowConstraints], slots: &[RECT]) -> SlotAssignment 
         }) else {
             break;
         };
-        let available = |other: &usize| -> bool {
-            *other != broken && !unplaceable.contains(other)
-        };
+        let available =
+            |other: &usize| -> bool { *other != broken && !unplaceable.contains(other) };
         // Prefer a trade that leaves the partner satisfied too, taking the
         // tightest such slot so the roomiest tiles stay free for whoever needs
         // them.
@@ -1206,30 +1257,24 @@ fn contain_floating_windows(
 }
 
 /// Tile with explicit top/bottom reserves (for panels DSL)
-pub fn tile_windows_reserved(
-    top_reserve: i32,
-    bottom_reserve: i32,
-    layout: Layout,
-    gap: i32,
-) {
+pub fn tile_windows_reserved(top_reserve: i32, bottom_reserve: i32, layout: Layout, gap: i32) {
     // snapshot config once per tick to avoid repeated locking
     let cfg_snapshot = crate::CURRENT_CONFIG
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let verbose = std::env::var_os("ALT_DWM_VERBOSE").is_some();
-    let all_windows = collect_windows();
-    if all_windows.is_empty() {
-        clear_auto_floating();
-        return;
-    }
-
     // Workspaces are applied before anything else looks at the window list:
     // hiding is what makes a window absent from the layout. The cached
     // enumeration is reused rather than walking every top-level window a second
     // time in the same pass.
+    // Re-enumerate after the visibility change. In particular, switching away
+    // from an empty workspace means there were zero visible windows before this
+    // call; returning at that point stranded every hidden window until some
+    // unrelated window opened and caused another layout pass.
     crate::workspace::apply_visibility(&all_managed_windows());
-    let all_windows: Vec<HWND> = all_windows
+    invalidate_window_snapshot();
+    let all_windows: Vec<HWND> = collect_windows()
         .into_iter()
         .filter(|hwnd| crate::workspace::is_visible(*hwnd))
         .collect();
@@ -1276,13 +1321,33 @@ pub fn tile_windows_reserved(
     let mut windows = Vec::new();
     let mut floating = Vec::new();
     let mut auto_floating_keys = HashSet::new();
+    let process_counts: HashMap<String, usize> = if cfg_snapshot.general.auto_float_utility_windows
+    {
+        let mut counts = HashMap::new();
+        for hwnd in &all_windows {
+            let process = crate::rules::get_process_name(*hwnd).to_ascii_lowercase();
+            if !process.is_empty() {
+                *counts.entry(process).or_insert(0) += 1;
+            }
+        }
+        counts
+    } else {
+        HashMap::new()
+    };
     for hwnd in all_windows {
         let key = hwnd.0 as isize;
         let manual = crate::focus::is_runtime_floating(hwnd);
         let decision = resolved.get(&key).and_then(|rules| rules.floating);
         let automatic = decision.is_none()
             && cfg_snapshot.general.auto_float_utility_windows
-            && classify_utility_window(hwnd, constraints.get(&key).copied().unwrap_or_default());
+            && classify_utility_window(
+                hwnd,
+                constraints.get(&key).copied().unwrap_or_default(),
+                process_counts
+                    .get(&crate::rules::get_process_name(hwnd).to_ascii_lowercase())
+                    .copied()
+                    .unwrap_or(1),
+            );
         if manual || decision == Some(true) || automatic {
             if automatic {
                 auto_floating_keys.insert(key);
@@ -1593,9 +1658,10 @@ pub fn tile_windows_reserved(
 #[cfg(test)]
 mod tests {
     use super::{
-        adjust_rects_for_resize, assign_slots, contained_floating_rect, panel_reserves_for_monitor,
-        promote_in_order, reconcile_window_order, rect_violates_constraints, rects_are_close,
-        shift_within_order, swap_window_order, WindowConstraints,
+        adjust_rects_for_resize, assign_slots, compact_secondary_rect, contained_floating_rect,
+        panel_reserves_for_monitor, promote_in_order, reconcile_window_order,
+        rect_violates_constraints, rects_are_close, shift_within_order, swap_window_order,
+        WindowConstraints,
     };
     use crate::config::{Config, PanelConfig};
     use windows::Win32::Foundation::RECT;
@@ -1624,6 +1690,34 @@ mod tests {
                 min_height: 360,
                 ..Default::default()
             }
+        ));
+    }
+
+    #[test]
+    fn compact_secondary_windows_are_distinguished_from_full_size_peers() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(compact_secondary_rect(
+            RECT {
+                left: 1400,
+                top: 120,
+                right: 1820,
+                bottom: 900
+            },
+            work,
+        ));
+        assert!(!compact_secondary_rect(
+            RECT {
+                left: 100,
+                top: 60,
+                right: 1820,
+                bottom: 1020
+            },
+            work,
         ));
     }
 
@@ -1669,9 +1763,16 @@ mod tests {
             assignment.unplaceable.is_empty(),
             "a window that fits somewhere must never be floated"
         );
-        assert_eq!(assignment.slot_for_window[2], 0, "demanding window takes master");
         assert_eq!(
-            assignment.slot_for_window.iter().copied().collect::<std::collections::HashSet<_>>(),
+            assignment.slot_for_window[2], 0,
+            "demanding window takes master"
+        );
+        assert_eq!(
+            assignment
+                .slot_for_window
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
             [0, 1, 2].into_iter().collect(),
             "assignment must remain a permutation"
         );
@@ -1708,10 +1809,17 @@ mod tests {
     #[test]
     fn two_demanding_windows_share_the_slots_that_fit_them() {
         let slots = vec![tile(300, 300), tile(900, 900), tile(900, 900)];
-        let limits = vec![min_size(800, 800), min_size(800, 800), WindowConstraints::default()];
+        let limits = vec![
+            min_size(800, 800),
+            min_size(800, 800),
+            WindowConstraints::default(),
+        ];
         let assignment = assign_slots(&limits, &slots);
         assert!(assignment.unplaceable.is_empty());
-        assert_eq!(assignment.slot_for_window[2], 0, "relaxed window takes the small slot");
+        assert_eq!(
+            assignment.slot_for_window[2], 0,
+            "relaxed window takes the small slot"
+        );
     }
 
     #[test]

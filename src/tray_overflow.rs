@@ -94,6 +94,7 @@ fn content_height(count: usize, scale: f32) -> i32 {
 }
 
 fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
+    let _antialias = ui::begin_antialiased_paint(hdc);
     let theme = crate::CURRENT_CONFIG
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -189,12 +190,7 @@ fn handle_click(hwnd: HWND, x: i32, y: i32, button: Button) {
     tray::invoke(id, button);
 }
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let point = |lparam: LPARAM| {
         (
             (lparam.0 & 0xFFFF) as i16 as i32,
@@ -319,11 +315,9 @@ pub fn toggle(anchor: RECT, items: Vec<TrayEntry>) {
         close();
         return;
     }
-    if let Err(error) = crate::util::register_window_class(
-        w!("AltDWM_TrayOverflow"),
-        wndproc,
-        "TrayOverflow",
-    ) {
+    if let Err(error) =
+        crate::util::register_window_class(w!("AltDWM_TrayOverflow"), wndproc, "TrayOverflow")
+    {
         eprintln!("[tray-overflow] {error}");
         return;
     }
@@ -356,7 +350,10 @@ pub fn toggle(anchor: RECT, items: Vec<TrayEntry>) {
         )
     };
     let Ok(hwnd) = created else {
-        eprintln!("[tray-overflow] CreateWindowExW failed: {:?}", created.err());
+        eprintln!(
+            "[tray-overflow] CreateWindowExW failed: {:?}",
+            created.err()
+        );
         STATE
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -461,7 +458,10 @@ mod tests {
         };
         let (x, y) = placement(top_bar, work, 268, 200, 6);
         assert!(y >= 40, "flyout should sit below a top bar");
-        assert_eq!(x, work.left, "a left-edge anchor clamps rather than going off-screen");
+        assert_eq!(
+            x, work.left,
+            "a left-edge anchor clamps rather than going off-screen"
+        );
 
         // A display that cannot fit the flyout at all still yields a point
         // inside it rather than a negative one.

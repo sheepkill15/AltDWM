@@ -116,6 +116,13 @@ fn has_independent_app_presence(ex_style: u32, has_owner: bool) -> bool {
     (!has_owner || app_window) && (!tool_window || app_window)
 }
 
+fn is_named_transient(ex_style: u32, has_owner: bool, class: &str, title: &str) -> bool {
+    let tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
+    (has_owner || tool_window)
+        && !title.trim().is_empty()
+        && !matches!(class, "#32768" | "tooltips_class32")
+}
+
 fn is_manageable_impl(hwnd: HWND, include_minimized: bool) -> bool {
     unsafe {
         if hwnd.0.is_null() {
@@ -138,7 +145,11 @@ fn is_manageable_impl(hwnd: HWND, include_minimized: bool) -> bool {
         // Rejecting all owned windows caused legitimate application windows to
         // disappear from AltDWM entirely.
         let has_owner = GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.0.is_null());
-        if !has_independent_app_presence(ex_style, has_owner) {
+        let class = get_class_name(hwnd);
+        let title = get_window_title(hwnd);
+        if !has_independent_app_presence(ex_style, has_owner)
+            && !is_named_transient(ex_style, has_owner, &class, &title)
+        {
             return false;
         }
 
@@ -146,8 +157,10 @@ fn is_manageable_impl(hwnd: HWND, include_minimized: bool) -> bool {
             return false;
         }
 
-        let class = get_class_name(hwnd);
         // hard-coded shell classes
+        if class.starts_with("AltDWM_") {
+            return false;
+        }
         match class.as_str() {
             "Progman" => return false,
             "WorkerW" => return false,
@@ -169,7 +182,6 @@ fn is_manageable_impl(hwnd: HWND, include_minimized: bool) -> bool {
         if crate::is_ignored_class(&class) {
             return false;
         }
-        let title = get_window_title(hwnd);
         if !title.is_empty() && crate::is_ignored_title(&title) {
             return false;
         }
@@ -215,7 +227,7 @@ pub fn rect_to_string(r: &RECT) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::has_independent_app_presence;
+    use super::{has_independent_app_presence, is_named_transient};
     use windows::Win32::UI::WindowsAndMessaging::{WS_EX_APPWINDOW, WS_EX_TOOLWINDOW};
 
     #[test]
@@ -227,5 +239,22 @@ mod tests {
     fn transient_owned_and_tool_windows_are_not_independently_manageable() {
         assert!(!has_independent_app_presence(0, true));
         assert!(!has_independent_app_presence(WS_EX_TOOLWINDOW.0, false));
+    }
+
+    #[test]
+    fn named_transient_windows_can_enter_the_floating_policy() {
+        assert!(is_named_transient(0, true, "Dialog", "Save changes"));
+        assert!(is_named_transient(
+            WS_EX_TOOLWINDOW.0,
+            false,
+            "Palette",
+            "Friends"
+        ));
+        assert!(!is_named_transient(
+            WS_EX_TOOLWINDOW.0,
+            false,
+            "tooltips_class32",
+            "Tooltip"
+        ));
     }
 }

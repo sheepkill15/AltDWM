@@ -68,9 +68,7 @@ widgets = [
     "layout",
     "window_list",
     "cpu",
-    "input",
-    "volume",
-    "network",
+    "system",
     "tray",
     "clock",
 ]
@@ -101,7 +99,15 @@ name = "tray"
 # geometry. `max_items` caps how many reach the bar — the rest go to the
 # overflow button.
 # width = 180
-# max_items = 8
+# max_items = 3 # default
+
+[[widgets]]
+type = "system_status"
+name = "system"
+show_volume = true
+show_network = true
+show_battery = true
+show_input = true
 
 [[widgets]]
 type = "clock"
@@ -121,11 +127,6 @@ width = 150
 # class is SpotifyMainWindow, so the wildcard is what makes this rule fire.
 [[rules]]
 match_class = "*Spotify*"
-floating = true
-
-[[rules]]
-match_process = "steamwebhelper.exe"
-match_title_regex = "(?i)(friends list|steam chat|friends & chat)"
 floating = true
 
 [[keybinds]]

@@ -46,7 +46,8 @@ pub const MAX_WORKSPACES: usize = 9;
 static ASSIGNMENT: LazyLock<Mutex<HashMap<isize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Active workspace per monitor.
-static ACTIVE: LazyLock<Mutex<HashMap<isize, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static ACTIVE: LazyLock<Mutex<HashMap<isize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Windows AltDWM hid, and only those.
 static HIDDEN: LazyLock<Mutex<HashSet<isize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 /// How long after a switch AltDWM's own show/hide events keep arriving.
@@ -387,10 +388,14 @@ pub fn restore_all() {
 /// would never appear in `live`. Pruning it would be exactly how a window gets
 /// lost.
 pub fn retain_windows(live: &HashSet<isize>) {
+    let hidden = HIDDEN
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
     ASSIGNMENT
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .retain(|key, _| live.contains(key));
+        .retain(|key, _| live.contains(key) || hidden.contains(key));
 }
 
 /// Forget a destroyed window.
@@ -567,9 +572,11 @@ pub fn summary(monitor: isize, visible: &[HWND]) -> Vec<WorkspaceInfo> {
     let active = active_for_monitor(monitor);
     let mut occupied = vec![false; total];
     let hidden = hidden_windows();
-    let candidates = visible.iter().copied().chain(hidden.into_iter().filter(|hwnd| unsafe {
-        IsWindow(Some(*hwnd)).as_bool()
-    }));
+    let candidates = visible.iter().copied().chain(
+        hidden
+            .into_iter()
+            .filter(|hwnd| unsafe { IsWindow(Some(*hwnd)).as_bool() }),
+    );
     for hwnd in candidates {
         if monitor_of(hwnd) != monitor {
             continue;
@@ -593,9 +600,7 @@ pub fn summary(monitor: isize, visible: &[HWND]) -> Vec<WorkspaceInfo> {
 /// otherwise be permanently invisible.
 pub fn clamp_to_count() {
     let total = count();
-    let mut assignment = ASSIGNMENT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut assignment = ASSIGNMENT.lock().unwrap_or_else(|error| error.into_inner());
     for index in assignment.values_mut() {
         if *index >= total {
             *index = total - 1;
@@ -616,7 +621,10 @@ mod tests {
 
     #[test]
     fn journal_lines_round_trip_handle_and_process() {
-        assert_eq!(parse_journal_line("204ac 1234 Claude"), Some((0x204ac, 1234)));
+        assert_eq!(
+            parse_journal_line("204ac 1234 Claude"),
+            Some((0x204ac, 1234))
+        );
         // A title with spaces must not confuse the two leading fields.
         assert_eq!(
             parse_journal_line("1038c 99 Anime Relay - Episode 3"),
@@ -664,7 +672,10 @@ mod tests {
         // hide it — a minimized-to-tray application, for instance.
         let (hide, show) = visibility_plan(&[candidate(1, false, true, false)]);
         assert!(hide.is_empty());
-        assert!(show.is_empty(), "AltDWM must not un-hide what it did not hide");
+        assert!(
+            show.is_empty(),
+            "AltDWM must not un-hide what it did not hide"
+        );
     }
 
     #[test]

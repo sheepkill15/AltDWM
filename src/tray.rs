@@ -70,6 +70,9 @@ pub struct TrayEntry {
     /// `NIS_HIDDEN`: the application asked to sit in the overflow rather than
     /// on the bar itself.
     pub hidden: bool,
+    /// Owning executable when known. This lets the shell remove only duplicate
+    /// system controls without hiding a third-party app with a similar tooltip.
+    pub process: String,
 }
 
 /// Which mouse gesture to forward to the owning application.
@@ -196,11 +199,33 @@ pub fn shutdown() {
 }
 
 pub fn entries() -> Vec<TrayEntry> {
-    match ACTIVE.load(Ordering::SeqCst) {
+    let entries = match ACTIVE.load(Ordering::SeqCst) {
         ACTIVE_NATIVE => native::entries(),
         ACTIVE_EXPLORER => explorer::entries(),
         _ => Vec::new(),
+    };
+    entries
+        .into_iter()
+        .filter(|entry| !is_redundant_system_volume(entry))
+        .collect()
+}
+
+fn is_redundant_system_volume(entry: &TrayEntry) -> bool {
+    let process = entry.process.to_ascii_lowercase();
+    let system_owner = process.is_empty()
+        || matches!(
+            process.as_str(),
+            "explorer" | "explorer.exe" | "sndvol" | "sndvol.exe" | "sihost" | "sihost.exe"
+        );
+    if !system_owner {
+        return false;
     }
+    let name = title_line(&entry.name).trim().to_ascii_lowercase();
+    name == "volume"
+        || name.starts_with("volume ")
+        || name.starts_with("speakers (")
+        || name.starts_with("speakers:")
+        || name.starts_with("system volume")
 }
 
 /// Forward a click to whoever owns the item.
@@ -275,8 +300,8 @@ mod native {
         SetTimer, SetWindowPos, HICON, HMENU, HWND_BROADCAST, HWND_TOPMOST, SM_CXSCREEN,
         SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WM_CONTEXTMENU,
         WM_COPYDATA, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN,
-        WM_RBUTTONUP, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN,
-        WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        WM_RBUTTONUP, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
 
     /// `NIM_*`
@@ -346,6 +371,7 @@ mod native {
                 name,
                 icon: self.icon,
                 hidden: self.state & NIS_HIDDEN != 0,
+                process: self.process.clone(),
             }
         }
     }
@@ -387,7 +413,8 @@ mod native {
     static ICONS: LazyLock<Mutex<Vec<Icon>>> = LazyLock::new(|| Mutex::new(Vec::new()));
     static HOST: AtomicUsize = AtomicUsize::new(0);
     static ANNOUNCED: AtomicBool = AtomicBool::new(false);
-    static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("ALT_DWM_VERBOSE").is_some());
+    static VERBOSE: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("ALT_DWM_VERBOSE").is_some());
 
     fn taskbar_created_message() -> u32 {
         static MESSAGE: AtomicUsize = AtomicUsize::new(0);
@@ -526,9 +553,10 @@ mod native {
         let Some(slice) = bytes.get(offset..offset + chars * 2) else {
             return String::new();
         };
-        let units: Vec<u16> = slice
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        let (pairs, _) = slice.as_chunks::<2>();
+        let units: Vec<u16> = pairs
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .take_while(|unit| *unit != 0)
             .collect();
         String::from_utf16_lossy(&units)
@@ -882,8 +910,10 @@ mod native {
                         if data.lpData.is_null() || data.cbData == 0 {
                             return LRESULT(0);
                         }
-                        let payload =
-                            std::slice::from_raw_parts(data.lpData as *const u8, data.cbData as usize);
+                        let payload = std::slice::from_raw_parts(
+                            data.lpData as *const u8,
+                            data.cbData as usize,
+                        );
                         let sender = HWND(wparam.0 as *mut std::ffi::c_void);
                         match decode(payload, sender_pointer_width(sender)) {
                             Some(notification) => {
@@ -1261,6 +1291,7 @@ mod explorer {
                 name: name.clone(),
                 icon: 0,
                 hidden: false,
+                process: String::new(),
             })
             .collect()
     }
@@ -1289,7 +1320,7 @@ mod explorer {
 #[cfg(test)]
 mod tests {
     use super::native::{decode, wire_layout};
-    use super::{compact_name, title_line, Source};
+    use super::{compact_name, is_redundant_system_volume, title_line, Source, TrayEntry, TrayId};
 
     #[test]
     fn tray_labels_are_unicode_safe_and_bounded() {
@@ -1303,6 +1334,20 @@ mod tests {
         assert_eq!(compact_name("Show Hidden Icons"), "More");
         assert_eq!(compact_name("Network Internet access"), "Network");
         assert_eq!(compact_name("Volume Speakers: 24%"), "Audio");
+    }
+
+    #[test]
+    fn only_the_shell_owned_volume_control_is_suppressed() {
+        let mut entry = TrayEntry {
+            id: TrayId::Native { owner: 1, uid: 1 },
+            name: "Speakers: 75%".into(),
+            icon: 0,
+            hidden: false,
+            process: "explorer.exe".into(),
+        };
+        assert!(is_redundant_system_volume(&entry));
+        entry.process = "Volume2.exe".into();
+        assert!(!is_redundant_system_volume(&entry));
     }
 
     #[test]

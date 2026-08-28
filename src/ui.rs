@@ -10,6 +10,9 @@
 //! This module is the single answer to both: one scale factor per surface, and
 //! text that is measured rather than guessed.
 
+use std::cell::Cell;
+use std::sync::LazyLock;
+
 use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRgn, GetTextExtentPoint32W,
@@ -19,6 +22,68 @@ use windows::Win32::Graphics::Gdi::{
 
 /// Reference DPI. All constants in this codebase are expressed at this scale.
 const BASE_DPI: f32 = 96.0;
+
+/// GDI has no FXAA stage. GDI+ can, however, antialias the vector geometry we
+/// draw into the existing GDI back buffers. The process token is intentionally
+/// retained for the lifetime of the shell; shutting GDI+ down while another
+/// paint is active is explicitly unsupported by the platform.
+static GDIPLUS_TOKEN: LazyLock<Option<usize>> = LazyLock::new(|| {
+    use windows::Win32::Graphics::GdiPlus::{GdiplusStartup, GdiplusStartupInput, Ok};
+    let input = GdiplusStartupInput {
+        GdiplusVersion: 1,
+        ..Default::default()
+    };
+    let mut token = 0usize;
+    let status = unsafe { GdiplusStartup(&mut token, &input, std::ptr::null_mut()) };
+    (status == Ok && token != 0).then_some(token)
+});
+
+thread_local! {
+    static ANTIALIASED_GRAPHICS: Cell<*mut windows::Win32::Graphics::GdiPlus::GpGraphics> =
+        const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Keeps one GDI+ graphics object alive for an entire buffered paint instead of
+/// constructing one for every pill and slider. Rounded primitives transparently
+/// fall back to plain GDI if GDI+ cannot initialise.
+pub struct AntialiasedPaint {
+    graphics: *mut windows::Win32::Graphics::GdiPlus::GpGraphics,
+    previous: *mut windows::Win32::Graphics::GdiPlus::GpGraphics,
+}
+
+impl Drop for AntialiasedPaint {
+    fn drop(&mut self) {
+        use windows::Win32::Graphics::GdiPlus::GdipDeleteGraphics;
+        ANTIALIASED_GRAPHICS.with(|active| active.set(self.previous));
+        unsafe {
+            let _ = GdipDeleteGraphics(self.graphics);
+        }
+    }
+}
+
+pub fn begin_antialiased_paint(hdc: HDC) -> Option<AntialiasedPaint> {
+    use windows::Win32::Graphics::GdiPlus::{
+        GdipCreateFromHDC, GdipDeleteGraphics, GdipSetPixelOffsetMode, GdipSetSmoothingMode, Ok,
+        PixelOffsetModeHalf, SmoothingModeAntiAlias8x8,
+    };
+    (*GDIPLUS_TOKEN)?;
+    let mut graphics = std::ptr::null_mut();
+    if unsafe { GdipCreateFromHDC(hdc, &mut graphics) } != Ok || graphics.is_null() {
+        return None;
+    }
+    let configured = unsafe {
+        GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias8x8) == Ok
+            && GdipSetPixelOffsetMode(graphics, PixelOffsetModeHalf) == Ok
+    };
+    if !configured {
+        unsafe {
+            let _ = GdipDeleteGraphics(graphics);
+        }
+        return None;
+    }
+    let previous = ANTIALIASED_GRAPHICS.with(|active| active.replace(graphics));
+    Some(AntialiasedPaint { graphics, previous })
+}
 
 /// Design tokens, in device-independent pixels at 96 DPI. Named so the same
 /// rhythm can be applied everywhere instead of being re-invented per widget.
@@ -52,7 +117,8 @@ pub fn scale_for_monitor(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> f3
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     let mut dpi_x = 0u32;
     let mut dpi_y = 0u32;
-    let ok = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_ok();
+    let ok =
+        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_ok();
     if !ok || dpi_x == 0 {
         return 1.0;
     }
@@ -139,6 +205,9 @@ pub fn fill_round_rect(hdc: HDC, rect: &RECT, radius: i32, color: COLORREF) {
         fill_rect(hdc, rect, color);
         return;
     }
+    if fill_round_rect_antialiased(rect, radius, color) {
+        return;
+    }
     unsafe {
         let region = CreateRoundRectRgn(
             rect.left,
@@ -157,6 +226,66 @@ pub fn fill_round_rect(hdc: HDC, rect: &RECT, radius: i32, color: COLORREF) {
         let _ = DeleteObject(region.into());
         let _ = DeleteObject(brush.into());
     }
+}
+
+fn fill_round_rect_antialiased(rect: &RECT, radius: i32, color: COLORREF) -> bool {
+    use windows::Win32::Graphics::GdiPlus::{
+        GdipCreateSolidFill, GdipDeleteBrush, GdipFillEllipseI, GdipFillRectangleI, GpBrush,
+        GpSolidFill, Ok,
+    };
+    ANTIALIASED_GRAPHICS.with(|active| {
+        let graphics = active.get();
+        if graphics.is_null() {
+            return false;
+        }
+        let mut solid: *mut GpSolidFill = std::ptr::null_mut();
+        let brush_color = colorref_to_argb(color);
+        if unsafe { GdipCreateSolidFill(brush_color, &mut solid) } != Ok || solid.is_null() {
+            return false;
+        }
+        let brush = solid.cast::<GpBrush>();
+        let width = rect_width(rect);
+        let height = rect_height(rect);
+        let diameter = radius * 2;
+        unsafe {
+            // The two centre rectangles cover the body; four antialiased
+            // circles supply the corners without seams.
+            let _ = GdipFillRectangleI(
+                graphics,
+                brush,
+                rect.left + radius,
+                rect.top,
+                width - diameter,
+                height,
+            );
+            let _ = GdipFillRectangleI(
+                graphics,
+                brush,
+                rect.left,
+                rect.top + radius,
+                width,
+                height - diameter,
+            );
+            for (x, y) in [
+                (rect.left, rect.top),
+                (rect.right - diameter, rect.top),
+                (rect.left, rect.bottom - diameter),
+                (rect.right - diameter, rect.bottom - diameter),
+            ] {
+                let _ = GdipFillEllipseI(graphics, brush, x, y, diameter, diameter);
+            }
+            let _ = GdipDeleteBrush(brush);
+        }
+        true
+    })
+}
+
+fn colorref_to_argb(color: COLORREF) -> u32 {
+    let value = color.0;
+    let red = value & 0xff;
+    let green = (value >> 8) & 0xff;
+    let blue = (value >> 16) & 0xff;
+    0xff00_0000 | (red << 16) | (green << 8) | blue
 }
 
 /// Width of `text` in the DC's current font. Replaces the old
@@ -264,7 +393,13 @@ pub fn resolve_track_sizes(requested: &[i32], total: i32, gap: i32) -> Vec<i32> 
 
 #[cfg(test)]
 mod tests {
-    use super::{px, resolve_track_sizes, split_span};
+    use super::{colorref_to_argb, px, resolve_track_sizes, split_span};
+    use windows::Win32::Foundation::COLORREF;
+
+    #[test]
+    fn gdi_bgr_colours_are_reordered_for_gdiplus() {
+        assert_eq!(colorref_to_argb(COLORREF(0x00_33_22_11)), 0xff_11_22_33);
+    }
 
     #[test]
     fn scaling_rounds_to_whole_pixels() {

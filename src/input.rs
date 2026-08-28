@@ -8,12 +8,12 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
+use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, GetKeyboardLayoutList, HKL};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, INPUTLANGCHANGE_FORWARD,
     WM_INPUTLANGCHANGEREQUEST,
 };
-use windows::Win32::Foundation::{LPARAM, WPARAM};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
@@ -117,17 +117,20 @@ pub fn installed() -> Vec<Layout> {
 
 /// Layout of the foreground window's thread, which is what the user is actually
 /// typing with.
-pub fn current() -> Option<Layout> {
+pub fn current_for(hwnd: windows::Win32::Foundation::HWND) -> Option<Layout> {
     unsafe {
-        let foreground = GetForegroundWindow();
-        let thread = if foreground.0.is_null() {
+        let thread = if hwnd.0.is_null() {
             0
         } else {
-            GetWindowThreadProcessId(foreground, None)
+            GetWindowThreadProcessId(hwnd, None)
         };
         let hkl = GetKeyboardLayout(thread);
         (!hkl.0.is_null()).then(|| describe(hkl.0 as isize))
     }
+}
+
+pub fn current() -> Option<Layout> {
+    current_for(unsafe { GetForegroundWindow() })
 }
 
 /// Ask the foreground window to adopt `layout`.
@@ -135,20 +138,23 @@ pub fn current() -> Option<Layout> {
 /// `WM_INPUTLANGCHANGEREQUEST` is the documented way to do this from outside the
 /// target process; it lets the application refuse, which is why the indicator
 /// re-reads the layout rather than assuming the change took effect.
-pub fn activate(layout: &Layout) -> bool {
+pub fn activate_for(hwnd: windows::Win32::Foundation::HWND, layout: &Layout) -> bool {
     unsafe {
-        let foreground = GetForegroundWindow();
-        if foreground.0.is_null() {
+        if hwnd.0.is_null() {
             return false;
         }
         PostMessageW(
-            Some(foreground),
+            Some(hwnd),
             WM_INPUTLANGCHANGEREQUEST,
             WPARAM(INPUTLANGCHANGE_FORWARD as usize),
             LPARAM(layout.handle),
         )
         .is_ok()
     }
+}
+
+pub fn activate(layout: &Layout) -> bool {
+    activate_for(unsafe { GetForegroundWindow() }, layout)
 }
 
 /// Move to the next installed layout, wrapping. Returns the layout requested.
