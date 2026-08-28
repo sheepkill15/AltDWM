@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, SetWindowPos, ShowWindow, HMENU, HWND_TOPMOST,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
 };
 
 use crate::config::{Config, PanelConfig};
@@ -324,6 +324,41 @@ unsafe extern "system" fn panel_wndproc(
                 if let Some(action) = widget.on_click(point, item, &ctx) {
                     println!(
                         "[panel {panel_name}] widget '{}' click -> {action}",
+                        widget.name()
+                    );
+                    crate::scripting::dispatch_action(&action);
+                }
+            }
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            // Right click reaches the widget and stops there: a widget's
+            // configured `action` belongs to the left button, and firing it from
+            // both would make a tray context menu also launch a program.
+            let point = client_point(lparam);
+            if let Some((panel_name, widget, item, ctx)) = resolve_hit(hwnd, point) {
+                if let Some(action) = widget.on_right_click(point, item, &ctx) {
+                    println!(
+                        "[panel {panel_name}] widget '{}' right click -> {action}",
+                        widget.name()
+                    );
+                    crate::scripting::dispatch_action(&action);
+                }
+            }
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            // The class asks for CS_DBLCLKS, so the second click of a pair
+            // arrives here instead of as another WM_LBUTTONDOWN. Widgets with no
+            // double-click meaning forward it back to `on_click`, which keeps
+            // that second click from being swallowed.
+            let point = client_point(lparam);
+            if let Some((panel_name, widget, item, ctx)) = resolve_hit(hwnd, point) {
+                if let Some(action) = widget.on_double_click(point, item, &ctx) {
+                    println!(
+                        "[panel {panel_name}] widget '{}' double click -> {action}",
                         widget.name()
                     );
                     crate::scripting::dispatch_action(&action);

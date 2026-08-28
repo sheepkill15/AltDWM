@@ -59,6 +59,15 @@ pub struct General {
     /// Hide Explorer's primary/secondary taskbars while AltDWM is running.
     #[serde(default = "default_true")]
     pub hide_native_taskbar: bool,
+    /// Where the `tray` widget's items come from.
+    ///
+    /// `auto` hosts the notification area when AltDWM owns the taskbar and
+    /// mirrors Explorer's when it does not; `native` always hosts it, `explorer`
+    /// always mirrors, `off` shows nothing. Hosting is what produces real icons
+    /// and working clicks, but it also takes icons away from Explorer's tray,
+    /// so it is not something to do behind the back of a user who kept it.
+    #[serde(default = "default_tray")]
+    pub tray: String,
     /// Additional inset applied to every edge of each monitor's work area.
     #[serde(default)]
     pub outer_gap: Option<i32>,
@@ -212,6 +221,9 @@ fn default_true() -> bool {
 fn default_filter_vd() -> bool {
     false
 }
+fn default_tray() -> String {
+    "auto".to_string()
+}
 /// Workspaces are opt-in.
 ///
 /// Switching away from a workspace hides windows, and a window the user cannot
@@ -249,6 +261,7 @@ impl Default for General {
             auto_float_utility_windows: default_true(),
             respect_window_size_constraints: default_true(),
             hide_native_taskbar: default_true(),
+            tray: default_tray(),
             outer_gap: None,
             filter_virtual_desktop: default_filter_vd(),
             workspaces: default_workspaces(),
@@ -526,6 +539,19 @@ impl Config {
             warns.push(format!(
                 "general.master_ratio must be between 0.1 and 0.9 ({})",
                 self.general.master_ratio
+            ));
+        }
+        // Same reasoning as the layout name below: an unrecognised value falls
+        // back to `auto`, which is indistinguishable from the setting being
+        // ignored unless `--check-config` says so.
+        if !matches!(
+            self.general.tray.trim().to_ascii_lowercase().as_str(),
+            "auto" | "native" | "host" | "shell" | "explorer" | "uia" | "mirror" | "off" | "none"
+                | "disabled"
+        ) {
+            warns.push(format!(
+                "general.tray '{}' is not one of auto|native|explorer|off — using auto",
+                self.general.tray
             ));
         }
         // A typo'd layout name silently became MasterStack, which looks like
@@ -873,7 +899,9 @@ pub fn example_config_with_panels() -> Config {
             command: None,
             label: None,
             icon: None,
-            width: Some(180),
+            // No fixed width: the tray sizes itself to however many icons the
+            // session actually has.
+            width: None,
             extra: HashMap::new(),
         },
         WidgetConfig {

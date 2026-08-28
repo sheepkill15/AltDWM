@@ -13,14 +13,16 @@ pub fn register_window_class(
 ) -> Result<(), String> {
     use windows::Win32::Graphics::Gdi::HBRUSH;
     use windows::Win32::UI::WindowsAndMessaging::{
-        LoadCursorW, RegisterClassExW, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, WNDCLASSEXW,
+        LoadCursorW, RegisterClassExW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, WNDCLASSEXW,
     };
 
     unsafe {
         let hinstance = HINSTANCE(std::ptr::null_mut());
         let class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            // CS_DBLCLKS so the tray can tell a double click from two singles:
+            // plenty of applications only open their window on the former.
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(window_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,

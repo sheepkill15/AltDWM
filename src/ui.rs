@@ -89,6 +89,31 @@ pub fn point_in_rect(x: i32, y: i32, rect: &RECT) -> bool {
     x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
 }
 
+/// Lift a rectangle out of `hwnd`'s client space into screen coordinates, for
+/// anchoring a flyout to something a widget drew.
+pub fn client_rect_to_screen(hwnd: HWND, rect: RECT) -> RECT {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    let mut top_left = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let mut bottom_right = POINT {
+        x: rect.right,
+        y: rect.bottom,
+    };
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut top_left);
+        let _ = ClientToScreen(hwnd, &mut bottom_right);
+    }
+    RECT {
+        left: top_left.x,
+        top: top_left.y,
+        right: bottom_right.x,
+        bottom: bottom_right.y,
+    }
+}
+
 pub fn fill_rect(hdc: HDC, rect: &RECT, color: COLORREF) {
     if rect_width(rect) <= 0 || rect_height(rect) <= 0 {
         return;

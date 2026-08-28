@@ -14,13 +14,14 @@ Tested on Windows 11, 2 monitors, Rust 1.98 + `windows` 0.61.
 - **Layouts** (`src/layout.rs:7`): `MasterStack` (60/40), `Grid`, `Monocle`, `Floating` — pluggable via `[[layouts.my]] script="..."` (Rhai).
 - **Event-driven** (`src/main.rs`): `SetWinEventHook` for `FOREGROUND/MINIMIZE/MOVESIZE/OBJECT_*` (`WINEVENT_OUTOFCONTEXT`). A newly shown window bypasses the normal 200ms coalescing timer and is placed synchronously with its first DWM transition suppressed; ordinary event bursts still coalesce. Maximize and external location changes are folded back into the active layout, title-bar moves swap tile slots, and resizing moves shared boundaries.
 - **Coherent native shell bar** (`src/panel.rs`, `src/widgets.rs`): a rounded per-display bar with hover feedback, a live/clickable layout capsule, real application icons, active/minimized window states, overflow counts, compact system status, and a two-line clock.
+- **Real notification area** (`src/tray.rs`): AltDWM registers the `Shell_TrayWnd` class and receives `Shell_NotifyIcon` traffic itself, so the tray shows applications' own `HICON`s and tooltips rather than a mirror of Explorer's buttons. Add/modify/delete/setversion are honoured by `(hWnd, uID)` or `guidItem`; clicks are posted back as the callback the application registered, in the `NOTIFYICON_VERSION_4` shape where it asked for one; left, right, and double click all reach it. `TaskbarCreated` is broadcast once the native taskbar is out of the way and again on exit, so icons come to AltDWM at startup and return to Explorer on shutdown. `NIS_HIDDEN` icons and any that do not fit go behind an overflow button. `general.tray` selects `auto` (the default), `native`, `explorer`, or `off`; `--list-tray` hosts the tray for three seconds and prints what arrives.
 - **Constraint-aware window policy** (`src/manager.rs`, `src/rules.rs`): explicit floating rules win; owned/modal/fixed-size utilities float automatically; windows whose minimum tracking size cannot fit their proposed tile are floated and clamped inside the usable monitor area. `floating=false` forces a matching window back into tiling.
 - **Focused window borders**: DWM border colors update on foreground changes without retiling. Configure `theme.border_active` and `theme.border_inactive` independently.
 - **Searchable command center** (`src/command_center.rs`): open it from the AltDWM button or `Alt+Shift+Space`; type to filter across both AltDWM's own commands and every installed application, use arrows to select, view every successfully registered shortcut, and launch apps, open quick settings, edit/reload configuration, pause tiling, or change layouts without memorizing commands.
 - **Declarative panels DSL** (`src/config.rs:16`, `docs/EXTENSIBILITY.md`): TOML `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`. Multiple bars remain supported, while generated and example configs now start with one polished shell bar.
 - **Workspaces** (`src/workspace.rs`): `general.workspaces` gives each monitor its own set, switched with `workspace(n)` or the `workspaces` widget's pills, with `send_to_workspace(n)` to move a window. Opt-in (`1` by default) because switching hides windows. Restored on every in-process exit path, and journalled to disk so a hard kill is recoverable with `--restore-windows`.
 - **Layout verbs** (`src/focus.rs`): geometric `focus_direction`, `move_window` to swap the focused window with its neighbour, `promote` to claim the master slot, and an adjustable `general.master_ratio`.
-- **Widgets** (`src/widgets.rs` trait): `clock`, live `layout` status, real `workspaces` pills, `window_list` (including minimized windows; click to focus/minimize/restore), `window_title`, Explorer-backed clickable `tray`, `volume` (scroll to change), `battery`, `network`, `input` (click to cycle keyboard layout), `spacer`, `launcher`, and Rhai `custom` status widgets.
+- **Widgets** (`src/widgets.rs` trait): `clock`, live `layout` status, real `workspaces` pills, `window_list` (including minimized windows; click to focus/minimize/restore), `window_title`, a real `tray` hosting `Shell_NotifyIcon` (application icons, left/right/double click, overflow flyout), `volume` (scroll to change), `battery`, `network`, `input` (click to cycle keyboard layout), `spacer`, `launcher`, and Rhai `custom` status widgets.
 - **System status and quick settings** (`src/system.rs`, `src/quick_settings.rs`): volume through Core Audio, battery through `GetSystemPowerStatus`, connection and Wi-Fi radio through the WLAN API and `INetworkListManager`, brightness through DDC/CI, keyboard layout through `GetKeyboardLayoutList`. All polled on a worker thread and published as a snapshot, so no status call ever runs in a paint handler. The flyout offers volume and brightness sliders, mute and Wi-Fi toggles, and a layout switcher; what AltDWM cannot own end to end opens the matching `ms-settings:` page. `--status` prints exactly what the readers see.
 - **Application search** (`src/apps.rs`): `shell:AppsFolder` is indexed on a worker thread at startup, covering desktop and Store apps together. Search is tiered — exact, prefix, word start, initials (`vsc` → *Visual Studio Code*), substring, then a word-anchored fuzzy pass — and launching goes through `shell:AppsFolder\<AppUserModelID>`. `--list-apps [query]` shows the index and its ranking.
 - **Panels** (`src/panel.rs:47`): Each `[[panels]]` is a `WS_POPUP|WS_EX_TOPMOST` window (`AltDWM_Panel` class), flex layout for widgets, 1s + 250ms timers, click → `scripting::dispatch_action`.
@@ -40,6 +41,7 @@ cargo run -- --config ./examples/config.example.toml  # panels DSL demo
 cargo run -- --generate-config   # writes %APPDATA%/AltDWM/config.toml
 cargo run -- --check-config      # validate
 cargo run -- --status            # live audio/power/network/input readings
+cargo run -- --list-tray         # host the notification area briefly, print the icons
 cargo run -- --list-apps code    # application index and search ranking
 cargo run -- --restore-windows   # un-hide anything a killed run left on a workspace
 
@@ -118,7 +120,8 @@ src/apps.rs      # shell:AppsFolder index, ranked search, launch
 src/workspace.rs # per-monitor workspaces, hide/show, journalled recovery
 src/widgets.rs   # Widget trait + clock/layout/tasklist/tray/launcher/custom
 src/shell.rs     # reversible Explorer taskbar ownership
-src/tray.rs      # Explorer notification-area discovery/invocation bridge
+src/tray.rs      # Notification-area host (Shell_NotifyIcon) + Explorer UIA fallback
+src/tray_overflow.rs # Overflow flyout for hidden and clipped tray icons
 src/scripting.rs # rhai engine + dispatch_action
 src/util.rs      # is_cloaked, is_manageable (+ config ignore)
 docs/EXTENSIBILITY.md
@@ -152,7 +155,7 @@ Panels re-place themselves on `WM_DPICHANGED` and `WM_DISPLAYCHANGE`.
 
 - `AltDHook.dll` (`WH_CBT`) for literal pre-show `HCBT_CREATEWND` placement and elevated windows
 - `IVirtualDesktopManager` + `IVirtualDesktopManagerInternal` workspaces
-- Explorer-free shell replacement and native notification-area hosting (design notes in `docs/EXTENSIBILITY.md`; the current tray bridges Explorer through UI Automation)
+- Explorer-free shell replacement (design notes in `docs/EXTENSIBILITY.md`). The notification area is now hosted natively; what remains is running without `explorer.exe` at all.
 - `uiAccess` manifest + signing
 - richer settings surfaces and a native notification-area host
 

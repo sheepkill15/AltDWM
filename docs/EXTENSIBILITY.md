@@ -66,7 +66,7 @@ Built-ins (v0.3):
 | `layout` / `workspaces` | Current layout and managed count; click to cycle layouts              | `width`                      |
 | `window_list`  | Clickable list of current desktop's tiled windows                             | `width`                      |
 | `window_title` | Active window title                                                           | `max_len`                    |
-| `tray`         | Clickable Explorer notification-area bridge; requires Explorer until a native shell receiver is implemented | `width`                      |
+| `tray`         | Notification area. Hosts `Shell_NotifyIcon` itself (real icons, left/right/double click, overflow flyout); falls back to mirroring Explorer's buttons. Sizes itself unless `width` is set | `width`, `max_items`         |
 | `spacer`       | Flexible gap                                                                  | `width` (`0` means flexible) |
 | `launcher`     | Opens the searchable AltDWM command center; an explicit action overrides it   | `label`, `icon`, `action`    |
 | `volume` / `audio` | Output level and mute state; scroll to change, click for quick settings   | `width`, `interval`          |
@@ -426,36 +426,66 @@ alt-dwm --status             # what the system readers actually see
 1. **Done**: `config.toml` (`general`+`ignore`) + path discovery.
 2. **Done**: `[[panels]]`/`[[widgets]]`/`[[rules]]`/`[[keybinds]]`, widget trait scaffold, panel manager, TOML widgets.
 3. **Done**: Rhai engine + `scripts/*.rhai` for custom widgets/layouts/callbacks.
-4. **Later**: real notification-area hosting, virtual-desktop workspace switching, elevated-window hook DLL, optional plugin ABI.
+4. **Done**: notification-area hosting (`src/tray.rs`) — AltDWM answers to `Shell_TrayWnd` and decodes the `WM_COPYDATA` payload itself.
+5. **Later**: running without `explorer.exe` at all, virtual-desktop workspace switching, elevated-window hook DLL, optional plugin ABI.
 
-## Deferred: Explorer-free shell and notification area
+## Notification area
 
-The current implementation makes Explorer's taskbar fully transparent and uses
-UI Automation to bridge its live notification-area items into AltDWM. This is a
-compatibility stage: Explorer remains alive as the tray backend even though no
-native taskbar pixels are visible and its work-area reservation is ignored.
+`Shell_NotifyIcon` does not go anywhere in particular. It resolves
+`FindWindow("Shell_TrayWnd")` and posts the caller's `NOTIFYICONDATA` to
+whatever answers, as `WM_COPYDATA` with `dwData == 1`. Owning that class is
+therefore the whole mechanism, and it is the only way to obtain an application's
+actual `HICON` — UI Automation can name Explorer's buttons but never draw them,
+and it reports nothing at all once Explorer's taskbar is hidden, which is
+AltDWM's default configuration.
 
-A complete shell-replacement mode should instead:
+`src/tray.rs` implements the receiving side:
+
+* **Window chain.** `Shell_TrayWnd` plus the `TrayNotifyWnd` / `SysPager` /
+  `ToolbarWindow32` descendants applications probe for. It is created without
+  `WS_VISIBLE` and with `WS_EX_TRANSPARENT`, sized like a taskbar because
+  applications read its rectangle to place balloons.
+* **Z-order.** `FindWindow` walks top-level windows in Z-order, so hiding
+  Explorer's taskbar is not enough — `src/shell.rs` also drops it out of the
+  topmost band, and the host re-asserts `HWND_TOPMOST` on its sweep timer.
+  Both are undone on shutdown.
+* **Wire format.** The payload is the sender's struct in the *sender's* layout,
+  so a 32-bit application on 64-bit Windows sends 4-byte handles at different
+  offsets. `wire_layout` reconstructs the offsets from the sender's pointer
+  width (probed with `IsWow64Process`) and the `cbSize` it declared; two of the
+  four published versions collide on `cbSize` across widths, which is why the
+  bitness is probed rather than inferred.
+* **Identity.** `NIM_ADD` / `NIM_MODIFY` / `NIM_DELETE` / `NIM_SETVERSION`
+  address an icon by `(hWnd, uID)` or by `guidItem`, and both are honoured. A
+  modify for an icon never seen is treated as an add — that application
+  registered with Explorer before AltDWM existed.
+* **Ownership.** Icons are `CopyIcon`'d on arrival; the sender is free to
+  destroy its own. Icons whose owner window is gone are swept every two seconds,
+  because an application that is killed never sends `NIM_DELETE`.
+* **Callbacks.** Clicks are posted back as the message the application
+  registered, in the `NOTIFYICON_VERSION_4` shape when it asked for one, and the
+  owner is granted `AllowSetForegroundWindow` first — a tray context menu will
+  not dismiss otherwise.
+* **Handshake.** `TaskbarCreated` is broadcast once the taskbar is out of the
+  way, and again after the host window is destroyed, so icons arrive at startup
+  and go back to Explorer on exit.
+
+Not implemented: balloon notifications (`NIF_INFO`), and
+`Shell_NotifyIconGetRect` (`dwData == 3`), whose reply packs a `RECT` into an
+`LRESULT` in a way that is neither documented nor stable — callers fall back to
+the cursor position, which is where AltDWM's icons are anyway.
+
+## Deferred: Explorer-free shell
+
+Explorer is still running. Its taskbar is transparent, demoted, and ignored for
+work-area purposes, and it no longer backs the tray — but a complete
+shell-replacement mode should also:
 
 1. Start AltDWM as the user's shell without starting `explorer.exe`.
-2. Host a notification-area compatibility endpoint for applications calling
-   `Shell_NotifyIcon`, including add/modify/delete/version operations, icon and
-   tooltip ownership, mouse/keyboard callback messages, balloon notifications,
-   DPI changes, overflow state, and the `TaskbarCreated` recovery broadcast.
-3. Implement clock, audio, network, battery, input, quick settings, and
-   notification access as AltDWM widgets backed by their Windows APIs rather
-   than Explorer UI Automation.
-4. Provide startup failure recovery and an explicit command that restores the
+2. Provide startup failure recovery and an explicit command that restores the
    normal Explorer shell before enabling this mode persistently.
-5. Decide how folder browsing works: starting `explorer.exe` as a file manager
+3. Decide how folder browsing works: starting `explorer.exe` as a file manager
    can also recreate shell UI, so Explorer process lifetime must be controlled
    or a separate file manager must be used.
-
-Windows documents the application-facing `Shell_NotifyIcon` contract but not a
-supported third-party implementation contract for the receiving tray host.
-Generic tray compatibility will therefore require a carefully isolated,
-version-tested compatibility layer. This work is deliberately deferred; the
-transparent Explorer bridge remains the default until that layer has recovery
-and compatibility coverage.
 
 This keeps easy tasks easy (edit TOML) and hard tasks possible (Rhai/Rust) — same model as Linux WMs but native to Windows.

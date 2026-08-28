@@ -11,6 +11,14 @@ instant_first_layout = true
 auto_float_utility_windows = true
 respect_window_size_constraints = true
 hide_native_taskbar = true
+# Where notification-area icons come from.
+#   auto     - host the notification area when AltDWM owns the taskbar (the case
+#              above), mirror Explorer's tray when it does not
+#   native   - always host it; icons arrive here instead of in Explorer's tray
+#   explorer - always mirror Explorer's buttons over UI Automation (no icons,
+#              only names)
+#   off      - show nothing
+tray = "auto"
 filter_virtual_desktop = false
 # Workspaces hide the windows that are not on the visible one. Opt-in, because
 # `1` (the default) keeps the feature inert. If AltDWM is ever killed outright
@@ -94,7 +102,11 @@ name = "window_list"
 [[widgets]]
 type = "tray"
 name = "tray"
-width = 176
+# Omit `width` and the tray sizes itself to its icons; set it to pin the bar's
+# geometry. `max_items` caps how many reach the bar — the rest go to the
+# overflow button.
+# width = 176
+# max_items = 8
 
 [[widgets]]
 type = "clock"

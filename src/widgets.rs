@@ -13,9 +13,10 @@ use windows::Win32::Graphics::Gdi::{HDC, HFONT};
 
 use crate::config::WidgetConfig;
 use crate::theme::{get_cached_font_variant, Theme};
+use crate::tray::TrayEntry;
 use crate::ui::{
     draw_label, fill_rect, fill_round_rect, inset_rect, measure_label, point_in_rect, px,
-    rect_height, token,
+    rect_height, rect_width, token,
 };
 
 fn truncate_chars(value: &mut String, max_chars: usize) {
@@ -179,6 +180,17 @@ pub trait Widget: Send + Sync {
     /// the geometry that `draw` produced.
     fn on_click(&self, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> Option<String> {
         None
+    }
+    /// Handle a right click. Most widgets have no second meaning for one; the
+    /// tray does, because that is where applications put their menus.
+    fn on_right_click(&self, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> Option<String> {
+        None
+    }
+    /// Handle a double click. The default is a second ordinary click, which is
+    /// how every widget behaved before the panel started asking for
+    /// `CS_DBLCLKS` on the tray's behalf.
+    fn on_double_click(&self, point: (i32, i32), rect: RECT, ctx: &PanelCtx) -> Option<String> {
+        self.on_click(point, rect, ctx)
     }
     /// Handle a mouse wheel notch over the widget. `delta` is +1 for a scroll
     /// away from the user and -1 towards. Returning true consumes the event.
@@ -418,54 +430,138 @@ pub struct TrayWidget {
     pub cfg: WidgetConfig,
 }
 
+/// Notification-area geometry, in device-independent pixels.
+const TRAY_ICON: i32 = 16;
+/// A square button around a 16px icon.
+const TRAY_ITEM: i32 = 26;
+/// Explorer-mirrored entries carry no bitmap, only a name, and need room for it.
+const TRAY_LABEL_ITEM: i32 = 72;
+const TRAY_CHEVRON: i32 = 26;
+/// Enough for "No tray icons", so an empty tray reads as empty rather than as a
+/// gap in the bar.
+const TRAY_EMPTY: i32 = 104;
+
+fn tray_item_span(entry: &TrayEntry) -> i32 {
+    if entry.icon != 0 {
+        TRAY_ITEM
+    } else {
+        TRAY_LABEL_ITEM
+    }
+}
+
+/// Where every tray item ended up. Computed once and used by `draw` and by all
+/// three click handlers, so a click can only ever land on something that was
+/// actually drawn.
+struct TrayLayout {
+    /// Entries on the bar, each with the rectangle it was drawn in.
+    items: Vec<(TrayEntry, RECT)>,
+    /// The overflow button, present only when it has something behind it.
+    chevron: Option<RECT>,
+    /// Entries the bar is not showing: those that asked to be hidden, then any
+    /// that did not fit.
+    overflow: Vec<TrayEntry>,
+}
+
 impl TrayWidget {
-    /// Item rectangles, shared by `draw` and `on_click`. Previously each
-    /// computed its own bounds and the click loop had no cut-off at all, so
-    /// clicking past the last visible icon invoked a tray item that had never
-    /// been drawn.
-    fn entry_layout(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) -> Vec<(usize, RECT)> {
+    fn max_items(&self) -> usize {
+        self.cfg
+            .extra
+            .get("max_items")
+            .and_then(|value| value.as_integer())
+            .map(|value| value.max(0) as usize)
+            .unwrap_or(usize::MAX)
+    }
+
+    fn layout(&self, rect: RECT, ctx: &PanelCtx) -> TrayLayout {
+        self.layout_of(crate::tray::entries(), rect, ctx)
+    }
+
+    fn layout_of(&self, entries: Vec<TrayEntry>, rect: RECT, ctx: &PanelCtx) -> TrayLayout {
+        let (bar, hidden): (Vec<TrayEntry>, Vec<TrayEntry>) =
+            entries.into_iter().partition(|entry| !entry.hidden);
         let body = content_rect(rect, ctx);
-        let font = ctx.body_font();
         let gap = ctx.px(token::ITEM_GAP);
-        let pad = ctx.px(token::PAD);
-        let entries = crate::tray::entries();
-        let mut items = Vec::new();
-        let mut offset = if ctx.vertical { body.top } else { body.left };
-        for (index, entry) in entries.iter().enumerate() {
-            let label = crate::tray::compact_name(&entry.name);
-            let (item, advance) = if ctx.vertical {
-                let height = ctx.px(26);
-                if offset + height > body.bottom {
+        let chevron_span = ctx.px(TRAY_CHEVRON);
+        let limit = self.max_items();
+
+        let place = |reserve: bool| -> Vec<(TrayEntry, RECT)> {
+            let far = if ctx.vertical { body.bottom } else { body.right }
+                - if reserve { chevron_span + gap } else { 0 };
+            let mut offset = if ctx.vertical { body.top } else { body.left };
+            let mut placed = Vec::new();
+            for entry in bar.iter().take(limit) {
+                let span = ctx.px(tray_item_span(entry));
+                if offset + span > far {
                     break;
                 }
-                (
+                let item = if ctx.vertical {
                     RECT {
                         left: body.left,
                         top: offset,
                         right: body.right,
-                        bottom: offset + height,
-                    },
-                    height,
-                )
-            } else {
-                let width = measure_label(hdc, &label, font) + pad * 2;
-                if offset + width > body.right {
-                    break;
-                }
-                (
+                        bottom: offset + span,
+                    }
+                } else {
                     RECT {
                         left: offset,
                         top: body.top,
-                        right: offset + width,
+                        right: offset + span,
                         bottom: body.bottom,
-                    },
-                    width,
-                )
-            };
-            items.push((index, item));
-            offset += advance + gap;
+                    }
+                };
+                placed.push((entry.clone(), item));
+                offset += span + gap;
+            }
+            placed
+        };
+
+        let mut items = place(!hidden.is_empty());
+        if hidden.is_empty() && items.len() < bar.len() {
+            // Something was clipped after all, so room has to be found for a
+            // chevron — which may push one more item behind it.
+            items = place(true);
         }
-        items
+        let mut overflow: Vec<TrayEntry> = bar.into_iter().skip(items.len()).collect();
+        overflow.extend(hidden);
+        let chevron = (!overflow.is_empty()).then(|| {
+            if ctx.vertical {
+                RECT {
+                    top: body.bottom - chevron_span,
+                    ..body
+                }
+            } else {
+                RECT {
+                    left: body.right - chevron_span,
+                    ..body
+                }
+            }
+        });
+        TrayLayout {
+            items,
+            chevron,
+            overflow,
+        }
+    }
+
+    /// Route a click to the item under it. The overflow button is checked first
+    /// because it is drawn last and therefore sits on top.
+    fn dispatch(&self, point: (i32, i32), rect: RECT, ctx: &PanelCtx, button: crate::tray::Button) {
+        let layout = self.layout(rect, ctx);
+        if let Some(chevron) = layout.chevron {
+            if point_in_rect(point.0, point.1, &chevron) {
+                crate::tray_overflow::toggle(
+                    crate::ui::client_rect_to_screen(ctx.hwnd, chevron),
+                    layout.overflow,
+                );
+                return;
+            }
+        }
+        for (entry, item) in layout.items {
+            if point_in_rect(point.0, point.1, &item) {
+                crate::tray::invoke(entry.id, button);
+                return;
+            }
+        }
     }
 }
 
@@ -476,64 +572,143 @@ impl Widget for TrayWidget {
     fn kind(&self) -> &'static str {
         "tray"
     }
+    /// Sized to its contents. A fixed width either clipped a busy tray or left a
+    /// hole on a quiet one; `width` in configuration still wins, for anyone who
+    /// would rather the bar's geometry stopped moving.
     fn width(&self, _ctx: &PanelCtx) -> i32 {
-        self.cfg.width.unwrap_or(196)
+        if let Some(width) = self.cfg.width {
+            return width;
+        }
+        let entries = crate::tray::entries();
+        if entries.is_empty() {
+            return TRAY_EMPTY;
+        }
+        let bar: Vec<&TrayEntry> = entries
+            .iter()
+            .filter(|entry| !entry.hidden)
+            .take(self.max_items())
+            .collect();
+        let mut span: i32 = bar.iter().map(|entry| tray_item_span(entry)).sum();
+        span += token::ITEM_GAP * (bar.len() as i32 - 1).max(0);
+        if entries.len() > bar.len() {
+            span += TRAY_CHEVRON + if bar.is_empty() { 0 } else { token::ITEM_GAP };
+        }
+        span + token::ITEM_GAP * 2
     }
     fn hover_paint(&self) -> HoverPaint {
         HoverPaint::SelfDrawn
     }
     fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
-        let items = self.entry_layout(hdc, rect, ctx);
-        if items.is_empty() {
+        let layout = self.layout(rect, ctx);
+        if layout.items.is_empty() && layout.chevron.is_none() {
             let area = inset_rect(content_rect(rect, ctx), ctx.px(token::PAD), 0);
             draw_label(
                 hdc,
                 &area,
-                "No tray items",
+                "No tray icons",
                 ctx.small_font(),
                 ctx.theme.text_dim_color(),
             );
             return;
         }
-        let entries = crate::tray::entries();
         let radius = ctx.radius();
-        for (index, item) in items {
-            let hovered = ctx.pointer_in(&item);
+        let idle = ctx.theme.color(&ctx.theme.tray_bg);
+        for (entry, item) in &layout.items {
+            let hovered = ctx.pointer_in(item);
             let background = if hovered {
                 ctx.theme.surface_hover_color()
             } else {
-                ctx.theme.color(&ctx.theme.tray_bg)
+                idle
             };
-            fill_round_rect(hdc, &item, radius, background);
-            let label = entries
-                .get(index)
-                .map(|entry| crate::tray::compact_name(&entry.name))
-                .unwrap_or_default();
-            let text = inset_rect(item, ctx.px(token::PAD), 0);
-            let color = if hovered {
-                ctx.theme.text_color()
+            fill_round_rect(hdc, item, radius, background);
+            if entry.icon != 0 {
+                let side = ctx.px(TRAY_ICON);
+                let left = item.left + (rect_width(item) - side) / 2;
+                let top = item.top + (rect_height(item) - side) / 2;
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DrawIconEx(
+                        hdc,
+                        left,
+                        top,
+                        windows::Win32::UI::WindowsAndMessaging::HICON(
+                            entry.icon as *mut std::ffi::c_void,
+                        ),
+                        side,
+                        side,
+                        0,
+                        None,
+                        windows::Win32::UI::WindowsAndMessaging::DI_NORMAL,
+                    );
+                }
             } else {
-                ctx.theme.text_dim_color()
+                // The Explorer bridge can name a button but never draw it.
+                let text = inset_rect(*item, ctx.px(6), 0);
+                let color = if hovered {
+                    ctx.theme.text_color()
+                } else {
+                    ctx.theme.text_dim_color()
+                };
+                draw_label(
+                    hdc,
+                    &text,
+                    &crate::tray::compact_name(&entry.name),
+                    ctx.body_font(),
+                    color,
+                );
+            }
+        }
+        if let Some(chevron) = layout.chevron {
+            let hovered = ctx.pointer_in(&chevron);
+            fill_round_rect(
+                hdc,
+                &chevron,
+                radius,
+                if hovered {
+                    ctx.theme.surface_hover_color()
+                } else {
+                    idle
+                },
+            );
+            // A count rather than a glyph, for the same reason `draw_mark`
+            // exists: chevron characters are not reliably present in the
+            // configured face, and "+3" says more than an arrow would anyway.
+            let label = format!("+{}", layout.overflow.len());
+            let font = ctx.small_font();
+            let text_width = measure_label(hdc, &label, font);
+            let centred = RECT {
+                left: chevron.left + (rect_width(&chevron) - text_width).max(0) / 2,
+                ..chevron
             };
-            draw_label(hdc, &text, &label, ctx.body_font(), color);
+            draw_label(
+                hdc,
+                &centred,
+                &label,
+                font,
+                if hovered {
+                    ctx.theme.text_color()
+                } else {
+                    ctx.theme.text_dim_color()
+                },
+            );
         }
     }
 
     fn on_click(&self, point: (i32, i32), rect: RECT, ctx: &PanelCtx) -> Option<String> {
-        // Hit-testing needs a DC in the same font the layout was measured with.
-        let hdc = unsafe { windows::Win32::Graphics::Gdi::GetDC(Some(ctx.hwnd)) };
-        let items = self.entry_layout(hdc, rect, ctx);
-        if !hdc.is_invalid() {
-            unsafe {
-                windows::Win32::Graphics::Gdi::ReleaseDC(Some(ctx.hwnd), hdc);
-            }
-        }
-        for (index, item) in items {
-            if point_in_rect(point.0, point.1, &item) {
-                crate::tray::invoke(index);
-                break;
-            }
-        }
+        self.dispatch(point, rect, ctx, crate::tray::Button::Left);
+        None
+    }
+
+    /// Right click is most of the point of a tray icon — it is where an
+    /// application puts Quit.
+    fn on_right_click(&self, point: (i32, i32), rect: RECT, ctx: &PanelCtx) -> Option<String> {
+        self.dispatch(point, rect, ctx, crate::tray::Button::Right);
+        None
+    }
+
+    /// Older applications open their main window on a double click and ignore a
+    /// single one entirely.
+    fn on_double_click(&self, point: (i32, i32), rect: RECT, ctx: &PanelCtx) -> Option<String> {
+        self.dispatch(point, rect, ctx, crate::tray::Button::DoubleLeft);
         None
     }
 }
@@ -1498,7 +1673,155 @@ pub fn widget_content_rect(rect: RECT, ctx: &PanelCtx) -> RECT {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_time, truncate_chars};
+    use super::{format_time, truncate_chars, HoverPaint, PanelCtx, TrayWidget, Widget};
+    use crate::config::WidgetConfig;
+    use crate::theme::Theme;
+    use crate::tray::{TrayEntry, TrayId};
+    use windows::Win32::Foundation::{HWND, RECT};
+
+    fn tray_entry(uid: u32, hidden: bool) -> TrayEntry {
+        TrayEntry {
+            id: TrayId::Native { owner: 1, uid },
+            name: format!("App {uid}"),
+            // Non-zero: an icon-bearing entry is the narrow, square kind.
+            icon: 0x100 + uid as isize,
+            hidden,
+        }
+    }
+
+    fn ctx(width: i32, scale: f32) -> PanelCtx {
+        PanelCtx {
+            panel_name: "test".into(),
+            monitor: "all".into(),
+            monitor_key: 0,
+            width,
+            height: 40,
+            hwnd: HWND(std::ptr::null_mut()),
+            windows: Vec::new(),
+            scale,
+            vertical: false,
+            pointer: None,
+            theme: Theme::default(),
+        }
+    }
+
+    fn tray_widget() -> TrayWidget {
+        TrayWidget {
+            cfg: WidgetConfig {
+                widget_type: "tray".into(),
+                name: "tray".into(),
+                format: None,
+                interval: None,
+                script: None,
+                action: None,
+                command: None,
+                label: None,
+                icon: None,
+                width: None,
+                extra: Default::default(),
+            },
+        }
+    }
+
+    fn bar(width: i32) -> RECT {
+        RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: 40,
+        }
+    }
+
+    /// The width the widget asks the panel for has to be the width its own
+    /// layout then needs. When these disagree the last icon is drawn clipped or
+    /// the bar carries a hole.
+    #[test]
+    fn the_tray_asks_for_exactly_the_room_its_icons_need() {
+        let widget = tray_widget();
+        for count in 1..=6u32 {
+            let entries: Vec<TrayEntry> = (0..count).map(|uid| tray_entry(uid, false)).collect();
+            let requested = super::TRAY_ITEM * count as i32
+                + super::token::ITEM_GAP * (count as i32 - 1)
+                + super::token::ITEM_GAP * 2;
+            let ctx = ctx(requested, 1.0);
+            let layout = widget.layout_of(entries, bar(requested), &ctx);
+            assert_eq!(
+                layout.items.len(),
+                count as usize,
+                "{count} icons should all fit in {requested}px"
+            );
+            assert!(layout.chevron.is_none(), "nothing should overflow");
+            assert!(layout.items.last().unwrap().1.right <= requested);
+        }
+    }
+
+    /// Items must never overlap, or one would swallow its neighbour's clicks.
+    #[test]
+    fn tray_items_are_laid_out_in_order_without_overlapping() {
+        let widget = tray_widget();
+        let entries: Vec<TrayEntry> = (0..5).map(|uid| tray_entry(uid, false)).collect();
+        let layout = widget.layout_of(entries, bar(400), &ctx(400, 1.5));
+        assert_eq!(layout.items.len(), 5);
+        for pair in layout.items.windows(2) {
+            assert!(pair[0].1.right <= pair[1].1.left, "items overlap");
+        }
+        // Order is the order the applications registered in, not whatever the
+        // layout pass found convenient.
+        let ids: Vec<TrayId> = layout.items.iter().map(|(entry, _)| entry.id).collect();
+        let expected: Vec<TrayId> = (0..5)
+            .map(|uid| TrayId::Native { owner: 1, uid })
+            .collect();
+        assert_eq!(ids, expected);
+    }
+
+    /// A bar too narrow for every icon grows a chevron, and the chevron has to
+    /// fit inside the widget rather than on top of the last icon it hides.
+    #[test]
+    fn icons_that_do_not_fit_move_behind_a_chevron() {
+        let widget = tray_widget();
+        let entries: Vec<TrayEntry> = (0..8).map(|uid| tray_entry(uid, false)).collect();
+        let narrow = 120;
+        let layout = widget.layout_of(entries, bar(narrow), &ctx(narrow, 1.0));
+        let chevron = layout.chevron.expect("a clipped tray needs a chevron");
+        assert!(!layout.overflow.is_empty());
+        assert_eq!(layout.items.len() + layout.overflow.len(), 8);
+        assert!(chevron.right <= narrow);
+        for (_, item) in &layout.items {
+            assert!(
+                item.right <= chevron.left,
+                "an icon was drawn under the chevron"
+            );
+        }
+    }
+
+    /// `NIS_HIDDEN` entries belong in the overflow however much room there is,
+    /// and they must not consume any of the bar's width.
+    #[test]
+    fn icons_that_asked_to_be_hidden_never_reach_the_bar() {
+        let widget = tray_widget();
+        let entries = vec![
+            tray_entry(0, false),
+            tray_entry(1, true),
+            tray_entry(2, true),
+            tray_entry(3, false),
+        ];
+        let layout = widget.layout_of(entries, bar(600), &ctx(600, 1.0));
+        assert_eq!(layout.items.len(), 2);
+        assert_eq!(layout.overflow.len(), 2);
+        assert!(layout.overflow.iter().all(|entry| entry.hidden));
+        assert!(layout.chevron.is_some());
+    }
+
+    #[test]
+    fn an_empty_tray_reserves_a_readable_slot_rather_than_flexing() {
+        let widget = tray_widget();
+        // 0 would mean "flex" to the panel, which would hand the tray most of
+        // the bar to draw nothing in.
+        assert!(widget.width(&ctx(400, 1.0)) > 0);
+        assert!(widget.hover_paint() == HoverPaint::SelfDrawn);
+        let layout = widget.layout_of(Vec::new(), bar(400), &ctx(400, 1.0));
+        assert!(layout.items.is_empty() && layout.chevron.is_none());
+    }
 
     #[test]
     fn truncates_unicode_at_character_boundaries() {

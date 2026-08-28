@@ -13,6 +13,7 @@ mod shell;
 mod system;
 mod theme;
 mod tray;
+mod tray_overflow;
 mod ui;
 mod util;
 mod virtual_desktop;
@@ -606,6 +607,7 @@ Options:
   --check-config      Validate config and exit
   --list-apps [q]     List indexed applications (optionally matching a query)
   --status            Print live system state (audio, power, network, input)
+  --list-tray         Host the notification area briefly and print what arrives
   --restore-windows   Un-hide any window a previous run left on a workspace
   --no-taskbar        Disable taskbar/panels (only tiling)
   --gap <px>          Override gap (default from config)
@@ -619,6 +621,7 @@ Examples:
   alt-dwm --gap 12 --layout grid
   alt-dwm --generate-config
   alt-dwm --check-config
+  alt-dwm --list-tray
 
 Config search: exe_dir/config.toml -> %APPDATA%/AltDWM/config.toml -> ./config.toml
 DSL: see docs/EXTENSIBILITY.md + examples/config.example.toml
@@ -636,6 +639,49 @@ fn do_generate_config(explicit: Option<&std::path::Path>) {
             std::process::exit(1);
         }
     }
+    std::process::exit(0);
+}
+
+/// Host the notification area for a moment and print every icon that arrives.
+///
+/// This genuinely takes the tray over while it runs — that is the only way to
+/// see any of it — and hands it back before returning. Without this there is no
+/// way to tell "no application published an icon" apart from "the widget is
+/// broken", which is the question this whole subsystem tends to raise.
+fn do_list_tray() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+    println!("Hosting the notification area for a moment (Explorer gets it back on exit)...");
+    tray::start(tray::Source::Native, true);
+    tray::announce();
+    // Applications answer `TaskbarCreated` on their own message loops, so this
+    // is a wait for other processes to get around to it, not for work of ours.
+    for _ in 0..120 {
+        let mut msg = MSG::default();
+        unsafe {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let entries = tray::entries();
+    if entries.is_empty() {
+        println!("No application published a notification icon.");
+    } else {
+        println!("{} icon(s):", entries.len());
+        for entry in &entries {
+            println!(
+                "  {:<28} icon={} {}",
+                tray::title_line(&entry.name),
+                if entry.icon != 0 { "yes" } else { "no" },
+                if entry.hidden { "(hidden)" } else { "" }
+            );
+        }
+    }
+    tray::shutdown();
     std::process::exit(0);
 }
 
@@ -836,10 +882,12 @@ fn apply_config_reload(
     // hidden with no way to reach them.
     workspace::clamp_to_count();
     *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = new_path.clone();
-    if new_cfg.general.hide_native_taskbar && !shell::native_taskbars_are_hidden() {
-        tray::prime();
-    }
+    tray::start(
+        tray::Source::parse(&new_cfg.general.tray),
+        new_cfg.general.hide_native_taskbar,
+    );
     shell::set_native_taskbars_hidden(new_cfg.general.hide_native_taskbar);
+    tray::announce();
     register_keybinds(&new_cfg);
     panel::destroy_panels();
     panel_handles.clear();
@@ -888,6 +936,9 @@ fn release_borrowed_system_state() {
     // cannot tell the difference between hidden and lost.
     workspace::restore_all();
     rules::restore_all_opacity();
+    // Before the taskbar comes back, so the "re-register your icons" broadcast
+    // does not race Explorer's own window into the topmost band.
+    tray::shutdown();
     shell::restore_native_taskbars();
     RELEASING.store(false, Ordering::SeqCst);
 }
@@ -968,6 +1019,7 @@ fn main() {
                 do_list_apps(&query);
             }
             "--status" => do_status(),
+            "--list-tray" => do_list_tray(),
             "--restore-windows" => {
                 // Recovery for the one case no in-process handler can catch: a
                 // hard kill while windows were hidden on another workspace.
@@ -1055,10 +1107,17 @@ fn main() {
         }
     };
 
-    if cfg.general.hide_native_taskbar {
-        tray::prime();
-    }
+    // Order matters. The host window has to exist before Explorer's taskbar is
+    // pushed out of the way, and the broadcast that makes applications
+    // re-publish their icons has to come after — otherwise they resolve
+    // `FindWindow("Shell_TrayWnd")` to Explorer's window and hand their icons to
+    // a taskbar nobody can see.
+    tray::start(
+        tray::Source::parse(&cfg.general.tray),
+        cfg.general.hide_native_taskbar,
+    );
     shell::set_native_taskbars_hidden(cfg.general.hide_native_taskbar);
+    tray::announce();
 
     let mut panel_handles: Vec<HWND> = Vec::new();
     if !cfg.panels.is_empty() {
