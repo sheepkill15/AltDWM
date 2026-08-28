@@ -11,8 +11,7 @@ use std::sync::{LazyLock, Mutex};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, GetKeyboardLayoutList, HKL};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, INPUTLANGCHANGE_FORWARD,
-    WM_INPUTLANGCHANGEREQUEST,
+    GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, WM_INPUTLANGCHANGEREQUEST,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,6 +137,11 @@ pub fn current() -> Option<Layout> {
 /// `WM_INPUTLANGCHANGEREQUEST` is the documented way to do this from outside the
 /// target process; it lets the application refuse, which is why the indicator
 /// re-reads the layout rather than assuming the change took effect.
+///
+/// wParam is 0, not `INPUTLANGCHANGE_FORWARD`: the FORWARD/BACKWARD flags tell
+/// the target to step to the next/previous locale and make it *ignore* the HKL
+/// in lParam entirely — so passing the specific layout the user picked did
+/// nothing useful. With no flag, lParam names the exact layout to switch to.
 pub fn activate_for(hwnd: windows::Win32::Foundation::HWND, layout: &Layout) -> bool {
     unsafe {
         if hwnd.0.is_null() {
@@ -146,7 +150,7 @@ pub fn activate_for(hwnd: windows::Win32::Foundation::HWND, layout: &Layout) -> 
         PostMessageW(
             Some(hwnd),
             WM_INPUTLANGCHANGEREQUEST,
-            WPARAM(INPUTLANGCHANGE_FORWARD as usize),
+            WPARAM(0),
             LPARAM(layout.handle),
         )
         .is_ok()

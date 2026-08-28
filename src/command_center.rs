@@ -446,16 +446,31 @@ unsafe fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
         };
         if app_icon != 0 {
             use windows::Win32::Graphics::Gdi::{
-                AlphaBlend, CreateCompatibleDC, DeleteDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER,
-                BLENDFUNCTION, HBITMAP,
+                AlphaBlend, CreateCompatibleDC, DeleteDC, GetObjectW, SelectObject, AC_SRC_ALPHA,
+                AC_SRC_OVER, BITMAP, BLENDFUNCTION, HBITMAP,
             };
             let side = px(24).min(badge_side - px(8)).max(1);
             let left = badge_rect.left + (badge_side - side) / 2;
             let top = badge_rect.top + (badge_side - side) / 2;
+            let bitmap = HBITMAP(app_icon as *mut std::ffi::c_void);
+            // Blit from the bitmap's real dimensions rather than a hardcoded 32,
+            // so a source cached at a higher resolution is downscaled cleanly.
+            let mut info = BITMAP::default();
+            let measured = GetObjectW(
+                bitmap.into(),
+                size_of::<BITMAP>() as i32,
+                Some(&mut info as *mut _ as *mut _),
+            );
+            let (src_w, src_h) = if measured != 0 && info.bmWidth > 0 && info.bmHeight > 0 {
+                (info.bmWidth, info.bmHeight)
+            } else {
+                (crate::apps::ICON_SIZE, crate::apps::ICON_SIZE)
+            };
             let source = CreateCompatibleDC(Some(hdc));
             if !source.0.is_null() {
-                let previous =
-                    SelectObject(source, HBITMAP(app_icon as *mut std::ffi::c_void).into());
+                let previous = SelectObject(source, bitmap.into());
+                // AlphaBlend filters as it shrinks, so downscaling the larger
+                // cached source is what makes the icon crisp.
                 let _ = AlphaBlend(
                     hdc,
                     left,
@@ -465,8 +480,8 @@ unsafe fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
                     source,
                     0,
                     0,
-                    32,
-                    32,
+                    src_w,
+                    src_h,
                     BLENDFUNCTION {
                         BlendOp: AC_SRC_OVER as u8,
                         BlendFlags: 0,

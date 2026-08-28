@@ -165,6 +165,12 @@ fn make_entry(name: String, id: String) -> Option<AppEntry> {
     })
 }
 
+/// Resolution icons are cached at. The picker draws them around 24 DIP, which is
+/// 48 physical pixels at 200% scaling, so a 32-pixel source had to be stretched
+/// and looked pixelated. Caching at 64 lets every common display downscale a
+/// crisp source instead of upscaling a coarse one.
+pub const ICON_SIZE: i32 = 64;
+
 fn shell_icon(item: &windows::Win32::UI::Shell::IShellItem) -> isize {
     use windows::core::Interface;
     use windows::Win32::Foundation::SIZE;
@@ -176,7 +182,10 @@ fn shell_icon(item: &windows::Win32::UI::Shell::IShellItem) -> isize {
     unsafe {
         factory
             .GetImage(
-                SIZE { cx: 32, cy: 32 },
+                SIZE {
+                    cx: ICON_SIZE,
+                    cy: ICON_SIZE,
+                },
                 SIIGBF_ICONONLY | SIIGBF_RESIZETOFIT,
             )
             .map(|bitmap| bitmap.0 as isize)
