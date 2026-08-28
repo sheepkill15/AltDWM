@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+    GetKeyState, SetFocus, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect, KillTimer,
@@ -598,7 +598,7 @@ unsafe fn paint(hwnd: HWND, hdc: HDC, client: RECT) {
         &theme,
         scale,
         small_font,
-        "↑ ↓  SELECT     ENTER  OPEN     ESC  CLOSE",
+        "↑↓ SELECT   ↵ OPEN   ^↵ ADMIN   ESC CLOSE",
     );
     drop(antialias);
 }
@@ -830,6 +830,24 @@ fn app_at(index: usize) -> Option<crate::apps::AppEntry> {
     }
 }
 
+/// Launch the selected row's application elevated (Ctrl+Enter). Falls back to
+/// the ordinary action when the selection is a built-in command, not an app.
+fn invoke_selected_as_admin(hwnd: HWND) {
+    let index = {
+        let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+        let count = results(&state.query).len();
+        state.selected.min(count.saturating_sub(1))
+    };
+    if let Some(entry) = app_at(index) {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        crate::apps::launch_as_admin(&entry);
+    } else {
+        invoke_selected(hwnd);
+    }
+}
+
 /// Row index under a client-area `y`, if it lands on a populated result row.
 ///
 /// Row geometry is scaled when painted, so hit-testing has to scale identically
@@ -933,7 +951,16 @@ unsafe extern "system" fn wndproc(
                 KEY_ESCAPE => {
                     let _ = DestroyWindow(hwnd);
                 }
-                KEY_RETURN => invoke_selected(hwnd),
+                KEY_RETURN => {
+                    // Ctrl+Enter launches the selected app elevated, matching the
+                    // per-row admin button; plain Enter opens it normally.
+                    let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+                    if ctrl {
+                        invoke_selected_as_admin(hwnd);
+                    } else {
+                        invoke_selected(hwnd);
+                    }
+                }
                 KEY_BACK => {
                     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
                     state.query.pop();
