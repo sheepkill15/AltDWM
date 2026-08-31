@@ -90,8 +90,7 @@ static LAYOUT_CACHE: LazyLock<Mutex<LayoutCache>> = LazyLock::new(|| Mutex::new(
 /// buries everything else in the log.
 fn warn_once(key: String, message: String) {
     use std::collections::HashSet;
-    static WARNED: LazyLock<Mutex<HashSet<String>>> =
-        LazyLock::new(|| Mutex::new(HashSet::new()));
+    static WARNED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
     if WARNED
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -191,12 +190,13 @@ pub fn try_compute_custom(
     // check cache
     let (ast, mut scope) = {
         let mut cache = LAYOUT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        let cached = cache
-            .get(name)
-            .and_then(|(cached_mtime, cached_ast, cached_path, cached_scope)| {
-                (*cached_path == code_path && *cached_mtime == code_mtime)
-                    .then(|| (cached_ast.clone(), cached_scope.clone()))
-            });
+        let cached =
+            cache
+                .get(name)
+                .and_then(|(cached_mtime, cached_ast, cached_path, cached_scope)| {
+                    (*cached_path == code_path && *cached_mtime == code_mtime)
+                        .then(|| (cached_ast.clone(), cached_scope.clone()))
+                });
         if let Some(cached) = cached {
             cached
         } else {
@@ -427,7 +427,10 @@ mod tests {
         assert_eq!(sane_master_ratio(f32::INFINITY), 0.6);
         let rects = compute_layout(2, AREA, 10, Layout::MasterStack);
         let master_width = rects[0].right - rects[0].left;
-        assert!(master_width > 100, "master column collapsed: {master_width}");
+        assert!(
+            master_width > 100,
+            "master column collapsed: {master_width}"
+        );
     }
 
     #[test]
@@ -449,7 +452,11 @@ mod tests {
         // Outer inset is the same on all four sides.
         assert_eq!(rects[0].left - AREA.left, gap);
         assert_eq!(rects[0].top - AREA.top, gap);
-        assert_eq!(AREA.right - rects[1].right, gap, "stack must keep its right gap");
+        assert_eq!(
+            AREA.right - rects[1].right,
+            gap,
+            "stack must keep its right gap"
+        );
         assert_eq!(AREA.bottom - rects[0].bottom, gap);
         assert_eq!(AREA.bottom - rects[2].bottom, gap);
         // Master and stack are separated by exactly one gap.

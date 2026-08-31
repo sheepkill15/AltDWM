@@ -8,8 +8,10 @@ mod manager;
 mod panel;
 mod quick_settings;
 mod rules;
+mod scripted_widget;
 mod scripting;
 mod shell;
+mod startup;
 mod system;
 mod theme;
 mod tray;
@@ -611,6 +613,7 @@ Options:
   --list-apps [q]     List indexed applications (optionally matching a query)
   --status            Print live system state (audio, power, network, input)
   --list-tray         Host the notification area briefly and print what arrives
+  --list-startup      List startup items and their enabled/disabled state
   --restore-windows   Un-hide any window a previous run left on a workspace
   --no-taskbar        Disable taskbar/panels (only tiling)
   --gap <px>          Override gap (default from config)
@@ -625,6 +628,7 @@ Examples:
   alt-dwm --generate-config
   alt-dwm --check-config
   alt-dwm --list-tray
+  alt-dwm --list-startup
 
 Config search: exe_dir/config.toml -> %APPDATA%/AltDWM/config.toml -> ./config.toml
 DSL: see docs/EXTENSIBILITY.md + examples/config.example.toml
@@ -636,7 +640,18 @@ fn do_generate_config(explicit: Option<&std::path::Path>) {
     let path = config::find_config_path(explicit).unwrap_or_else(config::default_config_path);
     let cfg = config::example_config_with_panels();
     match config::save_to_path(&cfg, &path) {
-        Ok(_) => println!("Generated example config at {}", path.display()),
+        Ok(_) => {
+            println!("Generated example config at {}", path.display());
+            match scripted_widget::export_builtin_scripts(&path) {
+                Ok(count) => {
+                    println!("Installed {count} editable widget script(s) beside the config")
+                }
+                Err(error) => {
+                    eprintln!("Failed to install widget scripts: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Err(e) => {
             eprintln!("Failed to generate config: {}", e);
             std::process::exit(1);
@@ -813,6 +828,9 @@ fn do_check_config(explicit: Option<&std::path::Path>) {
             std::process::exit(1);
         }
     };
+    *CONFIG_PATH
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(path.clone());
     // Report the configuration the runtime will actually build, including the
     // bar synthesised for `taskbar = true` with no [[panels]] declared.
     config::ensure_default_bar(&mut cfg);
@@ -842,6 +860,7 @@ fn do_check_config(explicit: Option<&std::path::Path>) {
 
 fn runtime_validation_errors(cfg: &config::Config) -> Vec<String> {
     let mut errors = cfg.validate();
+    errors.extend(scripted_widget::validate_config_scripts(cfg));
     for keybind in &cfg.keybinds {
         if parse_hotkey(&keybind.keys).is_none() {
             errors.push(format!("invalid keybind '{}'", keybind.keys));
@@ -1045,6 +1064,7 @@ fn main() {
             }
             "--status" => do_status(),
             "--list-tray" => do_list_tray(),
+            "--list-startup" => startup::print_entries_and_exit(),
             "--restore-windows" => {
                 // Recovery for the one case no in-process handler can catch: a
                 // hard kill while windows were hidden on another workspace.
@@ -1143,6 +1163,7 @@ fn main() {
     );
     shell::set_native_taskbars_hidden(cfg.general.hide_native_taskbar);
     tray::announce();
+    startup::launch_for_shell_once(cfg.general.launch_startup_apps);
 
     let mut panel_handles: Vec<HWND> = Vec::new();
     if !cfg.panels.is_empty() {

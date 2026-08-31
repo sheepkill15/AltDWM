@@ -34,6 +34,10 @@ pub struct Theme {
     pub font_name: String,
     #[serde(default = "def_font_size")]
     pub font_size: i32,
+    #[serde(default = "def_font_weight")]
+    pub font_weight: i32,
+    #[serde(default = "def_strong_font_weight")]
+    pub strong_font_weight: i32,
     #[serde(default = "def_rounding")]
     pub rounding: i32, // pill radius for window_list, 0 = square
     #[serde(default = "def_gap")]
@@ -82,6 +86,12 @@ fn def_font_name() -> String {
 fn def_font_size() -> i32 {
     13
 }
+fn def_font_weight() -> i32 {
+    400
+}
+fn def_strong_font_weight() -> i32 {
+    500
+}
 fn def_rounding() -> i32 {
     6
 }
@@ -106,6 +116,8 @@ impl Default for Theme {
             surface_hover: def_surface_hover(),
             font_name: def_font_name(),
             font_size: def_font_size(),
+            font_weight: def_font_weight(),
+            strong_font_weight: def_strong_font_weight(),
             rounding: def_rounding(),
             gap: def_gap(),
         }

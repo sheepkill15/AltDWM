@@ -1015,7 +1015,8 @@ unsafe extern "system" fn wndproc(
                 if let Some(entry) = app_at(row) {
                     let mut client = RECT::default();
                     let _ = GetClientRect(hwnd, &mut client);
-                    let button = admin_button_rect(row_rect_at(client, scale(hwnd), row), scale(hwnd));
+                    let button =
+                        admin_button_rect(row_rect_at(client, scale(hwnd), row), scale(hwnd));
                     if crate::ui::point_in_rect(x, y, &button) {
                         let _ = DestroyWindow(hwnd);
                         crate::apps::launch_as_admin(&entry);

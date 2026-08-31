@@ -6,7 +6,7 @@ Goal: let users configure **and change anything** without forking Rust code — 
 
 1. **No recompilation for most changes** — edit `config.toml` + optional `*.rhai` scripts and hit `Alt+Shift+C` (default, `Win+Shift` collides with Snipping Tool) to hot-reload.
 2. **Progressive disclosure** — simple TOML for 80% of users, full scripting for power users. Same file format powers both.
-3. **Stable Rust core, pluggable edges** — `Panel`, `Widget`, `Layout`, `Rule`, `Keybind` form the extension boundary. New widget types are added in Rust through `create_widget`; Rhai covers text widgets, layouts, and actions.
+3. **Stable Rust core, scripted policy** — Rust owns Win32 integration, snapshots, drawing primitives, and resource limits. Every shipped widget is a Rhai script, so appearance and behavior change without recompiling.
 4. **Fail-safe** — startup can use defaults when no valid config exists; a bad hot reload is rejected and the last-known-good configuration remains active.
 
 `general.instant_first_layout = true` is the default. CREATE/SHOW/FOREGROUND
@@ -35,7 +35,7 @@ Users who want full Rust can still use the plugin API (compile-time).
 ### 0) Units
 
 Every length in configuration — panel `height` and `margin`, `general.gap`,
-`outer_gap`, `theme.font_size`, `theme.rounding`, widget `width` — is a
+`outer_gap`, `theme.font_size`, `theme.font_weight`, `theme.strong_font_weight`, `theme.rounding`, widget `width` — is a
 device-independent pixel at 96 DPI. AltDWM scales them for each display's DPI, so
 one configuration looks the same on a 100% and a 200% monitor, and the tiling
 area reserves the panel's *physical* size. Panels re-place themselves on
@@ -73,7 +73,7 @@ Built-ins (v0.3):
 | `battery` / `power` | Charge, charging state, and estimated time left                         | `width`, `interval`          |
 | `network` / `wifi` | Connection name and signal, or `Offline`                                 | `width`, `interval`          |
 | `input` / `keyboard` / `language` | Active keyboard layout; click or scroll to cycle           | `width`, `interval`          |
-| `custom`       | Rhai-drawn widget                                                             | `script`, `interval`         |
+| `custom`       | Any Rhai widget using the same full renderer as the shipped widgets           | `script`, `interval`         |
 
 System-status widgets read a snapshot published by a background poller
 (`src/system.rs`), never by calling Core Audio, WLAN, or DDC/CI from the paint
@@ -92,7 +92,14 @@ Sliders respond to click, drag, and the scroll wheel. Rows that AltDWM cannot
 own end to end — choosing a Wi-Fi network, pairing Bluetooth — open the matching
 `ms-settings:` page instead of offering a partial implementation.
 
-Widget registry is extensible:
+All built-ins resolve to `scripts/widgets/<type>.rhai`. An explicit `script`
+replaces that path. AltDWM checks beside the config, the working directory, and
+the executable, in that order, and falls back to an embedded copy only when a
+shipped file is missing. `--generate-config` writes editable copies without
+overwriting existing scripts. Changes are noticed on the next refresh; config
+reload is not required.
+
+The stable Rust host contract remains:
 
 ```rust
 // src/widgets.rs
@@ -117,8 +124,10 @@ window or sets the foreground window pumps messages, which can re-enter
 deadlock the shell. Prefer returning an action string and letting
 `dispatch_action` run it.
 
-Adding a widget = implement the trait and add its branch in `create_widget`.
-Dynamic DLL plugins are not implemented.
+Normal widgets no longer need a Rust implementation. Add a `.rhai` file and a
+`[[widgets]]` entry with `type = "custom"`. `native = true` opts a built-in back
+into its legacy Rust renderer for compatibility and debugging. Dynamic DLL
+plugins are not implemented.
 
 Draw through `crate::ui` rather than positioning text yourself: `ctx.px(n)`
 scales a design constant for the panel's display, `ui::draw_label` centres one
@@ -181,6 +190,10 @@ Window chrome colors are independent theme tokens:
 
 ```toml
 [theme]
+font_name = "Segoe UI"
+font_size = 13
+font_weight = 400
+strong_font_weight = 500
 border_active = "#8b5cf6"
 border_inactive = "#343842"
 ```
@@ -211,29 +224,75 @@ action = "focus_next()"
 
 Actions: `retile`, `toggle_tiling`, `set_layout("grid")`, `launch("wt.exe")`, `focus_next()`, `toggle_floating()`, `move_to_next_monitor()`, `rhai: <code>`.
 
-### 6) Scripting — Rhai callbacks
+### 6) Scripting — full Rhai widgets
 
-Any `on_*` field can be `rhai: <expr>`:
+Every widget script defines `render(ctx)`:
 
 ```toml
 [[widgets]]
 type = "custom"
 name = "cpu"
 interval = 1000
-script = "scripts/cpu.rhai"      # or inline: on_update = "rhai: get_cpu()"
-```
-```rhai
-# scripts/cpu.rhai
-let cpu = get_cpu_usage();
-`CPU ${cpu}%`;
+script = "scripts/cpu.rhai"
 ```
 
-Exposed API (via `rhai::Engine` in `src/scripting.rs`):
+```rhai
+fn render(ctx) {
+    let cpu = get_cpu_usage();
+    #{
+        width: 120,
+        interval: 1000,
+        hover: "self",
+        commands: [
+            #{ type: "rect", x: 4, y: 5, w: ctx.width - 8,
+               h: ctx.height - 10, radius: 8,
+               background: "surface", hover_background: "surface_hover",
+               action: "launch('taskmgr.exe')" },
+            #{ type: "text", x: 12, y: 5, w: ctx.width - 24,
+               h: ctx.height - 10, text: `CPU ${cpu}%`,
+               font: "strong", color: "text",
+               action: "launch('taskmgr.exe')" }
+        ]
+    }
+}
+```
+
+The return value may be a command array or a map containing `width`, `interval`,
+`hover`, and `commands`. `ctx` contains:
+
+| field | value |
+| --- | --- |
+| `name`, `kind`, `panel`, `monitor` | Widget/panel identity |
+| `width`, `height`, `vertical` | Widget rectangle in 96-DPI logical pixels |
+| `config` | `format`, `label`, `icon`, `command`, `action`, plus every extra TOML key |
+| `focused_title`, `layout`, `tiling` | Current shell state |
+| `windows` | Maps with `id`, `title`, `icon`, `active`, `minimized`, `floating` |
+| `workspaces` | Maps with `number`, `active`, `occupied` |
+| `tray` | Maps with stable `id`, `name`, `icon`, `hidden`, `process` |
+| `system` | `volume`, `muted`, `battery`, `charging`, `on_ac`, `network`, `network_kind`, `network_signal`, `connected`, `brightness`, `input` |
+
+Drawing commands use logical `x`, `y`, `w`, `h`. Supported `type` values are
+`rect`, `text`, and `icon`. Text supports `font = "body"|"strong"|"small"|"symbol"`,
+`align = "left"|"center"|"right"`, optional `font_size`/`font_weight`, and theme color names `text`, `text_dim`,
+`surface`, `surface_hover`, `accent`, `border`, and `panel`, or any literal color
+accepted by the theme. Rectangles support `radius`, `background`, and
+`hover_background`. Any command can declare `action`, `right_action`,
+`double_action`, `scroll_up`, and `scroll_down`; hit testing uses the exact same
+rectangle that was drawn.
+
+Host actions beginning with `@` connect data snapshots back to Win32 safely:
+`@window:<id>`, `@tray:<left|right|double>:<id>`, `@tray_overflow`, and
+`@quick_settings`. Ordinary action strings use the same dispatcher as keybinds.
+
+The callable API (via `rhai::Engine` in `src/scripting.rs`) includes:
 
 ```
 launch(cmd)           // CreateProcess
 shell(cmd)            // cmd.exe /C; trusted local scripts only
 get_cpu_usage() -> int
+format_time(format) -> string
+truncate_text(text, max_chars) -> string
+symbol(codepoint) -> string // for text commands using font = "symbol"
 get_mem_usage() -> int / get_mem() -> map
 focused_title() -> string
 window_count() / tilable_count() -> int
@@ -249,17 +308,20 @@ Resource-limited, but **not a security sandbox**: scripts come from the trusted 
 ```
 config.toml                 # main DSL (checked: exe_dir -> %APPDATA%/AltDWM/ -> ./ )
 scripts/
+  widgets/*.rhai             # every shipped widget; open and editable
   spiral.rhai               # custom layout
   cpu.rhai                  # custom widget
 plugins/
   my_widget.dll             # optional Rust cdylib (libloading)
 ```
 
-`alt-dwm --generate-config` writes commented `config.example.toml` with all options.
+`alt-dwm --generate-config` writes the example config and all editable built-in
+widget scripts. Existing script files are never overwritten.
 
 ## Hot reload & safety
 
 - `Alt+Shift+C` (default) or the file watcher on `config.toml` loads and validates the changed file before recreating panels.
+- Widget script edits are polled at their own refresh interval and apply without a config reload.
 - Parse/read errors are logged and the last-known-good runtime configuration remains active.
 - `alt-dwm --check-config` validates without applying and exits nonzero for missing, malformed, or semantically invalid configuration.
 

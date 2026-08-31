@@ -249,16 +249,31 @@ unsafe extern "system" fn panel_wndproc(
                 // Widgets refresh here, never in WM_PAINT: a Rhai script or a
                 // file read in the paint handler stalled the whole shell.
                 let mut changed = false;
+                // Snapshot before taking the panel lock. Window discovery can
+                // enter virtual-desktop COM, which is allowed to pump paint
+                // messages on this thread.
+                let snapshot = crate::manager::window_snapshot();
+                let mut refreshes = Vec::new();
                 if let Some(panel_arc) = panel_collection() {
                     if let Ok(panels) = panel_arc.try_lock() {
                         for panel in panels.iter().filter(|panel| panel.hwnd == hwnd) {
-                            for widget in &panel.widgets {
-                                // Every widget ticks; `||` would short-circuit
-                                // and starve the ones after the first change.
-                                changed |= widget.tick();
+                            let mut client = RECT::default();
+                            let _ = GetClientRect(hwnd, &mut client);
+                            let ctx = build_ctx(panel, client, hwnd, snapshot.clone());
+                            let rects = widget_rects(panel, client, &ctx);
+                            for (widget, rect) in panel.widgets.iter().zip(rects) {
+                                refreshes.push((widget.clone(), rect, ctx.clone()));
                             }
                         }
                     }
+                }
+                // Scripts and their context APIs can launch COM/window queries
+                // and pump messages too. Invoke them only after releasing the
+                // panel collection lock.
+                for (widget, rect, ctx) in refreshes {
+                    // Every widget refreshes; `||` would short-circuit and
+                    // starve the ones after the first change.
+                    changed |= widget.refresh(&ctx, rect);
                 }
                 // Only repaint when something moved. A sub-second widget used to
                 // force the whole bar — window enumeration and all — to redraw
@@ -756,12 +771,21 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
                 apply_panel_chrome(hwnd);
                 // Keep sub-second widgets responsive without polling every panel
                 // at that rate.
-                if let Some(interval) = widgets_inst
-                    .iter()
-                    .filter_map(|widget| widget.interval_ms())
-                    .min()
-                    .filter(|interval| *interval < 1000)
-                {
+                let scripted = widgets_inst.iter().any(|widget| widget.kind() == "script");
+                let fast_interval = if scripted {
+                    // A script may change its own interval on disk. Keep a cheap
+                    // scheduler heartbeat so that change can take effect without
+                    // recreating the panel; the widget itself skips evaluation
+                    // until it is due.
+                    Some(50)
+                } else {
+                    widgets_inst
+                        .iter()
+                        .filter_map(|widget| widget.interval_ms())
+                        .min()
+                        .filter(|interval| *interval < 1000)
+                };
+                if let Some(interval) = fast_interval {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
                         Some(hwnd),
                         TIMER_FAST,
@@ -770,12 +794,30 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
                     );
                 }
             }
+            let panel = Panel {
+                cfg: pc.clone(),
+                hwnd,
+                widgets: widgets_inst,
+                background: bg,
+                monitor: *hmon,
+                edge_offset,
+            };
             // Populate widget state once up front so the first paint is not
-            // blank while waiting for the first timer tick.
-            for widget in &widgets_inst {
-                widget.tick();
+            // blank while waiting for the first timer tick. Script widgets need
+            // the actual panel context and their resolved rectangle.
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            let initial_ctx = build_ctx(&panel, client, hwnd, crate::manager::window_snapshot());
+            let initial_rects = widget_rects(&panel, client, &initial_ctx);
+            for (widget, item) in panel.widgets.iter().zip(initial_rects) {
+                widget.refresh(&initial_ctx, item);
             }
-            let widget_summary = widgets_inst
+            let widget_summary = panel
+                .widgets
                 .iter()
                 .map(|widget| format!("{}:{}", widget.name(), widget.kind()))
                 .collect::<Vec<_>>()
@@ -797,14 +839,7 @@ pub fn create_panels(cfg: &Config) -> Result<Vec<HWND>, String> {
             panels_arc
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(Panel {
-                    cfg: pc.clone(),
-                    hwnd,
-                    widgets: widgets_inst,
-                    background: bg,
-                    monitor: *hmon,
-                    edge_offset,
-                });
+                .push(panel);
         }
     }
 

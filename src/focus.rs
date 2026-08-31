@@ -454,7 +454,11 @@ mod tests {
     #[test]
     fn moving_right_from_master_finds_the_stack() {
         let (master, all) = master_stack();
-        let others: Vec<_> = all.iter().copied().filter(|(h, _)| h.0 as isize != 1).collect();
+        let others: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|(h, _)| h.0 as isize != 1)
+            .collect();
         // Master spans the full height, so both stack tiles overlap it and sit
         // almost exactly equidistant from its centre. Either is a correct answer;
         // what matters is that focus leaves master and lands in the stack.
@@ -479,7 +483,11 @@ mod tests {
     fn moving_left_from_the_stack_finds_master() {
         let (_, all) = master_stack();
         let stack_top = all[1].1;
-        let others: Vec<_> = all.iter().copied().filter(|(h, _)| h.0 as isize != 2).collect();
+        let others: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|(h, _)| h.0 as isize != 2)
+            .collect();
         assert_eq!(
             neighbour(stack_top, Direction::Left, &others).map(|h| h.0 as isize),
             Some(1)
@@ -490,7 +498,11 @@ mod tests {
     fn moving_down_within_the_stack_skips_master() {
         let (_, all) = master_stack();
         let stack_top = all[1].1;
-        let others: Vec<_> = all.iter().copied().filter(|(h, _)| h.0 as isize != 2).collect();
+        let others: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|(h, _)| h.0 as isize != 2)
+            .collect();
         // Master's centre is below the top stack tile's centre, but it is far
         // off-axis; the tile directly underneath wins.
         assert_eq!(
@@ -502,7 +514,11 @@ mod tests {
     #[test]
     fn there_is_no_neighbour_past_the_edge_of_the_layout() {
         let (master, all) = master_stack();
-        let others: Vec<_> = all.iter().copied().filter(|(h, _)| h.0 as isize != 1).collect();
+        let others: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|(h, _)| h.0 as isize != 1)
+            .collect();
         assert_eq!(neighbour(master, Direction::Left, &others), None);
     }
 
@@ -512,7 +528,11 @@ mod tests {
     #[test]
     fn vertical_moves_ignore_windows_in_another_column() {
         let (master, all) = master_stack();
-        let others: Vec<_> = all.iter().copied().filter(|(h, _)| h.0 as isize != 1).collect();
+        let others: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|(h, _)| h.0 as isize != 1)
+            .collect();
         assert_eq!(neighbour(master, Direction::Up, &others), None);
         assert_eq!(neighbour(master, Direction::Down, &others), None);
     }

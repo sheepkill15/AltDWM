@@ -20,8 +20,6 @@ use windows::Win32::Foundation::HWND;
 use crate::config::RuleConfig;
 use crate::util::{get_class_name, get_window_title};
 
-
-
 /// Class name and executable name never change for a live window, so they are
 /// resolved once. Process resolution in particular costs an `OpenProcess` round
 /// trip that used to be paid for every window on every rule evaluation, several
@@ -263,10 +261,7 @@ fn query_process_name(hwnd: HWND) -> String {
             return String::new();
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]);
-        path.rsplit(['\\', '/'])
-            .next()
-            .unwrap_or(&path)
-            .to_string()
+        path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string()
     }
 }
 
@@ -337,7 +332,10 @@ fn apply_alpha(hwnd: HWND, alpha: u8) {
     let key = hwnd.0 as isize;
     {
         let layered = LAYERED.lock().unwrap_or_else(|e| e.into_inner());
-        if layered.get(&key).is_some_and(|(previous, _)| *previous == alpha) {
+        if layered
+            .get(&key)
+            .is_some_and(|(previous, _)| *previous == alpha)
+        {
             return;
         }
     }
@@ -485,7 +483,10 @@ mod tests {
 
     #[test]
     fn identifiers_match_exactly_by_default() {
-        assert!(matches_identifier("Chrome_WidgetWin_1", "chrome_widgetwin_1"));
+        assert!(matches_identifier(
+            "Chrome_WidgetWin_1",
+            "chrome_widgetwin_1"
+        ));
         // The old substring fallback made this true, so a rule for "Chrome"
         // captured every class containing it.
         assert!(!matches_identifier("Chrome_WidgetWin_1", "Chrome"));

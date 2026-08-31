@@ -19,6 +19,7 @@ hide_native_taskbar = true
 #              only names)
 #   off      - show nothing
 tray = "auto"
+launch_startup_apps = true # only runs when AltDWM is the configured Winlogon shell
 filter_virtual_desktop = false
 # Workspaces hide the windows that are not on the visible one. Opt-in, because
 # `1` (the default) keeps the feature inert. If AltDWM is ever killed outright
@@ -54,6 +55,8 @@ surface = "#292d38"
 surface_hover = "#353b49"
 font_name = "Segoe UI"
 font_size = 13
+font_weight = 400
+strong_font_weight = 500
 rounding = 12
 gap = 4
 
@@ -79,26 +82,31 @@ widgets = [
 [[widgets]]
 type = "launcher"
 name = "launcher"
+script = "scripts/widgets/launcher.rhai"
 label = "AltDWM"
 width = 120
 
 [[widgets]]
 type = "workspaces"
 name = "workspaces"
+script = "scripts/widgets/workspaces.rhai"
 # Width is derived from the workspace count when omitted.
 
 [[widgets]]
 type = "layout"
 name = "layout"
+script = "scripts/widgets/layout.rhai"
 width = 180
 
 [[widgets]]
 type = "window_list"
 name = "window_list"
+script = "scripts/widgets/window_list.rhai"
 
 [[widgets]]
 type = "tray"
 name = "tray"
+script = "scripts/widgets/tray.rhai"
 # Omit `width` and the tray sizes itself to its icons; set it to pin the bar's
 # geometry. `max_items` caps how many reach the bar — the rest go to the
 # overflow button.
@@ -108,6 +116,7 @@ name = "tray"
 [[widgets]]
 type = "clock"
 name = "clock"
+script = "scripts/widgets/clock.rhai"
 format = "%H:%M"
 interval = 500
 width = 136
@@ -117,6 +126,7 @@ width = 136
 [[widgets]]
 type = "system_status"
 name = "system"
+script = "scripts/widgets/system.rhai"
 show_volume = true
 show_network = true
 show_battery = true

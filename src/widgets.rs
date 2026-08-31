@@ -7,7 +7,6 @@
 //! display scaling.
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
-use std::time::Instant;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{HDC, HFONT};
 
@@ -33,7 +32,7 @@ fn truncate_chars(value: &mut String, max_chars: usize) {
 static ICON_CACHE: LazyLock<Mutex<HashMap<isize, isize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn window_icon(hwnd: HWND) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+pub(crate) fn window_icon(hwnd: HWND) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassLongPtrW, SendMessageTimeoutW, GCLP_HICONSM, HICON, ICON_SMALL2, SMTO_ABORTIFHUNG,
         WM_GETICON,
@@ -94,7 +93,7 @@ pub fn forget_icon(hwnd: HWND) {
 /// anywhere over the open windows filled a rounded panel nearly the width of
 /// the display. Widgets that contain individually clickable items now draw
 /// their own hover instead.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoverPaint {
     /// Not interactive — no hover feedback at all.
     None,
@@ -143,15 +142,15 @@ impl PanelCtx {
 
     /// The panel's body font.
     pub fn body_font(&self) -> HFONT {
-        self.font(self.theme.font_size, 400)
+        self.font(self.theme.font_size, self.theme.font_weight)
     }
 
     pub fn strong_font(&self) -> HFONT {
-        self.font(self.theme.font_size, 600)
+        self.font(self.theme.font_size, self.theme.strong_font_weight)
     }
 
     pub fn small_font(&self) -> HFONT {
-        self.font((self.theme.font_size - 2).max(8), 400)
+        self.font((self.theme.font_size - 2).max(8), self.theme.font_weight)
     }
 
     /// Windows' native icon face at one of Microsoft's recommended optical
@@ -221,6 +220,12 @@ pub trait Widget: Send + Sync {
     fn tick(&self) -> bool {
         false
     }
+    /// Rebuild context-dependent state outside `WM_PAINT`. Script widgets use
+    /// this to evaluate their Rhai `render(ctx)` function with the real panel
+    /// dimensions and snapshots; native widgets normally rely on `tick`.
+    fn refresh(&self, _ctx: &PanelCtx, _rect: RECT) -> bool {
+        self.tick()
+    }
 }
 
 /// The content box of a widget: full height minus the panel's inset.
@@ -254,7 +259,7 @@ pub struct ClockWidget {
     state: Mutex<(String, String)>,
 }
 
-fn format_time(format: &str) -> String {
+pub(crate) fn format_time(format: &str) -> String {
     let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = [
@@ -1758,144 +1763,19 @@ impl Widget for SystemStatusWidget {
     }
 }
 
-/// Custom Rhai-drawn widget — script returns text to draw.
-///
-/// Evaluation happens on the panel timer, never during `WM_PAINT`. Running a
-/// script and reading its file from the paint handler stalled the shell for as
-/// long as the script took, and did it while the panel collection was locked.
-pub struct CustomWidget {
-    pub cfg: WidgetConfig,
-    state: Mutex<CustomState>,
-}
-
-#[derive(Default)]
-struct CustomState {
-    evaluated_at: Option<Instant>,
-    text: String,
-}
-
-impl CustomWidget {
-    fn interval(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.cfg.interval.unwrap_or(1000).max(50) as u64)
-    }
-
-    fn evaluate(&self) -> String {
-        let Some(script) = &self.cfg.script else {
-            return self.cfg.label.clone().unwrap_or_else(|| "custom".into());
-        };
-        let code = if let Some(inline) = script.strip_prefix("rhai:") {
-            Ok(inline.trim().to_string())
-        } else {
-            read_widget_script(script)
-        };
-        code.and_then(|code| crate::scripting::eval_text(&code))
-            .unwrap_or_else(|error| format!("rhai: {error}"))
-    }
-}
-
-impl Widget for CustomWidget {
-    fn name(&self) -> &str {
-        &self.cfg.name
-    }
-    fn kind(&self) -> &'static str {
-        "custom"
-    }
-    fn width(&self, _ctx: &PanelCtx) -> i32 {
-        self.cfg.width.unwrap_or(120)
-    }
-    fn hover_paint(&self) -> HoverPaint {
-        if self.cfg.action.is_some() {
-            HoverPaint::Whole
-        } else {
-            HoverPaint::None
-        }
-    }
-    fn tick(&self) -> bool {
-        let due = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state
-                .evaluated_at
-                .is_none_or(|last| last.elapsed() >= self.interval())
-        };
-        if !due {
-            return false;
-        }
-        // Evaluated without the state lock held: a script may take a while and
-        // must not block a concurrent paint from reading the previous value.
-        let text = self.evaluate();
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let changed = state.text != text;
-        state.text = text;
-        state.evaluated_at = Some(Instant::now());
-        changed
-    }
-    fn draw(&self, hdc: HDC, rect: RECT, ctx: &PanelCtx) {
-        let text = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.text.clone()
-        };
-        let area = inset_rect(content_rect(rect, ctx), ctx.px(token::PAD), 0);
-        draw_label(hdc, &area, &text, ctx.body_font(), ctx.theme.text_color());
-    }
-    fn on_click(&self, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> Option<String> {
-        self.cfg.action.clone()
-    }
-    fn interval_ms(&self) -> Option<u32> {
-        self.cfg.interval
-    }
-}
-
-/// Widget scripts are read once and re-read only when the file changes on disk.
-static SCRIPT_CACHE: LazyLock<Mutex<HashMap<String, (std::time::SystemTime, String)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn widget_script_candidates(script: &str) -> Vec<std::path::PathBuf> {
-    let mut candidates = vec![std::path::PathBuf::from(script)];
-    if let Some(dir) = crate::CONFIG_PATH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|path| path.parent())
-    {
-        candidates.push(dir.join(script));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(script));
-        }
-    }
-    candidates
-}
-
-fn read_widget_script(script: &str) -> Result<String, String> {
-    for path in widget_script_candidates(script) {
-        let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) else {
-            continue;
-        };
-        let key = path.to_string_lossy().to_string();
-        if let Some((cached_at, cached)) = SCRIPT_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            if *cached_at == modified {
-                return Ok(cached.clone());
-            }
-        }
-        if let Ok(code) = std::fs::read_to_string(&path) {
-            SCRIPT_CACHE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, (modified, code.clone()));
-            return Ok(code);
-        }
-    }
-    Err(format!("script not found: {script}"))
-}
-
 // ---- factory ----------------------------------------------------
 
 pub fn create_widget(cfg: &WidgetConfig) -> Box<dyn Widget> {
+    // Built-ins are shipped as editable Rhai scripts. `native = true` is kept
+    // as an escape hatch for old configurations while the Rust implementations
+    // remain available as compatibility/reference renderers.
+    let scripted = cfg.widget_type == "custom"
+        || cfg.script.is_some()
+        || (!widget_flag(cfg, "native", false)
+            && crate::scripted_widget::builtin_script_name(&cfg.widget_type).is_some());
+    if scripted {
+        return Box::new(crate::scripted_widget::ScriptWidget::new(cfg.clone()));
+    }
     match cfg.widget_type.as_str() {
         "clock" => Box::new(ClockWidget {
             cfg: cfg.clone(),
@@ -1916,19 +1796,12 @@ pub fn create_widget(cfg: &WidgetConfig) -> Box<dyn Widget> {
             tag: Mutex::new(String::new()),
         }),
         "system_status" | "status" | "system" => Box::new(SystemStatusWidget { cfg: cfg.clone() }),
-        "custom" => Box::new(CustomWidget {
-            cfg: cfg.clone(),
-            state: Mutex::new(CustomState::default()),
-        }),
         other => {
             eprintln!(
                 "[widgets] unknown type '{}' for '{}' -> custom fallback",
                 other, cfg.name
             );
-            Box::new(CustomWidget {
-                cfg: cfg.clone(),
-                state: Mutex::new(CustomState::default()),
-            })
+            Box::new(crate::scripted_widget::ScriptWidget::new(cfg.clone()))
         }
     }
 }

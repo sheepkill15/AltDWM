@@ -94,6 +94,26 @@ fn build_engine() -> Engine {
         println!("[rhai] {}", msg);
     });
     eng.register_fn("get_cpu_usage", || -> i64 { get_cpu_usage_real() });
+    eng.register_fn("format_time", |format: &str| -> String {
+        crate::widgets::format_time(format)
+    });
+    eng.register_fn("truncate_text", |text: &str, max_chars: i64| -> String {
+        let max_chars = max_chars.max(0) as usize;
+        if text.chars().count() <= max_chars {
+            text.to_string()
+        } else {
+            format!("{}…", text.chars().take(max_chars).collect::<String>())
+        }
+    });
+    // Turn any Unicode codepoint into text. Widget scripts use this for icon
+    // fonts, keeping both the chosen glyph and its state thresholds editable.
+    eng.register_fn("symbol", |codepoint: i64| -> String {
+        u32::try_from(codepoint)
+            .ok()
+            .and_then(char::from_u32)
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    });
     eng.register_fn("focused_title", || -> String {
         unsafe {
             let hwnd = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
@@ -237,23 +257,6 @@ fn build_engine() -> Engine {
 
 pub fn engine() -> &'static Engine {
     ENGINE.get_or_init(build_engine)
-}
-
-/// Evaluate Rhai expression that returns text (for custom widget)
-pub fn eval_text(code: &str) -> Result<String, String> {
-    let eng = engine();
-    let scope = Scope::new();
-    let res: Result<Dynamic, _> = eng.eval_with_scope(&mut scope.clone(), code);
-    match res {
-        Ok(v) => {
-            if let Ok(s) = v.clone().into_string() {
-                Ok(s)
-            } else {
-                Ok(v.to_string())
-            }
-        }
-        Err(e) => Err(format!("{}", e)),
-    }
 }
 
 /// Evaluate for side effects (action)

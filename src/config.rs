@@ -68,6 +68,10 @@ pub struct General {
     /// so it is not something to do behind the back of a user who kept it.
     #[serde(default = "default_tray")]
     pub tray: String,
+    /// Process enabled Run entries and Startup-folder shortcuts when AltDWM is
+    /// the configured Winlogon shell. Explorer normally owns this job.
+    #[serde(default = "default_true")]
+    pub launch_startup_apps: bool,
     /// Additional inset applied to every edge of each monitor's work area.
     #[serde(default)]
     pub outer_gap: Option<i32>,
@@ -262,6 +266,7 @@ impl Default for General {
             respect_window_size_constraints: default_true(),
             hide_native_taskbar: default_true(),
             tray: default_tray(),
+            launch_startup_apps: default_true(),
             outer_gap: None,
             filter_virtual_desktop: default_filter_vd(),
             workspaces: default_workspaces(),
@@ -528,6 +533,12 @@ impl Config {
                 self.theme.font_size
             ));
         }
+        if !(100..=900).contains(&self.theme.font_weight) {
+            warns.push("theme.font_weight must be between 100 and 900".to_string());
+        }
+        if !(100..=900).contains(&self.theme.strong_font_weight) {
+            warns.push("theme.strong_font_weight must be between 100 and 900".to_string());
+        }
         if self.theme.rounding < 0 {
             warns.push("theme.rounding cannot be negative".to_string());
         }
@@ -731,7 +742,7 @@ pub fn builtin_widget_config(name: &str) -> Option<WidgetConfig> {
         name: name.into(),
         format: None,
         interval: None,
-        script: None,
+        script: crate::scripted_widget::builtin_script_path(widget_type),
         action: None,
         command: None,
         label: None,
@@ -870,7 +881,7 @@ pub fn example_config_with_panels() -> Config {
             name: "launcher".into(),
             format: None,
             interval: None,
-            script: None,
+            script: crate::scripted_widget::builtin_script_path("launcher"),
             action: None,
             command: None,
             label: Some("AltDWM".into()),
@@ -883,7 +894,7 @@ pub fn example_config_with_panels() -> Config {
             name: "layout".into(),
             format: None,
             interval: None,
-            script: None,
+            script: crate::scripted_widget::builtin_script_path("layout"),
             action: None,
             command: None,
             label: None,
@@ -896,7 +907,7 @@ pub fn example_config_with_panels() -> Config {
             name: "window_list".into(),
             format: None,
             interval: None,
-            script: None,
+            script: crate::scripted_widget::builtin_script_path("window_list"),
             action: None,
             command: None,
             label: None,
@@ -909,7 +920,7 @@ pub fn example_config_with_panels() -> Config {
             name: "tray".into(),
             format: None,
             interval: None,
-            script: None,
+            script: crate::scripted_widget::builtin_script_path("tray"),
             action: None,
             command: None,
             label: None,
@@ -924,7 +935,7 @@ pub fn example_config_with_panels() -> Config {
             name: "clock".into(),
             format: Some("%H:%M".into()),
             interval: Some(1000),
-            script: None,
+            script: crate::scripted_widget::builtin_script_path("clock"),
             action: None,
             command: None,
             label: None,

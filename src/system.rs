@@ -299,7 +299,9 @@ mod audio {
                     let device = enumerator
                         .GetDefaultAudioEndpoint(eRender, eMultimedia)
                         .ok()?;
-                    device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()
+                    device
+                        .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+                        .ok()
                 };
             }
             self.volume.as_ref()
@@ -404,15 +406,14 @@ mod power {
 
 mod net {
     use super::NetworkStatus;
-    use windows::Win32::Networking::NetworkListManager::INetworkListManager;
     use windows::Win32::NetworkManagement::WiFi::{
-        WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
-        WlanSetInterface, WLAN_API_VERSION_2_0,
-        WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST, WLAN_INTERFACE_STATE,
-        WLAN_PHY_RADIO_STATE, WLAN_RADIO_STATE,
         dot11_radio_state_off, dot11_radio_state_on, wlan_interface_state_connected,
-        wlan_intf_opcode_current_connection, wlan_intf_opcode_radio_state,
+        wlan_intf_opcode_current_connection, wlan_intf_opcode_radio_state, WlanCloseHandle,
+        WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, WlanSetInterface,
+        WLAN_API_VERSION_2_0, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
+        WLAN_INTERFACE_STATE, WLAN_PHY_RADIO_STATE, WLAN_RADIO_STATE,
     };
+    use windows::Win32::Networking::NetworkListManager::INetworkListManager;
 
     /// A WLAN client handle plus the interfaces it found, released together.
     struct Wlan {
@@ -423,9 +424,8 @@ mod net {
         fn open() -> Option<Self> {
             let mut negotiated = 0u32;
             let mut handle = windows::Win32::Foundation::HANDLE::default();
-            let result = unsafe {
-                WlanOpenHandle(WLAN_API_VERSION_2_0, None, &mut negotiated, &mut handle)
-            };
+            let result =
+                unsafe { WlanOpenHandle(WLAN_API_VERSION_2_0, None, &mut negotiated, &mut handle) };
             (result == 0).then_some(Self { handle })
         }
 
@@ -530,8 +530,7 @@ mod net {
                             let association = attributes.wlanAssociationAttributes;
                             let ssid = &association.dot11Ssid;
                             let length = (ssid.uSSIDLength as usize).min(ssid.ucSSID.len());
-                            let name =
-                                String::from_utf8_lossy(&ssid.ucSSID[..length]).to_string();
+                            let name = String::from_utf8_lossy(&ssid.ucSSID[..length]).to_string();
                             return NetworkStatus::WiFi {
                                 ssid: name,
                                 signal: association.wlanSignalQuality.min(100) as u8,
@@ -566,9 +565,8 @@ mod net {
             const CLSID_NETWORK_LIST_MANAGER: GUID =
                 GUID::from_u128(0xDCB00C01_570F_4A9B_8D69_199FDBA5723B);
             if self.connectivity.is_none() {
-                self.connectivity = unsafe {
-                    CoCreateInstance(&CLSID_NETWORK_LIST_MANAGER, None, CLSCTX_ALL).ok()
-                };
+                self.connectivity =
+                    unsafe { CoCreateInstance(&CLSID_NETWORK_LIST_MANAGER, None, CLSCTX_ALL).ok() };
             }
             let manager = self.connectivity.as_ref()?;
             match unsafe { manager.GetConnectivity() } {
@@ -732,12 +730,47 @@ mod tests {
 
     #[test]
     fn volume_reports_whole_percentages() {
-        assert_eq!(VolumeStatus { level: 0.0, muted: false }.percent(), 0);
-        assert_eq!(VolumeStatus { level: 0.245, muted: false }.percent(), 25);
-        assert_eq!(VolumeStatus { level: 1.0, muted: false }.percent(), 100);
+        assert_eq!(
+            VolumeStatus {
+                level: 0.0,
+                muted: false
+            }
+            .percent(),
+            0
+        );
+        assert_eq!(
+            VolumeStatus {
+                level: 0.245,
+                muted: false
+            }
+            .percent(),
+            25
+        );
+        assert_eq!(
+            VolumeStatus {
+                level: 1.0,
+                muted: false
+            }
+            .percent(),
+            100
+        );
         // Endpoints have been observed reporting slightly out-of-range scalars.
-        assert_eq!(VolumeStatus { level: 1.4, muted: false }.percent(), 100);
-        assert_eq!(VolumeStatus { level: -0.2, muted: false }.percent(), 0);
+        assert_eq!(
+            VolumeStatus {
+                level: 1.4,
+                muted: false
+            }
+            .percent(),
+            100
+        );
+        assert_eq!(
+            VolumeStatus {
+                level: -0.2,
+                muted: false
+            }
+            .percent(),
+            0
+        );
     }
 
     #[test]
