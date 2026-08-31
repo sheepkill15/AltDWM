@@ -2,6 +2,7 @@ mod apps;
 mod command_center;
 mod config;
 mod desktop;
+mod elevation;
 mod focus;
 mod input;
 mod layout;
@@ -1062,6 +1063,14 @@ fn install_crash_safety() {
 }
 
 fn main() {
+    match elevation::relaunch_installed_if_needed() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("[elevation] {error}");
+            return;
+        }
+    }
     let _ = MAIN_TID.set(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
     install_crash_safety();
     print_banner();

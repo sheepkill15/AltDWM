@@ -64,10 +64,10 @@ cargo build --release  # -> target\release\alt-dwm.exe
 taskkill /f /im explorer.exe
 # AltDWM keeps tiling (dwm.exe alive) -> explorer.exe to restore
 
-# install as shell (admin):
-.\install.ps1                 # HKLM, copies to C:\Program Files\AltDWM
-.\install.ps1 -PerUser        # HKCU, no admin
-.\uninstall.ps1; .\uninstall.ps1 -PerUser  # restore the previously configured shell
+# install as the current account's elevated shell (admin):
+.\install.ps1                 # HKCU shell, protected files in C:\Program Files\AltDWM
+.\install.ps1 -PerUser        # compatibility alias for the same account scope
+.\uninstall.ps1               # restore the previously configured shell
 ```
 
 ## Extensibility DSL
@@ -160,7 +160,7 @@ Panels re-place themselves on `WM_DPICHANGED` and `WM_DISPLAYCHANGE`.
 - `AltDHook.dll` (`WH_CBT`) for literal pre-show `HCBT_CREATEWND` placement and elevated windows
 - `IVirtualDesktopManager` + `IVirtualDesktopManagerInternal` workspaces
 - Explorer-free shell replacement (design notes in `docs/EXTENSIBILITY.md`). The notification area is now hosted natively; what remains is running without `explorer.exe` at all.
-- `uiAccess` manifest + signing
+- signed `uiAccess` mode as a lower-integrity alternative to the elevated installed build
 - richer settings surfaces and a native notification-area host
 
 ## Build

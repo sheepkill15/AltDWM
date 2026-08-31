@@ -21,22 +21,30 @@ function Get-OptionalRegistryValue {
     return $property.Value
 }
 
-if (-not $PerUser) {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "Per-machine installation requires an elevated PowerShell. Use -PerUser for an admin-free install."
-    }
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "AltDWM's installed shell runs elevated. Re-run this installer from an Administrator PowerShell."
 }
 
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
-    $InstallDir = if ($PerUser) {
-        Join-Path $env:LOCALAPPDATA "Programs\AltDWM"
-    } else {
-        "C:\Program Files\AltDWM"
-    }
+    $InstallDir = Join-Path $env:ProgramFiles "AltDWM"
 }
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
+$secureRoots = @(
+    [IO.Path]::GetFullPath($env:ProgramFiles)
+) | Select-Object -Unique
+$isSecureInstallDir = $false
+foreach ($root in $secureRoots) {
+    $rootPrefix = $root.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if ($InstallDir.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        $isSecureInstallDir = $true
+        break
+    }
+}
+if (-not $isSecureInstallDir) {
+    throw "The elevated shell must be installed below Program Files so normal processes cannot replace it: $InstallDir"
+}
 
 Write-Host "== AltDWM Installer ==" -ForegroundColor Cyan
 Write-Host "InstallDir: $InstallDir  PerUser: $PerUser  NoBuild: $NoBuild"
@@ -66,7 +74,7 @@ $destExe = Join-Path $InstallDir "alt-dwm.exe"
 Write-Host "Installed: $destExe"
 
 Write-Host "`n[3/4] Writing default config..." -ForegroundColor Yellow
-$configDir = if ($PerUser) { Join-Path $env:APPDATA "AltDWM" } else { $InstallDir }
+$configDir = $InstallDir
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 $configPath = Join-Path $configDir "config.toml"
 if (-not (Test-Path -LiteralPath $configPath)) {
@@ -78,12 +86,8 @@ if (-not (Test-Path -LiteralPath $configPath)) {
 }
 
 Write-Host "`n[4/4] Registering as shell..." -ForegroundColor Yellow
-$winlogonPath = if ($PerUser) {
-    "HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-} else {
-    "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-}
-$statePath = if ($PerUser) { "HKCU:\SOFTWARE\AltDWM" } else { "HKLM:\SOFTWARE\AltDWM" }
+$winlogonPath = "HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+$statePath = "HKCU:\SOFTWARE\AltDWM"
 if (-not (Test-Path -LiteralPath $winlogonPath)) {
     New-Item -Path $winlogonPath | Out-Null
 }
@@ -91,10 +95,28 @@ if (-not (Test-Path -LiteralPath $statePath)) {
     New-Item -Path $statePath | Out-Null
 }
 
+$taskPath = "\"
+$taskName = "AltDWM-Shell-$($identity.User.Value)"
+$taskFullName = "$taskPath$taskName"
+$taskArguments = '--config "' + $configPath + '"'
+$taskAction = New-ScheduledTaskAction -Execute $destExe -Argument $taskArguments -WorkingDirectory $InstallDir
+$taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.User.Value -LogonType Interactive -RunLevel Highest
+$taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Action $taskAction -Principal $taskPrincipal -Settings $taskSettings -Description "Elevated AltDWM replacement shell for $($identity.Name)" -Force | Out-Null
+$registeredTask = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName
+if ($registeredTask.Principal.RunLevel -ne "Highest") {
+    throw "Scheduled task $taskFullName was not registered with Highest run level."
+}
+
+$schedulerExe = Join-Path $env:SystemRoot "System32\schtasks.exe"
+$shellCommand = '"' + $schedulerExe + '" /Run /TN "' + $taskFullName + '"'
+$legacyShellCommand = '"' + $destExe + '"'
 $currentShell = Get-OptionalRegistryValue -Path $winlogonPath -Name Shell
-$normalizedCurrent = if ($null -eq $currentShell) { "" } else { $currentShell.Trim().Trim('"') }
+$normalizedCurrent = if ($null -eq $currentShell) { "" } else { $currentShell.Trim() }
 $existingBackup = Get-OptionalRegistryValue -Path $statePath -Name PreviousShellPresent
-if (-not $normalizedCurrent.Equals($destExe, [StringComparison]::OrdinalIgnoreCase) -and $null -eq $existingBackup) {
+if (-not $normalizedCurrent.Equals($shellCommand, [StringComparison]::OrdinalIgnoreCase) -and
+    -not $normalizedCurrent.Equals($legacyShellCommand, [StringComparison]::OrdinalIgnoreCase) -and
+    $null -eq $existingBackup) {
     $hadPreviousShell = $null -ne $currentShell
     New-ItemProperty -Path $statePath -Name PreviousShellPresent -PropertyType DWord -Value ([int]$hadPreviousShell) -Force | Out-Null
     if ($hadPreviousShell) {
@@ -104,12 +126,15 @@ if (-not $normalizedCurrent.Equals($destExe, [StringComparison]::OrdinalIgnoreCa
     }
 }
 
-$shellCommand = '"' + $destExe + '"'
+New-ItemProperty -Path $statePath -Name ScheduledTaskPath -PropertyType String -Value $taskPath -Force | Out-Null
+New-ItemProperty -Path $statePath -Name ScheduledTaskName -PropertyType String -Value $taskName -Force | Out-Null
+New-ItemProperty -Path $statePath -Name InstalledShell -PropertyType String -Value $shellCommand -Force | Out-Null
 Set-ItemProperty -Path $winlogonPath -Name Shell -Value $shellCommand
 Write-Host "Set Shell = $shellCommand"
+Write-Host "Registered $taskFullName with Highest run level."
 Write-Host "The previous shell value was saved under $statePath."
 
 Write-Host "`nDone. Log off/on to use AltDWM." -ForegroundColor Green
-$uninstallHint = if ($PerUser) { ".\uninstall.ps1 -PerUser" } else { ".\uninstall.ps1" }
-Write-Host "Run $uninstallHint to restore the previous shell."
-Write-Host "For uiAccess, sign the executable, enable uiAccess in alt-dwm.manifest, and install to a trusted location."
+Write-Host "Run .\uninstall.ps1 to restore the previous shell for this account."
+Write-Host "The installed shell starts through Task Scheduler with administrator privileges."
+Write-Host "Windows will still prevent control of protected/system processes."

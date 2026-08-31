@@ -19,12 +19,9 @@
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
     </windowsSettings>
   </application>
-  <!-- Requested execution level: asInvoker normally, uiAccess false for dev.
-       For real shell replacement with elevated window control:
-       1. Set uiAccess="true"
-       2. Sign exe with trusted cert
-       3. Install to C:\Program Files\AltDWM\ or C:\Windows\System32\
-       Then rebuild. -->
+  <!-- Keep the binary asInvoker. The installer uses Task Scheduler's Highest
+       run level because Winlogon cannot service a UAC elevation request while
+       directly creating a replacement-shell process. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges>

@@ -22,29 +22,29 @@ explorer.exe   # restore
 ## Install as shell
 
 ```powershell
-# per-machine (requires admin, logoff):
+# install securely and register for the current account (requires admin, logoff):
 .\install.ps1
-# per-user (no admin; defaults to %LOCALAPPDATA%\Programs\AltDWM):
+# compatibility alias; shell registration is always scoped to the current account:
 .\install.ps1 -PerUser
-# custom dir / skip build:
-.\install.ps1 -InstallDir C:\AltDWM -NoBuild
+# secure custom dir / skip build:
+.\install.ps1 -InstallDir "C:\Program Files\AltDWM-Test" -NoBuild
 
 # check
 .\target\release\alt-dwm.exe --config "C:\Program Files\AltDWM\config.toml" --check-config
 
 # uninstall
 .\uninstall.ps1
-.\uninstall.ps1 -PerUser
+.\uninstall.ps1 -PerUser # compatibility alias
 ```
 
 ### What install.ps1 does
 
 1. `cargo build --release` → `target\release\alt-dwm.exe`
-2. Copies `alt-dwm.exe` + `scripts/` + `config.example.toml` to `C:\Program Files\AltDWM\` (machine) or `%LOCALAPPDATA%\Programs\AltDWM\` (per-user)
-3. Generates `%APPDATA%\AltDWM\config.toml` (or `$InstallDir\config.toml` if per-machine) via `--generate-config` if missing
-4. Saves the existing shell value under `HKLM/HKCU\SOFTWARE\AltDWM`, then sets the corresponding Winlogon `Shell` value to AltDWM
+2. Copies `alt-dwm.exe` + `scripts/` + `config.example.toml` to `C:\Program Files\AltDWM\`
+3. Generates `$InstallDir\config.toml` via `--generate-config` if missing
+4. Registers a current-user Task Scheduler action at `Highest` run level, saves the existing shell value under `HKCU\SOFTWARE\AltDWM`, then sets the current account's HKCU Winlogon shell to invoke that task
 
-`uninstall.ps1` restores the exact saved value and only changes the registry when the current shell exactly matches its AltDWM installation path. Manual Explorer fallback:
+`uninstall.ps1` removes the scheduled task, restores the exact saved value, and only changes the registry when the current shell exactly matches its AltDWM installation command. Manual Explorer fallback:
 
 ```powershell
 Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name Shell -Value "explorer.exe"
@@ -52,15 +52,35 @@ Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlo
 logoff
 ```
 
-## uiAccess (move elevated windows like Task Manager)
+## Administrator access and elevated windows
 
-1. Edit `alt-dwm.manifest`: `requestedExecutionLevel uiAccess="true"`
-2. Sign `alt-dwm.exe` with trusted cert (self-signed + import to Trusted Root, or EV)
-3. Install to secure location: `C:\Program Files\AltDWM\` or `C:\Windows\System32\`
-4. Rebuild: `cargo build --release` (manifest embedded via `build.rs` `/MANIFEST:EMBED`)
-5. Run `install.ps1` again
+The executable remains `asInvoker` because Winlogon cannot service a UAC prompt
+while directly creating a replacement-shell process. Instead, `install.ps1`
+registers an on-demand Task Scheduler entry for the current user with `Highest`
+run level, then points Winlogon at `schtasks.exe /Run` for that entry. AltDWM
+therefore starts with the user's elevated administrator token without risking a
+login-time `ERROR_ELEVATION_REQUIRED` failure.
 
-Without `uiAccess`, `SetWindowPos` on elevated windows fails (`ERROR_ACCESS_DENIED`) — tiling will skip them.
+If the Program Files copy is launched manually, its runtime guard uses the UAC
+`runas` path to restart elevated. It exits instead of silently continuing with
+insufficient rights when elevation is declined. Builds outside Program Files do
+not use that guard.
+
+The installer rejects user-writable destinations and keeps the executable,
+scripts, and Rhai configuration under Program Files. This is required because a
+normal process that could replace any of those files could otherwise use the
+scheduled task to gain administrator privileges. `-PerUser` is retained as a
+compatibility alias because shell registration is now always per-account. A
+machine-wide HKLM shell cannot safely target one user's elevated task and could
+leave other accounts with a blank desktop.
+
+Windows still blocks manipulation of protected processes and windows running as
+`SYSTEM`. Applications launched directly by an elevated shell can inherit its
+administrator token; this is the security and compatibility tradeoff of making
+the shell itself elevated.
+
+`uiAccess` remains a future alternative that would require code signing and a
+trusted installation directory. It is not enabled by this installer.
 
 ## DPI
 

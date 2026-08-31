@@ -19,52 +19,53 @@ function Get-OptionalRegistryValue {
     return $property.Value
 }
 
-if (-not $PerUser) {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "Per-machine uninstall requires an elevated PowerShell. Use -PerUser for a per-user install."
-    }
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "AltDWM's elevated scheduled shell must be removed from an Administrator PowerShell."
 }
 
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
-    $InstallDir = if ($PerUser) {
-        Join-Path $env:LOCALAPPDATA "Programs\AltDWM"
-    } else {
-        "C:\Program Files\AltDWM"
-    }
+    $InstallDir = Join-Path $env:ProgramFiles "AltDWM"
 }
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
 
 Write-Host "== AltDWM Uninstaller ==" -ForegroundColor Cyan
 
-$winlogonPath = if ($PerUser) {
-    "HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-} else {
-    "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-}
-$statePath = if ($PerUser) { "HKCU:\SOFTWARE\AltDWM" } else { "HKLM:\SOFTWARE\AltDWM" }
+$winlogonPath = "HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+$statePath = "HKCU:\SOFTWARE\AltDWM"
 $destExe = Join-Path $InstallDir "alt-dwm.exe"
+$legacyShellCommand = '"' + $destExe + '"'
+$taskPath = Get-OptionalRegistryValue -Path $statePath -Name ScheduledTaskPath
+$taskName = Get-OptionalRegistryValue -Path $statePath -Name ScheduledTaskName
+$installedShell = Get-OptionalRegistryValue -Path $statePath -Name InstalledShell
+if ([string]::IsNullOrWhiteSpace($taskPath)) { $taskPath = "\" }
+if ([string]::IsNullOrWhiteSpace($taskName)) { $taskName = "AltDWM-Shell-$($identity.User.Value)" }
 $currentShell = Get-OptionalRegistryValue -Path $winlogonPath -Name Shell
-$normalizedCurrent = if ($null -eq $currentShell) { "" } else { $currentShell.Trim().Trim('"') }
+$normalizedCurrent = if ($null -eq $currentShell) { "" } else { $currentShell.Trim() }
+$ownsCurrentShell = $normalizedCurrent.Equals($legacyShellCommand, [StringComparison]::OrdinalIgnoreCase) -or
+    (-not [string]::IsNullOrWhiteSpace($installedShell) -and $normalizedCurrent.Equals($installedShell.Trim(), [StringComparison]::OrdinalIgnoreCase))
 
 Write-Host "Current Shell: $currentShell"
-if ($normalizedCurrent.Equals($destExe, [StringComparison]::OrdinalIgnoreCase)) {
+if ($ownsCurrentShell) {
     $previousPresent = Get-OptionalRegistryValue -Path $statePath -Name PreviousShellPresent
     $previousShell = Get-OptionalRegistryValue -Path $statePath -Name PreviousShell
     if ($previousPresent -eq 1 -and -not [string]::IsNullOrWhiteSpace($previousShell)) {
         Set-ItemProperty -Path $winlogonPath -Name Shell -Value $previousShell
         Write-Host "Restored previous Shell = $previousShell"
-    } elseif ($PerUser) {
+    } else {
         Remove-ItemProperty -Path $winlogonPath -Name Shell -ErrorAction SilentlyContinue
         Write-Host "Removed the per-user Shell override."
-    } else {
-        Set-ItemProperty -Path $winlogonPath -Name Shell -Value "explorer.exe"
-        Write-Host "No backup was available; restored Shell = explorer.exe"
     }
     Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
 } else {
-    Write-Warning "Shell does not exactly match $destExe; registry state was left unchanged."
+    Write-Warning "Shell does not exactly match this AltDWM installation; registry state was left unchanged."
+}
+
+$scheduledTask = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue
+if ($null -ne $scheduledTask) {
+    Unregister-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Confirm:$false
+    Write-Host "Removed scheduled task $taskPath$taskName"
 }
 
 if (Test-Path -LiteralPath $InstallDir) {
