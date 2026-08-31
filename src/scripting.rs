@@ -273,6 +273,37 @@ fn looks_like_call(action: &str) -> bool {
     action.ends_with(')') && action.contains('(')
 }
 
+fn monitor_workspace_action(action: &str) -> Option<(Option<usize>, isize)> {
+    let action = action.trim();
+    if matches!(action, "next_workspace" | "next_workspace()") {
+        return Some((None, 1));
+    }
+    if matches!(action, "prev_workspace" | "prev_workspace()") {
+        return Some((None, -1));
+    }
+    let index = action
+        .strip_prefix("workspace(")?
+        .strip_suffix(')')?
+        .trim()
+        .parse::<usize>()
+        .ok()?;
+    Some((Some(index.saturating_sub(1)), 0))
+}
+
+/// Dispatch an action originating from a panel on `monitor`. Workspace actions
+/// are monitor-local; every other action keeps the ordinary global/focused
+/// semantics.
+pub fn dispatch_action_on_monitor(action: &str, monitor: isize) {
+    if let Some((workspace, delta)) = monitor_workspace_action(action) {
+        match workspace {
+            Some(index) => crate::workspace::switch_to_monitor(monitor, index),
+            None => crate::workspace::cycle_on_monitor(monitor, delta),
+        }
+        return;
+    }
+    dispatch_action(action);
+}
+
 pub fn dispatch_action(action: &str) {
     let act = action.trim();
     if act.starts_with("rhai:") {
@@ -361,6 +392,18 @@ pub fn dispatch_action(action: &str) {
 #[cfg(test)]
 mod tests {
     use super::engine;
+
+    #[test]
+    fn panel_workspace_actions_keep_their_monitor_context() {
+        use super::monitor_workspace_action;
+        assert_eq!(monitor_workspace_action("workspace(3)"), Some((Some(2), 0)));
+        assert_eq!(monitor_workspace_action("next_workspace"), Some((None, 1)));
+        assert_eq!(
+            monitor_workspace_action("prev_workspace()"),
+            Some((None, -1))
+        );
+        assert_eq!(monitor_workspace_action("toggle_tiling"), None);
+    }
 
     #[test]
     fn call_shaped_actions_go_to_the_script_engine() {

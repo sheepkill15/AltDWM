@@ -1,4 +1,5 @@
 [general]
+desktop = true # wallpaper, Desktop-folder icons, and right-click menus
 gap = 8
 outer_gap = 0
 layout = "MasterStack"

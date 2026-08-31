@@ -434,6 +434,17 @@ recycled handle can never cause an unrelated window to be shown.
 | `move_to_workspace(n)` / `send_to_workspace(n)` | Send the focused window there, staying or following |
 | `next_workspace` / `prev_workspace` | Step through workspaces |
 
+Workspace numbers are local to each physical monitor. Panel clicks and wheel
+actions target the monitor containing that panel; a switch applies visibility
+and layout only there, leaving every window and panel on other displays
+untouched. A window explicitly moved to another monitor joins that monitor's
+currently active workspace.
+
+Borderless or popup windows that cover an entire monitor are treated as
+application-owned fullscreen surfaces. AltDWM does not resize, round, or contain
+them, and hides panels only on the fullscreen application's monitor until it
+leaves fullscreen or loses foreground focus.
+
 Directional focus is geometric: a candidate qualifies only if it is on that side
 *and* its extent across the axis of travel overlaps the origin's. The overlap
 requirement is what stops Up from a full-height master window jumping sideways

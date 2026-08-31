@@ -95,6 +95,10 @@ pub fn move_focused_to_monitor(dir: &str) {
                 let x = work.left + (work.right - work.left - w) / 2;
                 let y = work.top + (work.bottom - work.top - h) / 2;
                 let _ = SetWindowPos(hwnd, Some(HWND_TOP), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                // Workspace numbers are local to a monitor. Moving a window to
+                // another display adopts that display's active workspace rather
+                // than carrying a same-numbered but unrelated workspace across.
+                crate::workspace::adopt_active_workspace(hwnd, target.0 as isize);
                 // also set foreground
                 set_foreground(hwnd);
                 crate::request_retile();

@@ -8,8 +8,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetCursorPos, GetWindow,
     GetWindowLongPtrW, GetWindowRect, IsWindow, IsZoomed, SendMessageTimeoutW, SetWindowPos,
     ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_TOP, MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, WM_GETMINMAXINFO, WS_EX_DLGMODALFRAME,
-    WS_EX_TOOLWINDOW,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, WM_GETMINMAXINFO, WS_CAPTION, WS_EX_DLGMODALFRAME,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::layout::{compute_layout, Layout};
@@ -97,11 +97,61 @@ pub fn window_snapshot() -> Vec<HWND> {
     windows
 }
 
-fn clear_auto_floating() {
-    AUTO_FLOATING
+fn commit_auto_floating(keys: HashSet<isize>, only_monitor: Option<isize>) {
+    let mut current = AUTO_FLOATING
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clear();
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(monitor) = only_monitor {
+        current.retain(|key| {
+            let hwnd = HWND(*key as *mut std::ffi::c_void);
+            unsafe {
+                IsWindow(Some(hwnd)).as_bool()
+                    && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST).0 as isize != monitor
+            }
+        });
+        current.extend(keys);
+    } else {
+        *current = keys;
+    }
+}
+
+fn rect_covers_monitor(window: RECT, monitor: RECT, tolerance: i32) -> bool {
+    window.left <= monitor.left + tolerance
+        && window.top <= monitor.top + tolerance
+        && window.right >= monitor.right - tolerance
+        && window.bottom >= monitor.bottom - tolerance
+}
+
+fn style_can_be_fullscreen(style: u32) -> bool {
+    (style & WS_POPUP.0) != 0 || (style & WS_CAPTION.0) == 0
+}
+
+/// A borderless/popup window covering its complete physical monitor is owned by
+/// the application, not by the tiler. This includes DirectX exclusive mode and
+/// ordinary borderless fullscreen, while excluding a normal maximized window
+/// whose caption/thick frame remain present.
+pub fn is_exclusive_fullscreen(hwnd: HWND) -> bool {
+    unsafe {
+        if hwnd.0.is_null() || windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool() {
+            return false;
+        }
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut _).as_bool() {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() || !rect_covers_monitor(rect, info.rcMonitor, 2)
+        {
+            return false;
+        }
+        let style =
+            GetWindowLongPtrW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWL_STYLE) as u32;
+        style_can_be_fullscreen(style)
+    }
 }
 
 pub fn is_auto_floating(hwnd: HWND) -> bool {
@@ -1109,7 +1159,10 @@ pub fn hmonitor_for_target(target: &str) -> Option<HMONITOR> {
 /// Panel geometry is declared in device-independent pixels, so a 40px bar
 /// occupies 60 physical pixels at 150%. Reserving the unscaled value let tiled
 /// windows run underneath the bar on any scaled display.
-fn panel_reserves_for_monitor(hmon: HMONITOR, cfg: &crate::config::Config) -> (i32, i32, i32, i32) {
+pub(crate) fn panel_reserves_for_monitor(
+    hmon: HMONITOR,
+    cfg: &crate::config::Config,
+) -> (i32, i32, i32, i32) {
     let scale = crate::ui::scale_for_monitor(hmon);
     let mut left = 0;
     let mut top = 0;
@@ -1277,6 +1330,26 @@ fn contain_floating_windows(
 
 /// Tile with explicit top/bottom reserves (for panels DSL)
 pub fn tile_windows_reserved(top_reserve: i32, bottom_reserve: i32, layout: Layout, gap: i32) {
+    tile_windows_reserved_impl(top_reserve, bottom_reserve, layout, gap, None);
+}
+
+pub fn tile_windows_reserved_for_monitor(
+    top_reserve: i32,
+    bottom_reserve: i32,
+    layout: Layout,
+    gap: i32,
+    monitor: isize,
+) {
+    tile_windows_reserved_impl(top_reserve, bottom_reserve, layout, gap, Some(monitor));
+}
+
+fn tile_windows_reserved_impl(
+    top_reserve: i32,
+    bottom_reserve: i32,
+    layout: Layout,
+    gap: i32,
+    only_monitor: Option<isize>,
+) {
     // snapshot config once per tick to avoid repeated locking
     let cfg_snapshot = crate::CURRENT_CONFIG
         .lock()
@@ -1291,14 +1364,24 @@ pub fn tile_windows_reserved(top_reserve: i32, bottom_reserve: i32, layout: Layo
     // from an empty workspace means there were zero visible windows before this
     // call; returning at that point stranded every hidden window until some
     // unrelated window opened and caused another layout pass.
-    crate::workspace::apply_visibility(&all_managed_windows());
+    let managed = all_managed_windows();
+    if let Some(monitor) = only_monitor {
+        crate::workspace::apply_visibility_for_monitor(&managed, monitor);
+    } else {
+        crate::workspace::apply_visibility(&managed);
+    }
     invalidate_window_snapshot();
     let all_windows: Vec<HWND> = collect_windows()
         .into_iter()
         .filter(|hwnd| crate::workspace::is_visible(*hwnd))
+        .filter(|hwnd| {
+            only_monitor.is_none_or(|monitor| unsafe {
+                MonitorFromWindow(*hwnd, MONITOR_DEFAULTTONEAREST).0 as isize == monitor
+            })
+        })
         .collect();
     if all_windows.is_empty() {
-        clear_auto_floating();
+        commit_auto_floating(HashSet::new(), only_monitor);
         return;
     }
 
@@ -1319,7 +1402,7 @@ pub fn tile_windows_reserved(top_reserve: i32, bottom_reserve: i32, layout: Layo
         );
     }
     if all_windows.is_empty() {
-        clear_auto_floating();
+        commit_auto_floating(HashSet::new(), only_monitor);
         return;
     }
 
@@ -1339,6 +1422,7 @@ pub fn tile_windows_reserved(top_reserve: i32, bottom_reserve: i32, layout: Layo
         .collect();
     let mut windows = Vec::new();
     let mut floating = Vec::new();
+    let mut fullscreen = Vec::new();
     let mut auto_floating_keys = HashSet::new();
     let process_counts: HashMap<String, usize> = if cfg_snapshot.general.auto_float_utility_windows
     {
@@ -1355,6 +1439,14 @@ pub fn tile_windows_reserved(top_reserve: i32, bottom_reserve: i32, layout: Layo
     };
     for hwnd in all_windows {
         let key = hwnd.0 as isize;
+        if is_exclusive_fullscreen(hwnd) {
+            EXPECTED_RECTS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+            fullscreen.push(hwnd);
+            continue;
+        }
         let manual = crate::focus::is_runtime_floating(hwnd);
         let decision = resolved.get(&key).and_then(|rules| rules.floating);
         let automatic = decision.is_none()
@@ -1408,11 +1500,17 @@ pub fn tile_windows_reserved(top_reserve: i32, bottom_reserve: i32, layout: Layo
             }
         }
     }
-    crate::rules::sync_opacity(&opacity_targets);
+    if only_monitor.is_none() {
+        crate::rules::sync_opacity(&opacity_targets);
+    }
+    if verbose && !fullscreen.is_empty() {
+        println!(
+            "[manager] leaving {} exclusive-fullscreen window(s) application-controlled",
+            fullscreen.len()
+        );
+    }
     if windows.is_empty() {
-        *AUTO_FLOATING
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = auto_floating_keys;
+        commit_auto_floating(auto_floating_keys, only_monitor);
         contain_floating_windows(
             &floating,
             top_reserve,
@@ -1662,9 +1760,7 @@ pub fn tile_windows_reserved(top_reserve: i32, bottom_reserve: i32, layout: Layo
             Err(e) => println!("[manager] EndDeferWindowPos failed: {:?}", e),
         }
     }
-    *AUTO_FLOATING
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = auto_floating_keys;
+    commit_auto_floating(auto_floating_keys, only_monitor);
     contain_floating_windows(
         &floating,
         top_reserve,
@@ -1678,13 +1774,47 @@ pub fn tile_windows_reserved(top_reserve: i32, bottom_reserve: i32, layout: Layo
 mod tests {
     use super::{
         adjust_rects_for_resize, assign_slots, compact_secondary_rect, contained_floating_rect,
-        panel_reserves_for_monitor, promote_in_order, reconcile_window_order,
-        rect_violates_constraints, rects_are_close, shift_within_order, swap_window_order,
-        WindowConstraints,
+        panel_reserves_for_monitor, promote_in_order, reconcile_window_order, rect_covers_monitor,
+        rect_violates_constraints, rects_are_close, shift_within_order, style_can_be_fullscreen,
+        swap_window_order, WindowConstraints,
     };
     use crate::config::{Config, PanelConfig};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::HMONITOR;
+    use windows::Win32::UI::WindowsAndMessaging::{WS_OVERLAPPEDWINDOW, WS_POPUP};
+
+    #[test]
+    fn fullscreen_requires_monitor_coverage_and_borderless_chrome() {
+        let monitor = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        };
+        assert!(rect_covers_monitor(monitor, monitor, 2));
+        assert!(rect_covers_monitor(
+            RECT {
+                left: -1921,
+                top: -1,
+                right: 1,
+                bottom: 1081,
+            },
+            monitor,
+            2
+        ));
+        assert!(!rect_covers_monitor(
+            RECT {
+                left: -1920,
+                top: 40,
+                right: 0,
+                bottom: 1080,
+            },
+            monitor,
+            2
+        ));
+        assert!(style_can_be_fullscreen(WS_POPUP.0));
+        assert!(!style_can_be_fullscreen(WS_OVERLAPPEDWINDOW.0));
+    }
 
     #[test]
     fn minimum_size_violation_is_detected_before_placement() {

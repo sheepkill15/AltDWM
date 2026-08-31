@@ -449,7 +449,7 @@ impl Widget for ScriptWidget {
         if let Some(action) = self.action_at(point, rect, ctx.scale, field) {
             let _ = self
                 .handle_action(action, rect, ctx)
-                .map(|a| crate::scripting::dispatch_action(&a));
+                .map(|a| crate::scripting::dispatch_action_on_monitor(&a, ctx.monitor_key));
             true
         } else {
             false

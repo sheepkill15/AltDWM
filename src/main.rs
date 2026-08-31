@@ -1,6 +1,7 @@
 mod apps;
 mod command_center;
 mod config;
+mod desktop;
 mod focus;
 mod input;
 mod layout;
@@ -83,6 +84,26 @@ pub fn retile_now() {
     if TILING_ENABLED.load(Ordering::SeqCst) {
         tile_current_layout_now();
     }
+}
+
+/// Re-tile only one physical display. Workspace switching must not reposition,
+/// hide, show, or restyle windows belonging to any other monitor.
+pub fn retile_monitor_now(monitor: isize) {
+    if !TILING_ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    let cfg = CURRENT_CONFIG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let (top_reserve, bottom_reserve) = bar_reserves(&cfg);
+    manager::tile_windows_reserved_for_monitor(
+        top_reserve,
+        bottom_reserve,
+        cfg.layout_enum(),
+        cfg.general.gap,
+        monitor,
+    );
 }
 pub fn request_quit() {
     let v = HOST_HWND.load(Ordering::SeqCst);
@@ -468,6 +489,12 @@ unsafe extern "system" fn win_event_proc(
         manager::invalidate_window_snapshot();
         panel::invalidate_all();
     }
+    if matches!(
+        event,
+        EVENT_SYSTEM_FOREGROUND | EVENT_OBJECT_SHOW | EVENT_OBJECT_LOCATIONCHANGE
+    ) {
+        panel::sync_fullscreen(windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow());
+    }
     if event == EVENT_SYSTEM_FOREGROUND {
         // Remembered so workspace switching still targets the display the user
         // was working on after its focused window has been hidden.
@@ -550,6 +577,7 @@ unsafe extern "system" fn host_wndproc(
             manager::clear_layout_overrides();
             manager::invalidate_window_snapshot();
             panel::reposition_all();
+            desktop::reposition();
             request_retile();
             LRESULT(0)
         }
@@ -917,6 +945,7 @@ fn apply_config_reload(
     *CURRENT_GAP.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.general.gap;
     *CURRENT_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.layout_enum();
     *CURRENT_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
+    desktop::configure(new_cfg.general.desktop);
     // A reload can shrink the workspace count; windows left beyond it would be
     // hidden with no way to reach them.
     workspace::clamp_to_count();
@@ -1152,6 +1181,10 @@ fn main() {
         }
     };
 
+    if let Err(error) = desktop::start(cfg.general.desktop) {
+        eprintln!("[desktop] {error} — continuing without a desktop surface");
+    }
+
     // Order matters. The host window has to exist before Explorer's taskbar is
     // pushed out of the way, and the broadcast that makes applications
     // re-publish their icons has to come after — otherwise they resolve
@@ -1329,6 +1362,7 @@ fn main() {
         panel::destroy_panels();
         command_center::close();
         quick_settings::close();
+        desktop::shutdown();
         release_borrowed_system_state();
         let _ = host_hwnd;
         let _ = panel_handles;

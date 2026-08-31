@@ -134,6 +134,16 @@ pub fn workspace_of(hwnd: HWND) -> usize {
     index
 }
 
+/// Assign a window to the currently visible workspace of its new monitor.
+/// Called after an explicit cross-monitor move so local workspace numbering
+/// never makes the moved window disappear on its destination display.
+pub fn adopt_active_workspace(hwnd: HWND, monitor: isize) {
+    ASSIGNMENT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(hwnd.0 as isize, active_for_monitor(monitor));
+}
+
 /// True when the window's workspace is the visible one on its monitor.
 pub fn is_visible(hwnd: HWND) -> bool {
     if !is_enabled() {
@@ -146,6 +156,7 @@ pub fn is_visible(hwnd: HWND) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub key: isize,
+    pub monitor: isize,
     pub visible_now: bool,
     pub should_be_visible: bool,
     /// True when AltDWM is the one that hid it.
@@ -172,6 +183,18 @@ pub fn visibility_plan(candidates: &[Candidate]) -> (Vec<isize>, Vec<isize>) {
     (to_hide, to_show)
 }
 
+fn visibility_plan_for_monitor(
+    candidates: &[Candidate],
+    monitor: isize,
+) -> (Vec<isize>, Vec<isize>) {
+    let local: Vec<Candidate> = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.monitor == monitor)
+        .collect();
+    visibility_plan(&local)
+}
+
 /// Hide or show each window to match its workspace.
 ///
 /// `windows` is the currently *visible* managed set, which the caller has
@@ -179,7 +202,7 @@ pub fn visibility_plan(candidates: &[Candidate]) -> (Vec<isize>, Vec<isize>) {
 /// is not manageable and cannot appear in that list — the windows this function
 /// has to bring back are precisely the ones the caller cannot see. They are
 /// added here from `HIDDEN` rather than expected from the caller.
-pub fn apply_visibility(windows: &[HWND]) {
+fn apply_visibility_on(windows: &[HWND], only_monitor: Option<isize>) {
     if !is_enabled() {
         return;
     }
@@ -190,12 +213,16 @@ pub fn apply_visibility(windows: &[HWND]) {
     let mut candidates: Vec<Candidate> = Vec::with_capacity(windows.len() + hidden_keys.len());
     let mut seen: HashSet<isize> = HashSet::new();
     for hwnd in windows {
+        if only_monitor.is_some_and(|monitor| monitor_of(*hwnd) != monitor) {
+            continue;
+        }
         let key = hwnd.0 as isize;
         if !seen.insert(key) {
             continue;
         }
         candidates.push(Candidate {
             key,
+            monitor: monitor_of(*hwnd),
             visible_now: unsafe { IsWindowVisible(*hwnd).as_bool() },
             should_be_visible: is_visible(*hwnd),
             hidden_by_us: hidden_keys.contains(&key),
@@ -209,15 +236,22 @@ pub fn apply_visibility(windows: &[HWND]) {
         if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
             continue;
         }
+        if only_monitor.is_some_and(|monitor| monitor_of(hwnd) != monitor) {
+            continue;
+        }
         candidates.push(Candidate {
             key: *key,
+            monitor: monitor_of(hwnd),
             visible_now: unsafe { IsWindowVisible(hwnd).as_bool() },
             should_be_visible: is_visible(hwnd),
             hidden_by_us: true,
         });
     }
 
-    let (to_hide, to_show) = visibility_plan(&candidates);
+    let (to_hide, to_show) = match only_monitor {
+        Some(monitor) => visibility_plan_for_monitor(&candidates, monitor),
+        None => visibility_plan(&candidates),
+    };
     if to_hide.is_empty() && to_show.is_empty() {
         return;
     }
@@ -242,6 +276,16 @@ pub fn apply_visibility(windows: &[HWND]) {
     }
     // Deliberately not cleared here: the events these calls produced have not
     // been delivered yet.
+}
+
+pub fn apply_visibility(windows: &[HWND]) {
+    apply_visibility_on(windows, None);
+}
+
+/// Apply workspace visibility to exactly one display. A workspace switch uses
+/// this path so it never sends ShowWindow to an application on another monitor.
+pub fn apply_visibility_for_monitor(windows: &[HWND], monitor: isize) {
+    apply_visibility_on(windows, Some(monitor));
 }
 
 /// Where the hidden set is journalled.
@@ -458,13 +502,12 @@ fn focused_monitor() -> isize {
 }
 
 /// Show workspace `index` on the monitor the user is working on.
-pub fn switch_to(index: usize) {
+pub fn switch_to_monitor(monitor: isize, index: usize) {
     if !is_enabled() {
         eprintln!("[workspace] switching needs general.workspaces > 1");
         return;
     }
     let index = index.min(count() - 1);
-    let monitor = focused_monitor();
     let previous = active_for_monitor(monitor);
     if previous == index {
         return;
@@ -484,10 +527,15 @@ pub fn switch_to(index: usize) {
     crate::manager::invalidate_window_snapshot();
     // Synchronous, so visibility is applied before anything is focused — and so
     // the switch does not visibly lag behind the key press.
-    crate::retile_now();
+    crate::retile_monitor_now(monitor);
     crate::manager::invalidate_window_snapshot();
     focus_something_on(monitor);
     crate::panel::invalidate_all();
+}
+
+/// Show workspace `index` on the display containing the focused window.
+pub fn switch_to(index: usize) {
+    switch_to_monitor(focused_monitor(), index);
 }
 
 /// Give focus to a window on `monitor` after a switch.
@@ -514,10 +562,18 @@ pub fn cycle(delta: isize) {
     if !is_enabled() {
         return;
     }
+    cycle_on_monitor(focused_monitor(), delta);
+}
+
+/// Step workspaces on an explicit display. Panel widgets use this rather than
+/// borrowing focus from an unrelated monitor.
+pub fn cycle_on_monitor(monitor: isize, delta: isize) {
+    if !is_enabled() {
+        return;
+    }
     let total = count() as isize;
-    let monitor = focused_monitor();
     let current = active_for_monitor(monitor) as isize;
-    switch_to(((current + delta).rem_euclid(total)) as usize);
+    switch_to_monitor(monitor, ((current + delta).rem_euclid(total)) as usize);
 }
 
 /// Send the focused window to workspace `index` and follow it or not.
@@ -537,7 +593,7 @@ pub fn move_focused_to(index: usize, follow: bool) {
         .insert(hwnd.0 as isize, index);
     println!("[workspace] moved {:?} to workspace {}", hwnd.0, index + 1);
     if follow {
-        switch_to(index);
+        switch_to_monitor(monitor_of(hwnd), index);
     } else {
         crate::manager::invalidate_window_snapshot();
         crate::request_retile();
@@ -617,7 +673,10 @@ pub fn clamp_to_count() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_journal_line, visibility_plan, Candidate, WorkspaceInfo, MAX_WORKSPACES};
+    use super::{
+        parse_journal_line, visibility_plan, visibility_plan_for_monitor, Candidate, WorkspaceInfo,
+        MAX_WORKSPACES,
+    };
 
     #[test]
     fn journal_lines_round_trip_handle_and_process() {
@@ -643,6 +702,7 @@ mod tests {
     fn candidate(key: isize, visible_now: bool, should: bool, ours: bool) -> Candidate {
         Candidate {
             key,
+            monitor: 1,
             visible_now,
             should_be_visible: should,
             hidden_by_us: ours,
@@ -697,6 +757,19 @@ mod tests {
         ]);
         assert_eq!(hide, vec![10, 11]);
         assert_eq!(show, vec![20]);
+    }
+
+    #[test]
+    fn a_monitor_switch_never_touches_another_monitors_windows() {
+        let mut local_hide = candidate(10, true, false, false);
+        local_hide.monitor = 1;
+        let mut remote_hide = candidate(20, true, false, false);
+        remote_hide.monitor = 2;
+        let mut remote_show = candidate(21, false, true, true);
+        remote_show.monitor = 2;
+        let (hide, show) = visibility_plan_for_monitor(&[local_hide, remote_hide, remote_show], 1);
+        assert_eq!(hide, vec![10]);
+        assert!(show.is_empty());
     }
 
     #[test]

@@ -976,13 +976,14 @@ impl Widget for WorkspacesWidget {
     fn on_click(&self, point: (i32, i32), rect: RECT, ctx: &PanelCtx) -> Option<String> {
         for (index, pill) in self.pills(rect, ctx) {
             if point_in_rect(point.0, point.1, &pill) {
-                return Some(format!("workspace({})", index + 1));
+                crate::workspace::switch_to_monitor(ctx.monitor_key, index);
+                return None;
             }
         }
         None
     }
-    fn on_scroll(&self, delta: i32, _point: (i32, i32), _rect: RECT, _ctx: &PanelCtx) -> bool {
-        crate::workspace::cycle(if delta > 0 { -1 } else { 1 });
+    fn on_scroll(&self, delta: i32, _point: (i32, i32), _rect: RECT, ctx: &PanelCtx) -> bool {
+        crate::workspace::cycle_on_monitor(ctx.monitor_key, if delta > 0 { -1 } else { 1 });
         true
     }
 }

@@ -34,6 +34,11 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct General {
+    /// Provide wallpaper, Desktop-folder icons, and desktop context menus.
+    /// The surface stays at the bottom of the Z order, underneath Explorer's
+    /// own desktop when AltDWM is being tested without replacing the shell.
+    #[serde(default = "default_true")]
+    pub desktop: bool,
     #[serde(default = "default_gap")]
     pub gap: i32,
     #[serde(default = "default_layout")]
@@ -256,6 +261,7 @@ fn default_monitor() -> String {
 impl Default for General {
     fn default() -> Self {
         Self {
+            desktop: default_true(),
             gap: default_gap(),
             layout: default_layout(),
             taskbar: default_taskbar(),
@@ -1032,6 +1038,12 @@ mod tests {
         assert!(config.general.instant_first_layout);
         assert!(config.general.auto_float_utility_windows);
         assert!(config.general.respect_window_size_constraints);
+    }
+
+    #[test]
+    fn missing_desktop_setting_defaults_to_enabled() {
+        let config: super::Config = toml::from_str("[general]\ngap = 12").unwrap();
+        assert!(config.general.desktop);
     }
 
     #[test]

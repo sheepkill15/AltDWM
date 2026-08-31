@@ -1,6 +1,7 @@
 # RustRover full-demo configuration. This exercises the complete panel/widget,
 # scripting, layout, rule, hotkey, multi-monitor, and virtual-desktop paths.
 [general]
+desktop = true
 gap = 4
 outer_gap = 4
 layout = "spiral"
