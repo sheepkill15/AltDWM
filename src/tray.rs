@@ -1030,6 +1030,22 @@ mod native {
             )
             .map_err(|error| format!("Shell_TrayWnd CreateWindowExW failed: {error:?}"))?;
 
+            // The installed shell is high integrity while ordinary applications
+            // correctly run at medium integrity. Shell_NotifyIcon transports
+            // NOTIFYICONDATA with WM_COPYDATA, so opt this one window into that
+            // message without weakening the filter for the rest of AltDWM.
+            if let Err(error) = windows::Win32::UI::WindowsAndMessaging::ChangeWindowMessageFilterEx(
+                hwnd,
+                WM_COPYDATA,
+                windows::Win32::UI::WindowsAndMessaging::MSGFLT_ALLOW,
+                None,
+            ) {
+                // WM_COPYDATA is permitted by default on some Windows builds.
+                // A filter API failure therefore does not justify abandoning a
+                // tray window that was otherwise created successfully.
+                eprintln!("[tray] could not explicitly allow WM_COPYDATA: {error:?}");
+            }
+
             let child = |parent: HWND, class: PCWSTR, title: PCWSTR| {
                 CreateWindowExW(
                     WINDOW_EX_STYLE(0),

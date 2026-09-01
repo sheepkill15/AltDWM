@@ -379,7 +379,11 @@ unsafe extern "system" fn panel_wndproc(
                         "[panel {panel_name}] widget '{}' click -> {action}",
                         widget.name()
                     );
-                    crate::scripting::dispatch_action_on_monitor(&action, ctx.monitor_key);
+                    crate::scripting::dispatch_action_from_panel(
+                        &action,
+                        ctx.hwnd,
+                        ctx.monitor_key,
+                    );
                 }
             }
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
@@ -396,7 +400,11 @@ unsafe extern "system" fn panel_wndproc(
                         "[panel {panel_name}] widget '{}' right click -> {action}",
                         widget.name()
                     );
-                    crate::scripting::dispatch_action_on_monitor(&action, ctx.monitor_key);
+                    crate::scripting::dispatch_action_from_panel(
+                        &action,
+                        ctx.hwnd,
+                        ctx.monitor_key,
+                    );
                 }
             }
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
@@ -414,7 +422,11 @@ unsafe extern "system" fn panel_wndproc(
                         "[panel {panel_name}] widget '{}' double click -> {action}",
                         widget.name()
                     );
-                    crate::scripting::dispatch_action_on_monitor(&action, ctx.monitor_key);
+                    crate::scripting::dispatch_action_from_panel(
+                        &action,
+                        ctx.hwnd,
+                        ctx.monitor_key,
+                    );
                 }
             }
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);

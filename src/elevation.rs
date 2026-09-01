@@ -15,7 +15,7 @@ fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
-fn is_elevated() -> bool {
+pub fn is_elevated() -> bool {
     let mut token = Default::default();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
         return false;
@@ -52,6 +52,14 @@ fn installed_executable() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let program_files = PathBuf::from(std::env::var_os("ProgramFiles")?);
     path_is_below(&exe, &program_files).then_some(exe)
+}
+
+/// Normal application launches from the protected installed shell must cross
+/// back to the user's ordinary integrity level. `shell:AppsFolder` activation
+/// from the elevated shell fails with `ERROR_ACCESS_DENIED` for many packaged
+/// applications and would unnecessarily elevate classic applications.
+pub fn normal_launch_broker_required() -> bool {
+    is_elevated() && installed_executable().is_some()
 }
 
 fn quote_argument(argument: &OsStr) -> String {

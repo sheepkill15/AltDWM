@@ -7,9 +7,10 @@
 //! Walking the Start menu's `.lnk` files instead would miss every Store app and
 //! pick up uninstallers and documentation shortcuts.
 //!
-//! Each entry keeps its AppUserModelID, so launching is a single
-//! `ShellExecuteW` on `shell:AppsFolder\<id>` — no COM activation, and it works
-//! identically for both kinds of app.
+//! Each entry keeps the AppsFolder-relative parsing name. Classic shell items
+//! launch through `ShellExecuteW`; packaged AUMIDs use
+//! `IApplicationActivationManager`, because treating them as file-like shell
+//! paths intermittently returns `ERROR_ACCESS_DENIED`.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -370,7 +371,16 @@ pub fn search(query: &str, limit: usize) -> Vec<AppEntry> {
 
 /// Launch an indexed application.
 pub fn launch(entry: &AppEntry) {
-    shell_launch(entry, None);
+    if crate::elevation::normal_launch_broker_required() {
+        crate::startup::launch_app_at_normal_integrity(entry.id.clone(), entry.name.clone());
+    } else if is_packaged_app_id(&entry.id) {
+        println!("[apps] activate packaged {} ({})", entry.name, entry.id);
+        if let Err(error) = activate_packaged_app(&entry.id) {
+            eprintln!("[apps] failed to activate {}: {error}", entry.name);
+        }
+    } else {
+        let _ = shell_launch(entry, None);
+    }
 }
 
 /// Launch an indexed application elevated, prompting UAC.
@@ -380,10 +390,26 @@ pub fn launch(entry: &AppEntry) {
 /// have no such verb and simply cannot run elevated; the request fails
 /// harmlessly there rather than doing anything unexpected.
 pub fn launch_as_admin(entry: &AppEntry) {
-    shell_launch(entry, Some(windows::core::w!("runas")));
+    if crate::elevation::normal_launch_broker_required() {
+        crate::startup::launch_app_as_admin_via_user_helper(entry.id.clone(), entry.name.clone());
+        return;
+    }
+    if shell_launch(entry, Some(windows::core::w!("runas"))).is_err()
+        && is_packaged_app_id(&entry.id)
+    {
+        // Not every package exposes an elevated verb. A normal activation is
+        // still preferable to making the command-center action a dead button.
+        eprintln!(
+            "[apps] {} does not expose an elevated AppsFolder launch; activating normally",
+            entry.name
+        );
+        if let Err(error) = activate_packaged_app(&entry.id) {
+            eprintln!("[apps] failed to activate {}: {error}", entry.name);
+        }
+    }
 }
 
-fn shell_launch(entry: &AppEntry, verb: Option<windows::core::PCWSTR>) {
+fn shell_launch(entry: &AppEntry, verb: Option<windows::core::PCWSTR>) -> Result<(), isize> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -409,20 +435,59 @@ fn shell_launch(entry: &AppEntry, verb: Option<windows::core::PCWSTR>) {
         // ShellExecuteW reports failure as a pseudo-handle of 32 or less. A user
         // declining the UAC prompt lands here too, which is not an error worth
         // shouting about, but the log line is still useful.
-        if (result.0 as isize) <= 32 {
+        let code = result.0 as isize;
+        if code <= 32 {
             eprintln!(
                 "[apps] failed to launch{} {}: {}",
                 if elevated { " as admin" } else { "" },
                 entry.name,
-                result.0 as isize
+                code
             );
+            return Err(code);
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_packaged_app_id(id: &str) -> bool {
+    id.split_once('!')
+        .is_some_and(|(package, application)| !package.is_empty() && !application.is_empty())
+}
+
+/// Activate a package by its AUMID instead of treating `shell:AppsFolder` as a
+/// file path. ShellExecute is reliable for classic shell items but returns
+/// `ERROR_ACCESS_DENIED` for some packaged applications even at normal
+/// integrity; this is the API Windows exposes for their launch contract.
+pub(crate) fn activate_packaged_app(id: &str) -> Result<u32, String> {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        ApplicationActivationManager, IApplicationActivationManager, AO_NONE,
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let manager: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)
+                .map_err(|error| format!("activation manager unavailable: {error:?}"))?;
+        let id = id
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        manager
+            .ActivateApplication(
+                windows::core::PCWSTR(id.as_ptr()),
+                windows::core::PCWSTR::null(),
+                AO_NONE,
+            )
+            .map_err(|error| format!("ActivateApplication failed: {error:?}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{fuzzy_score, is_document, make_entry, score};
+    use super::{fuzzy_score, is_document, is_packaged_app_id, make_entry, score};
 
     fn entry(name: &str) -> super::AppEntry {
         make_entry(name.into(), format!("{name}.id")).expect("valid entry")
@@ -433,6 +498,18 @@ mod tests {
         assert!(make_entry("  ".into(), "some.id".into()).is_none());
         assert!(make_entry("App".into(), "  ".into()).is_none());
         assert!(make_entry(" App ".into(), "id".into()).is_some());
+    }
+
+    #[test]
+    fn packaged_ids_are_distinguished_from_classic_shell_items() {
+        assert!(is_packaged_app_id(
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+        ));
+        assert!(is_packaged_app_id("OpenAI.Codex_2p2nqsd0c76g0!App"));
+        assert!(!is_packaged_app_id(
+            r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(!is_packaged_app_id("broken!"));
     }
 
     #[test]

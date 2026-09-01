@@ -4,6 +4,7 @@
 //! discoverable surface while keeping the existing Win32/GDI architecture.
 
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -225,6 +226,17 @@ const CARET_TIMER: usize = 1;
 const CARET_BLINK_MS: u32 = 530;
 
 static STATE: LazyLock<Mutex<CenterState>> = LazyLock::new(|| Mutex::new(CenterState::default()));
+static LAST_FOCUS_DISMISS: Mutex<Option<Instant>> = Mutex::new(None);
+const PANEL_TOGGLE_GRACE: Duration = Duration::from_millis(250);
+
+fn consume_recent_focus_dismissal() -> bool {
+    let mut dismissed = LAST_FOCUS_DISMISS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    dismissed
+        .take()
+        .is_some_and(|when| when.elapsed() <= PANEL_TOGGLE_GRACE)
+}
 
 /// Repaint the command center if it is open. Called when the application index
 /// finishes building, so results appear as soon as they are available.
@@ -1031,7 +1043,14 @@ unsafe extern "system" fn wndproc(
             }
             LRESULT(0)
         }
-        WM_KILLFOCUS | WM_CLOSE => {
+        WM_KILLFOCUS => {
+            *LAST_FOCUS_DISMISS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
@@ -1187,10 +1206,30 @@ pub fn toggle(anchor: HWND) {
     }
 }
 
+/// Toggle from a no-activate panel button. Some custom-framed flyouts lose
+/// focus just before the panel receives its click; treat that same click as the
+/// close operation instead of seeing an empty state and reopening immediately.
+pub fn toggle_from_panel(anchor: HWND) {
+    let existing = STATE.lock().unwrap_or_else(|error| error.into_inner()).hwnd;
+    if existing != 0 {
+        unsafe {
+            let _ = DestroyWindow(HWND(existing as *mut std::ffi::c_void));
+        }
+        return;
+    }
+    if consume_recent_focus_dismissal() {
+        return;
+    }
+    toggle(anchor);
+}
+
 pub fn toggle_from_keyboard() {
-    let anchor = crate::panel::first_handle().unwrap_or_else(|| unsafe {
-        windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
-    });
+    let foreground = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    let anchor = if foreground.0.is_null() {
+        crate::panel::first_handle().unwrap_or(foreground)
+    } else {
+        foreground
+    };
     if !anchor.0.is_null() {
         toggle(anchor);
     }

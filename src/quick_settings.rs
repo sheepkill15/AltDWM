@@ -11,6 +11,7 @@
 //! settings page rather than pretending to a capability it does not have.
 
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -129,6 +130,17 @@ struct State {
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
+static LAST_FOCUS_DISMISS: Mutex<Option<Instant>> = Mutex::new(None);
+const PANEL_TOGGLE_GRACE: Duration = Duration::from_millis(250);
+
+fn consume_recent_focus_dismissal() -> bool {
+    let mut dismissed = LAST_FOCUS_DISMISS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    dismissed
+        .take()
+        .is_some_and(|when| when.elapsed() <= PANEL_TOGGLE_GRACE)
+}
 
 fn handle() -> Option<HWND> {
     let raw = STATE.lock().unwrap_or_else(|error| error.into_inner()).hwnd;
@@ -1010,6 +1022,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KILLFOCUS => {
             // Dismiss on focus loss, like every other flyout in the shell.
+            *LAST_FOCUS_DISMISS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
@@ -1125,6 +1140,13 @@ pub fn toggle_near(anchor: Option<HWND>) {
 }
 
 pub fn toggle_from_panel(panel: HWND, widget: RECT, edge: &str) {
+    if is_open() {
+        close();
+        return;
+    }
+    if consume_recent_focus_dismissal() {
+        return;
+    }
     toggle_anchored(Some(panel), Some(widget), Some(edge));
 }
 

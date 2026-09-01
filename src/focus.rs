@@ -2,6 +2,7 @@
 //! Exposed to keybinds via `focus_next()` / `focus_prev()` etc. and Rhai `focus_next()`
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -9,14 +10,16 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SetForegroundWindow, SetWindowPos,
-    ShowWindow, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE,
+    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
+    SetWindowPos, ShowWindow, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE,
 };
 
 use crate::manager::collect_windows;
 
 static RUNTIME_FLOATING: LazyLock<Mutex<HashSet<isize>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static PENDING_MINIMIZE_FOCUS: LazyLock<Mutex<Vec<(isize, Instant)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 pub fn is_runtime_floating(hwnd: HWND) -> bool {
     RUNTIME_FLOATING
@@ -198,12 +201,98 @@ pub fn toggle_window_from_list(hwnd: HWND) {
             focus_hwnd(hwnd);
             crate::request_retile();
         } else if GetForegroundWindow() == hwnd {
+            println!(
+                "[focus] task-list requested minimize {:?} {}",
+                hwnd.0,
+                crate::util::get_window_title(hwnd)
+            );
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
         } else {
             focus_hwnd(hwnd);
         }
     }
     crate::panel::invalidate_all();
+}
+
+fn preferred_focus_candidate(candidates: &[(HWND, bool)]) -> Option<HWND> {
+    candidates
+        .iter()
+        .find(|(_, same_monitor)| *same_monitor)
+        .or_else(|| candidates.first())
+        .map(|(hwnd, _)| *hwnd)
+}
+
+/// Remember a focused window that is beginning to minimize. Focus must not be
+/// changed from inside MINIMIZESTART: Windows is still processing the minimize
+/// operation there, and activating another HWND can make the operation continue
+/// onto that newly focused window.
+pub fn queue_focus_handoff_from_minimizing(hwnd: HWND) {
+    unsafe {
+        if GetForegroundWindow() != hwnd {
+            return;
+        }
+    }
+    PENDING_MINIMIZE_FOCUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push((hwnd.0 as isize, Instant::now() + Duration::from_millis(100)));
+}
+
+fn visible_focus_candidate(hwnd: HWND) -> bool {
+    !hwnd.0.is_null()
+        && unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() }
+        && crate::util::is_manageable_or_minimized(hwnd)
+        && crate::workspace::is_visible(hwnd)
+        && crate::virtual_desktop::is_on_current_desktop(hwnd)
+}
+
+/// Complete queued minimize focus handoffs after Windows has committed the
+/// iconic state. If the OS already selected a visible application, preserve it.
+pub fn process_minimize_focus_handoffs() {
+    let now = Instant::now();
+    let ready: Vec<isize> = {
+        let mut pending = PENDING_MINIMIZE_FOCUS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut ready = Vec::new();
+        pending.retain(|(source, due)| {
+            if now >= *due {
+                ready.push(*source);
+                false
+            } else {
+                true
+            }
+        });
+        ready
+    };
+    for source in ready {
+        let source = HWND(source as *mut std::ffi::c_void);
+        // If the minimize was cancelled or the application restored itself,
+        // leave it focused and do not hand focus elsewhere.
+        if visible_focus_candidate(source) {
+            continue;
+        }
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground != source && visible_focus_candidate(foreground) {
+            continue;
+        }
+        let source_monitor = unsafe { MonitorFromWindow(source, MONITOR_DEFAULTTONEAREST) };
+        let mut candidates = crate::manager::window_snapshot();
+        candidates.retain(|candidate| *candidate != source && visible_focus_candidate(*candidate));
+        let candidates: Vec<(HWND, bool)> = candidates
+            .into_iter()
+            .map(|candidate| {
+                let same_monitor = unsafe {
+                    MonitorFromWindow(candidate, MONITOR_DEFAULTTONEAREST) == source_monitor
+                };
+                (candidate, same_monitor)
+            })
+            .collect();
+        let target = preferred_focus_candidate(&candidates);
+        if let Some(target) = target {
+            set_foreground(target);
+        }
+    }
 }
 
 /// A compass direction on screen.
@@ -419,7 +508,7 @@ pub fn focus_hwnd(hwnd: HWND) {
 
 #[cfg(test)]
 mod tests {
-    use super::{neighbour, Direction};
+    use super::{neighbour, preferred_focus_candidate, Direction};
     use windows::Win32::Foundation::{HWND, RECT};
 
     fn hwnd(value: isize) -> HWND {
@@ -433,6 +522,18 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    #[test]
+    fn minimize_focus_prefers_the_same_monitor_then_falls_back() {
+        let remote = hwnd(1);
+        let local = hwnd(2);
+        assert_eq!(
+            preferred_focus_candidate(&[(remote, false), (local, true)]),
+            Some(local)
+        );
+        assert_eq!(preferred_focus_candidate(&[(remote, false)]), Some(remote));
+        assert_eq!(preferred_focus_candidate(&[]), None);
     }
 
     /// A master-stack arrangement: master on the left, two stacked on the right.

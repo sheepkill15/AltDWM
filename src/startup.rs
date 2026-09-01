@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_ITEMS};
@@ -31,6 +32,7 @@ const APPROVED_FOLDER: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
 const WINLOGON: &str = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon";
 const SESSION_MARKER: &str = r"Software\AltDWM\VolatileSession";
+const STATE: &str = r"Software\AltDWM";
 
 #[derive(Clone, Debug)]
 struct Entry {
@@ -41,29 +43,273 @@ struct Entry {
     folder_item: bool,
 }
 
-pub fn launch_for_shell_once(enabled: bool) {
+pub fn launch_for_shell_once(enabled: bool, scheduled_shell_session: bool) {
+    // The installed shell is deliberately bootstrapped through a highest-level
+    // scheduled task. Ordinary startup applications must not inherit that
+    // elevated token, so dispatch a second, Limited task to do Explorer's
+    // startup work at the user's normal integrity level.
+    if scheduled_shell_session {
+        std::thread::spawn(move || {
+            let command = (enabled && !session_was_processed()).then_some("startup");
+            if let Err(error) = ensure_user_helper_and_send(command) {
+                eprintln!("[startup] {error}");
+            }
+        });
+        return;
+    }
     if !enabled || !is_configured_shell() || session_was_processed() {
         return;
     }
+    launch_entries_async();
+}
+
+fn launch_entries_async() {
     std::thread::spawn(|| {
-        let entries = collect_entries();
-        let mut launched = 0;
-        for entry in entries.iter().filter(|entry| entry.enabled) {
-            let result = if entry.folder_item {
-                launch_folder_item(&entry.target)
+        launch_entries();
+    });
+}
+
+fn launch_entries() {
+    let entries = collect_entries();
+    let mut launched = 0;
+    for entry in entries.iter().filter(|entry| entry.enabled) {
+        let result = if entry.folder_item {
+            launch_folder_item(&entry.target)
+        } else {
+            launch_command(&entry.target)
+        };
+        if result {
+            launched += 1;
+            println!("[startup] launched {} ({})", entry.name, entry.source);
+        } else {
+            eprintln!("[startup] failed {} ({})", entry.name, entry.source);
+        }
+    }
+    mark_session_processed();
+    println!("[startup] processed {launched} enabled startup item(s)");
+}
+
+pub fn run_user_session_helper_and_exit() -> ! {
+    if let Err(error) = run_user_helper() {
+        eprintln!("[startup] normal-integrity helper stopped: {error}");
+    }
+    std::process::exit(0);
+}
+
+fn start_user_helper_task() -> bool {
+    let task_path = read_string(HKEY_CURRENT_USER, STATE, "StartupTaskPath", KEY_WOW64_64KEY)
+        .unwrap_or_else(|| "\\".into());
+    let Some(task_name) = read_string(HKEY_CURRENT_USER, STATE, "StartupTaskName", KEY_WOW64_64KEY)
+    else {
+        return false;
+    };
+    let task = format!("{task_path}{task_name}");
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    launch_command(&format!(
+        r#""{}\System32\schtasks.exe" /Run /TN "{}""#,
+        system_root, task
+    ))
+}
+
+fn pipe_name() -> String {
+    let mut session = 0u32;
+    unsafe {
+        let _ = windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+            std::process::id(),
+            &mut session,
+        );
+    }
+    format!(r"\\.\pipe\AltDWM.UserSession.{session}")
+}
+
+fn send_user_helper_command(command: &str) -> Result<(), String> {
+    use windows::Win32::Foundation::GENERIC_WRITE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING,
+    };
+
+    let name = wide(&pipe_name());
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(name.as_ptr()),
+            GENERIC_WRITE.0,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|error| format!("normal-integrity helper is unavailable: {error:?}"))?;
+    let bytes = command.as_bytes();
+    let mut written = 0u32;
+    let result = unsafe { WriteFile(handle, Some(bytes), Some(&mut written), None) };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    result.map_err(|error| format!("could not send a launch request: {error:?}"))?;
+    if written as usize != bytes.len() {
+        return Err("normal-integrity helper accepted only part of a launch request".into());
+    }
+    Ok(())
+}
+
+fn ensure_user_helper_and_send(command: Option<&str>) -> Result<(), String> {
+    if let Some(command) = command {
+        if send_user_helper_command(command).is_ok() {
+            return Ok(());
+        }
+    }
+    if !start_user_helper_task() {
+        return Err("failed to start the normal-integrity application helper".into());
+    }
+    let Some(command) = command else {
+        return Ok(());
+    };
+    for _ in 0..40 {
+        if send_user_helper_command(command).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err("normal-integrity application helper did not become ready".into())
+}
+
+pub fn launch_app_at_normal_integrity(id: String, name: String) {
+    std::thread::spawn(move || {
+        println!("[apps] launch {name} ({id}) through normal-integrity helper");
+        let command = format!("app\n{id}");
+        if let Err(error) = ensure_user_helper_and_send(Some(&command)) {
+            eprintln!("[apps] failed to launch {name}: {error}");
+        }
+    });
+}
+
+pub fn launch_app_as_admin_via_user_helper(id: String, name: String) {
+    std::thread::spawn(move || {
+        println!("[apps] launch as admin {name} ({id}) through normal-integrity helper");
+        let command = format!("admin\n{id}");
+        if let Err(error) = ensure_user_helper_and_send(Some(&command)) {
+            eprintln!("[apps] failed to launch as admin {name}: {error}");
+        }
+    });
+}
+
+fn run_user_helper() -> Result<(), String> {
+    use windows::Win32::Foundation::{GetLastError, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{ReadFile, PIPE_ACCESS_INBOUND};
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+    };
+
+    let name = wide(&pipe_name());
+    let pipe = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(name.as_ptr()),
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            0,
+            16 * 1024,
+            0,
+            None,
+        )
+    };
+    if pipe == INVALID_HANDLE_VALUE {
+        return Err(format!("CreateNamedPipeW failed: {:?}", unsafe {
+            GetLastError()
+        }));
+    }
+    println!("[startup] normal-integrity application helper ready");
+    loop {
+        let connected = unsafe { ConnectNamedPipe(pipe, None) }.is_ok()
+            || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+        if !connected {
+            let error = unsafe { GetLastError() };
+            unsafe {
+                let _ = CloseHandle(pipe);
+            }
+            return Err(format!("ConnectNamedPipe failed: {error:?}"));
+        }
+        let mut buffer = vec![0u8; 16 * 1024];
+        let mut read = 0u32;
+        let received = unsafe { ReadFile(pipe, Some(&mut buffer), Some(&mut read), None) }.is_ok();
+        unsafe {
+            let _ = DisconnectNamedPipe(pipe);
+        }
+        if !received {
+            continue;
+        }
+        let command = String::from_utf8_lossy(&buffer[..read as usize]);
+        if command == "shutdown" {
+            break;
+        }
+        if command == "startup" {
+            if !session_was_processed() {
+                launch_entries();
+            }
+            continue;
+        }
+        if let Some(id) = command.strip_prefix("app\n") {
+            launch_apps_folder_id(id.trim(), false);
+            continue;
+        }
+        if let Some(id) = command.strip_prefix("admin\n") {
+            launch_apps_folder_id(id.trim(), true);
+        }
+    }
+    unsafe {
+        let _ = CloseHandle(pipe);
+    }
+    Ok(())
+}
+
+fn launch_apps_folder_id(id: &str, elevated: bool) {
+    if !elevated && crate::apps::is_packaged_app_id(id) {
+        match crate::apps::activate_packaged_app(id) {
+            Ok(pid) => println!("[apps] activated packaged {id} (pid={pid})"),
+            Err(error) => eprintln!("[apps] packaged activation failed for {id}: {error}"),
+        }
+        return;
+    }
+    let target = wide(&format!("shell:AppsFolder\\{id}"));
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            if elevated {
+                windows::core::w!("runas")
             } else {
-                launch_command(&entry.target)
-            };
-            if result {
-                launched += 1;
-                println!("[startup] launched {} ({})", entry.name, entry.source);
+                PCWSTR::null()
+            },
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        eprintln!(
+            "[apps] {} launch failed for {id}: {}",
+            if elevated {
+                "elevated"
             } else {
-                eprintln!("[startup] failed {} ({})", entry.name, entry.source);
+                "normal-integrity"
+            },
+            result.0 as isize
+        );
+        if elevated && crate::apps::is_packaged_app_id(id) {
+            eprintln!("[apps] package {id} has no usable elevated verb; activating normally");
+            match crate::apps::activate_packaged_app(id) {
+                Ok(pid) => println!("[apps] activated packaged {id} (pid={pid})"),
+                Err(error) => eprintln!("[apps] packaged activation failed for {id}: {error}"),
             }
         }
-        mark_session_processed();
-        println!("[startup] processed {launched} enabled startup item(s)");
-    });
+    }
+}
+
+pub fn shutdown_user_helper() {
+    let _ = send_user_helper_command("shutdown");
 }
 
 pub fn print_entries_and_exit() -> ! {

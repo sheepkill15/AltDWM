@@ -304,6 +304,20 @@ pub fn dispatch_action_on_monitor(action: &str, monitor: isize) {
     dispatch_action(action);
 }
 
+/// Dispatch a panel action without losing the panel HWND that identifies the
+/// clicked display. Flyouts use it as their placement anchor; workspace actions
+/// continue to use the explicit monitor identity.
+pub fn dispatch_action_from_panel(
+    action: &str,
+    panel: windows::Win32::Foundation::HWND,
+    monitor: isize,
+) {
+    match action.trim() {
+        "command_center" | "launcher" => crate::command_center::toggle_from_panel(panel),
+        _ => dispatch_action_on_monitor(action, monitor),
+    }
+}
+
 pub fn dispatch_action(action: &str) {
     let act = action.trim();
     if act.starts_with("rhai:") {

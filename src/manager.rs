@@ -1,15 +1,17 @@
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
     MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetCursorPos, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    SendMessageTimeoutW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_TOP,
-    MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE,
-    WM_GETMINMAXINFO, WS_CAPTION, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, IsIconic, IsWindow, IsWindowVisible,
+    IsZoomed, SendMessageTimeoutW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_TOP,
+    MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_NOACTIVATE, SWP_NOZORDER, SW_FORCEMINIMIZE,
+    SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, WINDOWPLACEMENT,
+    WM_GETMINMAXINFO, WM_NCHITTEST, WS_CAPTION, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::layout::{compute_layout, Layout};
@@ -24,6 +26,18 @@ use std::time::{Duration, Instant};
 // Keep the discovery order of each live HWND and only append newly managed
 // windows. Temporarily hidden/minimized windows retain their former slot.
 static WINDOW_ORDER: LazyLock<Mutex<Vec<isize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// A minimize event arrives before `IsIconic` is guaranteed to change. Keep
+/// that transition out of layout calculations immediately instead of allowing
+/// one pass where the disappearing window still consumes a tile.
+static MINIMIZE_TRANSITIONS: LazyLock<Mutex<HashMap<isize, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const MINIMIZE_TRANSITION_MAX_AGE: Duration = Duration::from_secs(2);
+/// WinEvent can be delivered before the queried WS_VISIBLE/placement state has
+/// caught up. A recent HIDE is authoritative for layout until SHOW arrives (or
+/// the short safety timeout expires).
+static HIDE_TRANSITIONS: LazyLock<Mutex<HashMap<isize, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const HIDE_TRANSITION_MAX_AGE: Duration = Duration::from_secs(2);
 static EXPECTED_RECTS: LazyLock<Mutex<HashMap<isize, RECT>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static AUTO_FLOATING: LazyLock<Mutex<HashSet<isize>>> =
@@ -61,6 +75,97 @@ pub fn invalidate_window_snapshot() {
     *WINDOW_SNAPSHOT
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+pub fn note_minimize_start(hwnd: HWND) {
+    MINIMIZE_TRANSITIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(hwnd.0 as isize, Instant::now());
+    invalidate_window_snapshot();
+}
+
+pub fn note_minimize_end(hwnd: HWND) {
+    MINIMIZE_TRANSITIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&(hwnd.0 as isize));
+    invalidate_window_snapshot();
+}
+
+pub fn note_window_hidden(hwnd: HWND) {
+    HIDE_TRANSITIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(hwnd.0 as isize, Instant::now());
+    invalidate_window_snapshot();
+}
+
+pub fn note_window_shown(hwnd: HWND) {
+    HIDE_TRANSITIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&(hwnd.0 as isize));
+    invalidate_window_snapshot();
+}
+
+fn is_minimize_transition(hwnd: HWND) -> bool {
+    let now = Instant::now();
+    let mut transitions = MINIMIZE_TRANSITIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    transitions.retain(|_, started| now.duration_since(*started) < MINIMIZE_TRANSITION_MAX_AGE);
+    transitions.contains_key(&(hwnd.0 as isize))
+}
+
+fn is_hide_transition(hwnd: HWND) -> bool {
+    let now = Instant::now();
+    let mut transitions = HIDE_TRANSITIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    transitions.retain(|_, started| now.duration_since(*started) < HIDE_TRANSITION_MAX_AGE);
+    transitions.contains_key(&(hwnd.0 as isize))
+}
+
+fn placement_excludes_from_layout(show: i32) -> bool {
+    matches!(
+        show,
+        value if value == SW_HIDE.0
+            || value == SW_MINIMIZE.0
+            || value == SW_SHOWMINIMIZED.0
+            || value == SW_SHOWMINNOACTIVE.0
+            || value == SW_FORCEMINIMIZE.0
+    )
+}
+
+fn excluded_from_layout(
+    visible: bool,
+    is_iconic: bool,
+    placement_hidden_or_minimized: bool,
+    minimize_event_pending: bool,
+    hide_event_pending: bool,
+) -> bool {
+    !visible
+        || is_iconic
+        || placement_hidden_or_minimized
+        || minimize_event_pending
+        || hide_event_pending
+}
+
+fn window_is_layout_visible(hwnd: HWND) -> bool {
+    let mut placement = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    let placement_excluded = unsafe { GetWindowPlacement(hwnd, &mut placement) }.is_ok()
+        && placement_excludes_from_layout(placement.showCmd as i32);
+    !excluded_from_layout(
+        unsafe { IsWindowVisible(hwnd).as_bool() },
+        unsafe { IsIconic(hwnd).as_bool() },
+        placement_excluded,
+        is_minimize_transition(hwnd),
+        is_hide_transition(hwnd),
+    )
 }
 
 /// Every managed window on the current virtual desktop, regardless of which
@@ -388,7 +493,23 @@ fn contained_floating_rect(current: RECT, area: RECT, constraints: WindowConstra
 struct MoveState {
     hwnd: isize,
     start_rect: RECT,
+    start_cursor: POINT,
+    resize_edges: ResizeEdges,
     slots: Vec<(isize, RECT)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ResizeEdges {
+    left: bool,
+    top: bool,
+    right: bool,
+    bottom: bool,
+}
+
+impl ResizeEdges {
+    fn any(self) -> bool {
+        self.left || self.top || self.right || self.bottom
+    }
 }
 
 static MOVE_STATE: LazyLock<Mutex<Option<MoveState>>> = LazyLock::new(|| Mutex::new(None));
@@ -462,6 +583,64 @@ pub fn is_move_active(hwnd: HWND) -> bool {
         .is_some_and(|state| state.hwnd == hwnd.0 as isize)
 }
 
+fn resize_edges_at_cursor(hwnd: HWND, cursor: POINT) -> ResizeEdges {
+    // WM_NCHITTEST is the authoritative distinction between dragging a caption
+    // and dragging a resize border. Geometry alone cannot distinguish a top
+    // border from a title bar, especially for custom-framed applications.
+    let packed = ((cursor.y as u32 & 0xffff) << 16) | (cursor.x as u32 & 0xffff);
+    let mut hit = 0usize;
+    unsafe {
+        let _ = SendMessageTimeoutW(
+            hwnd,
+            WM_NCHITTEST,
+            WPARAM(0),
+            LPARAM(packed as isize),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            30,
+            Some(&mut hit),
+        );
+    }
+    match hit as u32 {
+        HTLEFT => ResizeEdges {
+            left: true,
+            ..Default::default()
+        },
+        HTRIGHT => ResizeEdges {
+            right: true,
+            ..Default::default()
+        },
+        HTTOP => ResizeEdges {
+            top: true,
+            ..Default::default()
+        },
+        HTBOTTOM => ResizeEdges {
+            bottom: true,
+            ..Default::default()
+        },
+        HTTOPLEFT => ResizeEdges {
+            left: true,
+            top: true,
+            ..Default::default()
+        },
+        HTTOPRIGHT => ResizeEdges {
+            top: true,
+            right: true,
+            ..Default::default()
+        },
+        HTBOTTOMLEFT => ResizeEdges {
+            left: true,
+            bottom: true,
+            ..Default::default()
+        },
+        HTBOTTOMRIGHT => ResizeEdges {
+            right: true,
+            bottom: true,
+            ..Default::default()
+        },
+        _ => ResizeEdges::default(),
+    }
+}
+
 /// Capture the current tiled rectangles at the beginning of an interactive
 /// move. The pre-drag rectangles are the drop slots; the dragged window can
 /// cover another window without hiding the intended target from us.
@@ -481,6 +660,12 @@ pub fn begin_interactive_move(hwnd: HWND) {
     if unsafe { GetWindowRect(hwnd, &mut start_rect) }.is_err() {
         return;
     }
+    let mut start_cursor = POINT::default();
+    let resize_edges = if unsafe { GetCursorPos(&mut start_cursor) }.is_ok() {
+        resize_edges_at_cursor(hwnd, start_cursor)
+    } else {
+        ResizeEdges::default()
+    };
     let order = WINDOW_ORDER
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -496,6 +681,8 @@ pub fn begin_interactive_move(hwnd: HWND) {
     *MOVE_STATE.lock().unwrap_or_else(|error| error.into_inner()) = Some(MoveState {
         hwnd: hwnd.0 as isize,
         start_rect,
+        start_cursor,
+        resize_edges,
         slots,
     });
 }
@@ -630,7 +817,52 @@ fn adjust_rects_for_resize(
     Some((bounds, adjusted))
 }
 
-fn remember_interactive_resize(state: &MoveState, final_rect: RECT) -> bool {
+fn requested_resize_rect(
+    start: RECT,
+    start_cursor: POINT,
+    final_cursor: POINT,
+    edges: ResizeEdges,
+    accepted: RECT,
+) -> RECT {
+    if !edges.any() {
+        return accepted;
+    }
+    let dx = final_cursor.x - start_cursor.x;
+    let dy = final_cursor.y - start_cursor.y;
+    RECT {
+        left: if edges.left {
+            start.left + dx
+        } else {
+            start.left
+        },
+        top: if edges.top { start.top + dy } else { start.top },
+        right: if edges.right {
+            start.right + dx
+        } else {
+            start.right
+        },
+        bottom: if edges.bottom {
+            start.bottom + dy
+        } else {
+            start.bottom
+        },
+    }
+}
+
+fn remember_interactive_resize(state: &MoveState, accepted_rect: RECT) -> bool {
+    let mut final_cursor = state.start_cursor;
+    let final_rect =
+        if state.resize_edges.any() && unsafe { GetCursorPos(&mut final_cursor) }.is_ok() {
+            requested_resize_rect(
+                state.start_rect,
+                state.start_cursor,
+                final_cursor,
+                state.resize_edges,
+                accepted_rect,
+            )
+        } else {
+            accepted_rect
+        };
     let start_width = rect_width(&state.start_rect);
     let start_height = rect_height(&state.start_rect);
     let resized = (rect_width(&final_rect) - start_width).abs() >= 8
@@ -1006,9 +1238,7 @@ where
 pub fn collect_windows() -> Vec<HWND> {
     collect_windows_including_minimized()
         .into_iter()
-        .filter(|hwnd| unsafe {
-            !windows::Win32::UI::WindowsAndMessaging::IsIconic(*hwnd).as_bool()
-        })
+        .filter(|hwnd| window_is_layout_visible(*hwnd))
         .collect()
 }
 
@@ -1175,6 +1405,26 @@ pub(crate) fn panel_reserves_for_monitor(
     (left, top, right, bottom)
 }
 
+// `DWMWA_BORDER_COLOR` reserves these two high COLORREF values for DWM policy.
+// Asking for COLOR_NONE is preferable to using a transparent theme colour: it
+// removes the compositor-drawn frame entirely instead of blending a frame over
+// a fullscreen application's pixels.
+const DWM_COLOR_NONE: COLORREF = COLORREF(0xFFFF_FFFE);
+
+fn window_border_color(
+    cfg: &crate::config::Config,
+    focused: bool,
+    exclusive_fullscreen: bool,
+) -> COLORREF {
+    if exclusive_fullscreen {
+        DWM_COLOR_NONE
+    } else if focused {
+        cfg.theme.active_window_border_color()
+    } else {
+        cfg.theme.inactive_window_border_color()
+    }
+}
+
 fn apply_window_chrome(hwnd: HWND, cfg: &crate::config::Config, focused: bool) {
     use windows::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -1188,11 +1438,7 @@ fn apply_window_chrome(hwnd: HWND, cfg: &crate::config::Config, focused: bool) {
             &corner as *const _ as _,
             size_of_val(&corner) as u32,
         );
-        let border = if focused {
-            cfg.theme.active_window_border_color()
-        } else {
-            cfg.theme.inactive_window_border_color()
-        };
+        let border = window_border_color(cfg, focused, is_exclusive_fullscreen(hwnd));
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_BORDER_COLOR,
@@ -1420,6 +1666,10 @@ fn tile_windows_reserved_impl(
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&key);
+            // A window may enter borderless fullscreen without losing focus,
+            // so the foreground hook alone cannot clear chrome it received
+            // while tiled. Apply DWM's explicit no-border policy here too.
+            apply_window_chrome(hwnd, &cfg_snapshot, false);
             fullscreen.push(hwnd);
             continue;
         }
@@ -1742,16 +1992,35 @@ fn tile_windows_reserved_impl(
 #[cfg(test)]
 mod tests {
     use super::{
-        adjust_rects_for_resize, assign_slots, contained_floating_rect,
+        adjust_rects_for_resize, assign_slots, contained_floating_rect, excluded_from_layout,
         fullscreen_surface_candidate, is_background_shell_surface, panel_reserves_for_monitor,
-        promote_in_order, reconcile_window_order, rect_covers_monitor, rect_violates_constraints,
-        rects_are_close, shift_within_order, style_can_be_fullscreen, swap_window_order,
-        WindowConstraints,
+        placement_excludes_from_layout, promote_in_order, reconcile_window_order,
+        rect_covers_monitor, rect_violates_constraints, rects_are_close, requested_resize_rect,
+        shift_within_order, style_can_be_fullscreen, swap_window_order, window_border_color,
+        ResizeEdges, WindowConstraints, DWM_COLOR_NONE,
     };
     use crate::config::{Config, PanelConfig};
-    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Foundation::{POINT, RECT};
     use windows::Win32::Graphics::Gdi::HMONITOR;
-    use windows::Win32::UI::WindowsAndMessaging::{WS_OVERLAPPEDWINDOW, WS_POPUP};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SW_HIDE, SW_MINIMIZE, SW_SHOWNORMAL, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    };
+
+    #[test]
+    fn minimize_start_excludes_a_window_before_is_iconic_catches_up() {
+        assert!(excluded_from_layout(true, false, false, true, false));
+        assert!(excluded_from_layout(true, true, false, false, false));
+        assert!(excluded_from_layout(true, false, false, false, true));
+        assert!(excluded_from_layout(false, false, false, false, false));
+        assert!(!excluded_from_layout(true, false, false, false, false));
+    }
+
+    #[test]
+    fn startup_placement_state_excludes_hidden_and_minimized_windows() {
+        assert!(placement_excludes_from_layout(SW_HIDE.0));
+        assert!(placement_excludes_from_layout(SW_MINIMIZE.0));
+        assert!(!placement_excludes_from_layout(SW_SHOWNORMAL.0));
+    }
 
     #[test]
     fn fullscreen_requires_monitor_coverage_and_borderless_chrome() {
@@ -1797,6 +2066,26 @@ mod tests {
         assert!(!is_background_shell_surface(
             "Microsoft-Windows-SnipperCaptureForm"
         ));
+    }
+
+    #[test]
+    fn fullscreen_windows_request_no_dwm_border() {
+        let cfg = Config::default();
+        assert_eq!(
+            window_border_color(&cfg, true, true),
+            DWM_COLOR_NONE,
+            "fullscreen windows must not retain the active tile border"
+        );
+        assert_eq!(
+            window_border_color(&cfg, false, true),
+            DWM_COLOR_NONE,
+            "fullscreen windows must not retain the inactive tile border"
+        );
+        assert_eq!(
+            window_border_color(&cfg, true, false),
+            cfg.theme.active_window_border_color(),
+            "leaving fullscreen must restore the focused tile border"
+        );
     }
 
     #[test]
@@ -2076,6 +2365,57 @@ mod tests {
         assert_eq!(adjusted[&10].right, 700);
         assert_eq!(adjusted[&20].left, 710);
         assert_eq!(adjusted[&20].right, 990);
+    }
+
+    #[test]
+    fn resize_uses_the_requested_cursor_width_when_the_app_clamps_it() {
+        let start = RECT {
+            left: 10,
+            top: 10,
+            right: 600,
+            bottom: 990,
+        };
+        // The application stopped at its minimum, but the pointer continued
+        // 200px right. AltDWM must retain the requested divider position.
+        let accepted = RECT { left: 100, ..start };
+        let requested = requested_resize_rect(
+            start,
+            POINT { x: 10, y: 500 },
+            POINT { x: 210, y: 500 },
+            ResizeEdges {
+                left: true,
+                ..Default::default()
+            },
+            accepted,
+        );
+        assert_eq!(requested.left, 210);
+        assert_eq!(requested.right, 600);
+    }
+
+    #[test]
+    fn moving_a_window_keeps_the_rectangle_windows_accepted() {
+        let start = RECT {
+            left: 10,
+            top: 10,
+            right: 600,
+            bottom: 990,
+        };
+        let accepted = RECT {
+            left: 200,
+            top: 100,
+            right: 790,
+            bottom: 1080,
+        };
+        assert_eq!(
+            requested_resize_rect(
+                start,
+                POINT { x: 300, y: 20 },
+                POINT { x: 490, y: 110 },
+                ResizeEdges::default(),
+                accepted,
+            ),
+            accepted
+        );
     }
 
     #[test]

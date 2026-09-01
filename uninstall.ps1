@@ -38,9 +38,13 @@ $destExe = Join-Path $InstallDir "alt-dwm.exe"
 $legacyShellCommand = '"' + $destExe + '"'
 $taskPath = Get-OptionalRegistryValue -Path $statePath -Name ScheduledTaskPath
 $taskName = Get-OptionalRegistryValue -Path $statePath -Name ScheduledTaskName
+$startupTaskPath = Get-OptionalRegistryValue -Path $statePath -Name StartupTaskPath
+$startupTaskName = Get-OptionalRegistryValue -Path $statePath -Name StartupTaskName
 $installedShell = Get-OptionalRegistryValue -Path $statePath -Name InstalledShell
 if ([string]::IsNullOrWhiteSpace($taskPath)) { $taskPath = "\" }
 if ([string]::IsNullOrWhiteSpace($taskName)) { $taskName = "AltDWM-Shell-$($identity.User.Value)" }
+if ([string]::IsNullOrWhiteSpace($startupTaskPath)) { $startupTaskPath = "\" }
+if ([string]::IsNullOrWhiteSpace($startupTaskName)) { $startupTaskName = "AltDWM-Startup-$($identity.User.Value)" }
 $currentShell = Get-OptionalRegistryValue -Path $winlogonPath -Name Shell
 $normalizedCurrent = if ($null -eq $currentShell) { "" } else { $currentShell.Trim() }
 $ownsCurrentShell = $normalizedCurrent.Equals($legacyShellCommand, [StringComparison]::OrdinalIgnoreCase) -or
@@ -66,6 +70,12 @@ $scheduledTask = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Erro
 if ($null -ne $scheduledTask) {
     Unregister-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Confirm:$false
     Write-Host "Removed scheduled task $taskPath$taskName"
+}
+
+$startupTask = Get-ScheduledTask -TaskPath $startupTaskPath -TaskName $startupTaskName -ErrorAction SilentlyContinue
+if ($null -ne $startupTask) {
+    Unregister-ScheduledTask -TaskPath $startupTaskPath -TaskName $startupTaskName -Confirm:$false
+    Write-Host "Removed scheduled task $startupTaskPath$startupTaskName"
 }
 
 if (Test-Path -LiteralPath $InstallDir) {

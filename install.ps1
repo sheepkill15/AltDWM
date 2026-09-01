@@ -98,7 +98,7 @@ if (-not (Test-Path -LiteralPath $statePath)) {
 $taskPath = "\"
 $taskName = "AltDWM-Shell-$($identity.User.Value)"
 $taskFullName = "$taskPath$taskName"
-$taskArguments = '--config "' + $configPath + '"'
+$taskArguments = '--shell-session --config "' + $configPath + '"'
 $taskAction = New-ScheduledTaskAction -Execute $destExe -Argument $taskArguments -WorkingDirectory $InstallDir
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.User.Value -LogonType Interactive -RunLevel Highest
 $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
@@ -106,6 +106,16 @@ Register-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Action $taskActi
 $registeredTask = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName
 if ($registeredTask.Principal.RunLevel -ne "Highest") {
     throw "Scheduled task $taskFullName was not registered with Highest run level."
+}
+
+$startupTaskName = "AltDWM-Startup-$($identity.User.Value)"
+$startupTaskFullName = "$taskPath$startupTaskName"
+$startupAction = New-ScheduledTaskAction -Execute $destExe -Argument '--user-session-helper' -WorkingDirectory $InstallDir
+$startupPrincipal = New-ScheduledTaskPrincipal -UserId $identity.User.Value -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskPath $taskPath -TaskName $startupTaskName -Action $startupAction -Principal $startupPrincipal -Settings $taskSettings -Description "Normal-integrity application broker for AltDWM" -Force | Out-Null
+$registeredStartupTask = Get-ScheduledTask -TaskPath $taskPath -TaskName $startupTaskName
+if ($registeredStartupTask.Principal.RunLevel -ne "Limited") {
+    throw "Scheduled task $startupTaskFullName was not registered with Limited run level."
 }
 
 $schedulerExe = Join-Path $env:SystemRoot "System32\schtasks.exe"
@@ -128,10 +138,13 @@ if (-not $normalizedCurrent.Equals($shellCommand, [StringComparison]::OrdinalIgn
 
 New-ItemProperty -Path $statePath -Name ScheduledTaskPath -PropertyType String -Value $taskPath -Force | Out-Null
 New-ItemProperty -Path $statePath -Name ScheduledTaskName -PropertyType String -Value $taskName -Force | Out-Null
+New-ItemProperty -Path $statePath -Name StartupTaskPath -PropertyType String -Value $taskPath -Force | Out-Null
+New-ItemProperty -Path $statePath -Name StartupTaskName -PropertyType String -Value $startupTaskName -Force | Out-Null
 New-ItemProperty -Path $statePath -Name InstalledShell -PropertyType String -Value $shellCommand -Force | Out-Null
 Set-ItemProperty -Path $winlogonPath -Name Shell -Value $shellCommand
 Write-Host "Set Shell = $shellCommand"
 Write-Host "Registered $taskFullName with Highest run level."
+Write-Host "Registered $startupTaskFullName with Limited run level for application launches and startup applications."
 Write-Host "The previous shell value was saved under $statePath."
 
 Write-Host "`nDone. Log off/on to use AltDWM." -ForegroundColor Green

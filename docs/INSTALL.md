@@ -75,9 +75,15 @@ machine-wide HKLM shell cannot safely target one user's elevated task and could
 leave other accounts with a blank desktop.
 
 Windows still blocks manipulation of protected processes and windows running as
-`SYSTEM`. Applications launched directly by an elevated shell can inherit its
-administrator token; this is the security and compatibility tradeoff of making
-the shell itself elevated.
+`SYSTEM`. The installer also registers a second, `Limited` per-user task. Its
+long-lived session helper launches ordinary command-center applications and
+processes startup entries at normal integrity, avoiding both accidental
+elevation and `shell:AppsFolder` error 5. Packaged AUMIDs are activated through
+Windows' application activation manager rather than treated as file-like shell
+paths. The explicit run-as-administrator action still requests UAC through the
+normal-integrity helper; a package with no elevated verb is activated normally.
+Re-run `install.ps1` after upgrading an older installation so this helper task is
+registered with the current action.
 
 `uiAccess` remains a future alternative that would require code signing and a
 trusted installation directory. It is not enabled by this installer.

@@ -56,6 +56,8 @@ use windows::core::w;
 // Global state — pub for scripting/panel/util access
 // ------------------------------------------------------------------
 pub static RETILE_PENDING: AtomicBool = AtomicBool::new(false);
+static RETILE_MONITORS_PENDING: LazyLock<Mutex<HashSet<isize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 pub static CONFIG_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 pub static TILING_ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -84,6 +86,15 @@ pub static MAIN_TID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 // helpers for scripting / manager
 pub fn request_retile() {
     RETILE_PENDING.store(true, Ordering::SeqCst);
+}
+
+/// Queue a layout pass for one physical display. Window minimize/restore is a
+/// monitor-local change and must not reposition windows on another display.
+pub fn request_retile_for_monitor(monitor: isize) {
+    RETILE_MONITORS_PENDING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(monitor);
 }
 
 /// Re-tile immediately rather than on the next timer tick.
@@ -567,6 +578,11 @@ unsafe extern "system" fn win_event_proc(
     {
         return;
     }
+    if event == EVENT_OBJECT_HIDE {
+        manager::note_window_hidden(hwnd);
+    } else if event == EVENT_OBJECT_SHOW {
+        manager::note_window_shown(hwnd);
+    }
     if event == EVENT_OBJECT_DESTROY {
         rules::forget_window(hwnd);
         widgets::forget_icon(hwnd);
@@ -617,6 +633,29 @@ unsafe extern "system" fn win_event_proc(
         manager::refresh_window_borders();
     }
     let was_tracked = manager::is_tracked_window(hwnd);
+    if matches!(event, EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND) {
+        let monitor = windows::Win32::Graphics::Gdi::MonitorFromWindow(
+            hwnd,
+            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+        );
+        if event == EVENT_SYSTEM_MINIMIZESTART {
+            manager::note_minimize_start(hwnd);
+            focus::queue_focus_handoff_from_minimizing(hwnd);
+        } else {
+            manager::note_minimize_end(hwnd);
+        }
+        if was_tracked
+            && TILING_ENABLED.load(Ordering::SeqCst)
+            && CURRENT_CONFIG
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .general
+                .auto_tile
+        {
+            request_retile_for_monitor(monitor.0 as isize);
+        }
+        return;
+    }
     let is_first_layout_signal = matches!(
         event,
         EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW | EVENT_SYSTEM_FOREGROUND
@@ -676,10 +715,25 @@ unsafe extern "system" fn host_wndproc(
         WM_TIMER => {
             if wparam.0 == 100 {
                 restore_initial_transition_settings();
+                focus::process_minimize_focus_handoffs();
                 // handle reload request if pending (checked via scripting flag? for now just retile)
-                if RETILE_PENDING.load(Ordering::SeqCst) && TILING_ENABLED.load(Ordering::SeqCst) {
-                    RETILE_PENDING.store(false, Ordering::SeqCst);
-                    tile_current_layout_now();
+                if TILING_ENABLED.load(Ordering::SeqCst) {
+                    if RETILE_PENDING.swap(false, Ordering::SeqCst) {
+                        RETILE_MONITORS_PENDING
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clear();
+                        tile_current_layout_now();
+                    } else {
+                        let monitors: Vec<isize> = RETILE_MONITORS_PENDING
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .drain()
+                            .collect();
+                        for monitor in monitors {
+                            retile_monitor_now(monitor);
+                        }
+                    }
                 }
             }
             LRESULT(0)
@@ -1177,17 +1231,28 @@ fn install_crash_safety() {
 }
 
 fn main() {
-    match elevation::relaunch_installed_if_needed() {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => {
-            eprintln!("[elevation] {error}");
-            return;
+    let user_session_helper = std::env::args().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--user-session-helper" | "--startup-helper"
+        )
+    });
+    if !user_session_helper {
+        match elevation::relaunch_installed_if_needed() {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("[elevation] {error}");
+                return;
+            }
         }
     }
     let _ = MAIN_TID.set(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
     install_crash_safety();
     print_banner();
+    if user_session_helper {
+        startup::run_user_session_helper_and_exit();
+    }
     virtual_desktop::init();
 
     // --- early arg scan for --config / --generate-config / --check-config / --help
@@ -1195,6 +1260,7 @@ fn main() {
     let mut explicit_cfg: Option<PathBuf> = None;
     let mut do_generate = false;
     let mut do_check = false;
+    let mut scheduled_shell_session = false;
     let mut cli_overrides: Vec<(String, String)> = Vec::new();
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -1210,6 +1276,8 @@ fn main() {
             }
             "--generate-config" => do_generate = true,
             "--check-config" => do_check = true,
+            "--shell-session" => scheduled_shell_session = true,
+            "--startup-helper" | "--user-session-helper" => {}
             "--list-apps" => {
                 let query = iter.next().cloned().unwrap_or_default();
                 do_list_apps(&query);
@@ -1319,7 +1387,7 @@ fn main() {
     );
     shell::set_native_taskbars_hidden(cfg.general.hide_native_taskbar);
     tray::announce();
-    startup::launch_for_shell_once(cfg.general.launch_startup_apps);
+    startup::launch_for_shell_once(cfg.general.launch_startup_apps, scheduled_shell_session);
 
     let mut panel_handles: Vec<HWND> = Vec::new();
     if !cfg.panels.is_empty() {
@@ -1507,6 +1575,9 @@ fn main() {
         command_center::close();
         quick_settings::close();
         desktop::shutdown();
+        if scheduled_shell_session {
+            startup::shutdown_user_helper();
+        }
         release_borrowed_system_state();
         let _ = host_hwnd;
         let _ = panel_handles;
