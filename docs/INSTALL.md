@@ -88,6 +88,6 @@ Manifest declares `PerMonitorV2` (`alt-dwm.manifest`). Panels and tiling derive 
 
 ## Troubleshooting
 
-- **Hotkey already registered `1409`** — `Win+Shift+S` is Snipping Tool; defaults now `Alt+Shift` (`src/config.rs:225`). Change `[[keybinds]] keys = "Win+..."`
+- **Hotkey already registered `1409`** — another non-Win shortcut owns it. Choose a different chord. Configured `Win+...` bindings are intercepted by AltDWM instead of being registered with `RegisterHotKey`, so they can take precedence over shell shortcuts; avoid assigning Windows security chords such as `Win+L`.
 - **Config not reloading** — `notify` watcher debounces 500ms, also `Alt+Shift+C` manual reload. Check `[watcher] ... changed -> reload pending` in log.
 - **Build only** — per your request, we validate via `cargo check` / `cargo build`, not by running.

@@ -25,7 +25,7 @@ mod watcher;
 mod widgets;
 mod workspace;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -34,16 +34,19 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
-    MOD_SHIFT, MOD_WIN,
+    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+    MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VIRTUAL_KEY, VK_CONTROL, VK_LMENU, VK_LWIN, VK_MENU, VK_RWIN,
+    VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-    TranslateMessage, CW_USEDEFAULT, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
+    PostQuitMessage, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    CW_USEDEFAULT, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
     EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
     EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
-    EVENT_SYSTEM_MOVESIZESTART, HMENU, HWND_MESSAGE, MSG, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_TIMER,
+    EVENT_SYSTEM_MOVESIZESTART, HMENU, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CREATE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
 use layout::Layout;
@@ -66,6 +69,14 @@ pub static HOTKEY_ACTIONS: LazyLock<Mutex<HashMap<i32, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 pub static ACTIVE_KEYBINDS: LazyLock<Mutex<Vec<config::KeybindConfig>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+/// Actions captured by the low-level hook.  The hook must return promptly, so
+/// application work is always performed back on the main message-loop thread.
+static INTERCEPTED_HOTKEY_ACTIONS: LazyLock<Mutex<VecDeque<String>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+static INTERCEPTED_PRIMARY_KEYS: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static SUPPRESS_WIN_KEY_UP: AtomicBool = AtomicBool::new(false);
+const WM_INTERCEPTED_HOTKEY: u32 = WM_APP + 1;
 static TRANSITIONS_TO_RESTORE: LazyLock<Mutex<HashMap<isize, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 pub static MAIN_TID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -247,6 +258,11 @@ fn place_new_window_immediately(hwnd: HWND) {
     // before WS_VISIBLE, while SHOW/FOREGROUND catches the first usable frame.
     RETILE_PENDING.store(false, Ordering::SeqCst);
     tile_current_layout_now();
+    // CREATE/SHOW commonly arrives before a toolkit has installed its final
+    // WM_GETMINMAXINFO handler. The manager intentionally treats that first
+    // constraint reading as provisional; schedule the settling pass now rather
+    // than waiting for an unrelated drag/focus event to make the window snap.
+    request_retile();
     panel::invalidate_all();
     if std::env::var_os("ALT_DWM_VERBOSE").is_some() {
         println!("[manager] instant first layout for {:?}", hwnd.0);
@@ -359,6 +375,94 @@ fn parse_hotkey(keys: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
     Some((mods, vk))
 }
 
+fn win_hotkey_action(vk: u32, pressed_modifiers: HOT_KEY_MODIFIERS) -> Option<String> {
+    const MATCHED_MODIFIERS: u32 = MOD_WIN.0 | MOD_SHIFT.0 | MOD_CONTROL.0 | MOD_ALT.0;
+    ACTIVE_KEYBINDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find_map(|keybind| {
+            let (modifiers, key) = parse_hotkey(&keybind.keys)?;
+            ((modifiers.0 & MATCHED_MODIFIERS) == pressed_modifiers.0
+                && modifiers.0 & MOD_WIN.0 != 0
+                && key == vk)
+                .then(|| keybind.action.clone())
+        })
+}
+
+unsafe extern "system" fn low_level_keyboard_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code < 0 {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
+    let message = wparam.0 as u32;
+    let keyboard = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+    let vk = keyboard.vkCode;
+
+    if matches!(message, WM_KEYUP | WM_SYSKEYUP)
+        && INTERCEPTED_PRIMARY_KEYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&vk)
+    {
+        return LRESULT(1);
+    }
+
+    if matches!(message, WM_KEYUP | WM_SYSKEYUP)
+        && matches!(vk, value if value == VK_LWIN.0 as u32 || value == VK_RWIN.0 as u32)
+        && SUPPRESS_WIN_KEY_UP.swap(false, Ordering::SeqCst)
+    {
+        // The primary key was hidden from Windows. Hide the matching Win-key
+        // release as well so the shell does not treat it as a standalone tap.
+        return LRESULT(1);
+    }
+
+    if !matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
+    let is_down = |key: VIRTUAL_KEY| GetAsyncKeyState(key.0 as i32) < 0;
+    let pressed_modifiers = HOT_KEY_MODIFIERS(
+        if is_down(VK_LWIN) || is_down(VK_RWIN) {
+            MOD_WIN.0
+        } else {
+            0
+        } | if is_down(VK_SHIFT) { MOD_SHIFT.0 } else { 0 }
+            | if is_down(VK_CONTROL) {
+                MOD_CONTROL.0
+            } else {
+                0
+            }
+            | if is_down(VK_MENU) || is_down(VK_LMENU) {
+                MOD_ALT.0
+            } else {
+                0
+            },
+    );
+    if let Some(action) = win_hotkey_action(vk, pressed_modifiers) {
+        let mut intercepted = INTERCEPTED_PRIMARY_KEYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if intercepted.insert(vk) {
+            INTERCEPTED_HOTKEY_ACTIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(action);
+            SUPPRESS_WIN_KEY_UP.store(true, Ordering::SeqCst);
+            if let Some(thread_id) = MAIN_TID.get() {
+                let _ = PostThreadMessageW(*thread_id, WM_INTERCEPTED_HOTKEY, WPARAM(0), LPARAM(0));
+            }
+        }
+        return LRESULT(1);
+    }
+
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
 fn register_keybinds(cfg: &config::Config) {
     // clear old
     let mut map = HOTKEY_ACTIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -378,6 +482,16 @@ fn register_keybinds(cfg: &config::Config) {
     let mut next_id = 1;
     for kb in &cfg.keybinds {
         if let Some((mods, vk)) = parse_hotkey(&kb.keys) {
+            if mods.0 & MOD_WIN.0 != 0 {
+                // Windows reserves many Win chords, so RegisterHotKey cannot
+                // reliably own them. The low-level hook handles these instead.
+                println!("[hotkey] {} -> '{}' (intercepted)", kb.keys, kb.action);
+                ACTIVE_KEYBINDS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(kb.clone());
+                continue;
+            }
             let id = next_id;
             next_id += 1;
             unsafe {
@@ -1235,6 +1349,21 @@ fn main() {
     // hotkeys — dynamic from config.toml [[keybinds]]
     register_keybinds(&cfg);
 
+    // `RegisterHotKey` cannot claim a number of OS-reserved Win chords. A
+    // low-level hook sees configured Win keybinds first and consumes them.
+    let keyboard_hook = unsafe {
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0) {
+            Ok(hook) => {
+                println!("[hotkey] Win-key interception enabled");
+                Some(hook)
+            }
+            Err(error) => {
+                eprintln!("[hotkey] Win-key interception unavailable: {:?}", error);
+                None
+            }
+        }
+    };
+
     let mut hooks: Vec<HWINEVENTHOOK> = Vec::new();
     unsafe {
         let mut try_hook = |event_min: u32, event_max: u32, label: &str| {
@@ -1327,17 +1456,22 @@ fn main() {
                 );
                 break;
             }
-            if msg.message == WM_HOTKEY {
-                let id = msg.wParam.0 as i32;
-                let action = {
+            if msg.message == WM_HOTKEY || msg.message == WM_INTERCEPTED_HOTKEY {
+                let action = if msg.message == WM_HOTKEY {
+                    let id = msg.wParam.0 as i32;
                     HOTKEY_ACTIONS
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .get(&id)
                         .cloned()
+                } else {
+                    INTERCEPTED_HOTKEY_ACTIONS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pop_front()
                 };
                 if let Some(act) = action {
-                    println!("[hotkey] id={} -> '{}'", id, act);
+                    println!("[hotkey] -> '{}'", act);
                     if act == "quit" {
                         break;
                     } else if act == "reload_config" {
@@ -1356,8 +1490,6 @@ fn main() {
                         // delegate to scripting engine (handles toggle_tiling, set_layout, launch, rhai: ...)
                         scripting::dispatch_action(&act);
                     }
-                } else {
-                    eprintln!("[hotkey] unknown id {}", id);
                 }
                 continue;
             }
@@ -1365,6 +1497,9 @@ fn main() {
             DispatchMessageW(&msg);
         }
         unregister_all_hotkeys();
+        if let Some(hook) = keyboard_hook {
+            let _ = UnhookWindowsHookEx(hook);
+        }
         for h in hooks {
             let _ = UnhookWinEvent(h);
         }

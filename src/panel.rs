@@ -65,23 +65,10 @@ pub fn first_handle() -> Option<HWND> {
     panels.first().map(|panel| panel.hwnd)
 }
 
-fn panel_should_show(fullscreen_monitor: Option<HMONITOR>, panel_monitor: HMONITOR) -> bool {
-    fullscreen_monitor.is_none_or(|monitor| monitor != panel_monitor)
-}
-
-/// Hide shell chrome only on the display occupied by the foreground fullscreen
-/// application. Panels on every other monitor remain visible and interactive.
+/// Hide shell chrome on every display covered by the foreground fullscreen
+/// surface. This includes temporary capture overlays, which must be allowed
+/// above the otherwise-topmost panel, as well as managed fullscreen apps.
 pub fn sync_fullscreen(foreground: HWND) {
-    let fullscreen_monitor = if crate::manager::is_exclusive_fullscreen(foreground) {
-        Some(unsafe {
-            windows::Win32::Graphics::Gdi::MonitorFromWindow(
-                foreground,
-                windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
-            )
-        })
-    } else {
-        None
-    };
     let Some(panel_arc) = panel_collection() else {
         return;
     };
@@ -89,7 +76,7 @@ pub fn sync_fullscreen(foreground: HWND) {
         return;
     };
     for panel in panels.iter() {
-        let should_show = panel_should_show(fullscreen_monitor, panel.monitor);
+        let should_show = !crate::manager::foreground_occludes_monitor(foreground, panel.monitor);
         let visible = unsafe { IsWindowVisible(panel.hwnd).as_bool() };
         if should_show == visible {
             continue;
@@ -914,10 +901,9 @@ pub fn destroy_panels() {
 
 #[cfg(test)]
 mod tests {
-    use super::{panel_rect, panel_should_show, scaled_panel_config};
+    use super::{panel_rect, scaled_panel_config};
     use crate::config::PanelConfig;
     use windows::Win32::Foundation::RECT;
-    use windows::Win32::Graphics::Gdi::HMONITOR;
 
     const MONITOR: RECT = RECT {
         left: 0,
@@ -925,16 +911,6 @@ mod tests {
         right: 1920,
         bottom: 1080,
     };
-
-    #[test]
-    fn fullscreen_hides_only_the_panel_on_its_monitor() {
-        let primary = HMONITOR::default();
-        let secondary = HMONITOR(std::ptr::dangling_mut::<std::ffi::c_void>());
-        assert!(!panel_should_show(Some(secondary), secondary));
-        assert!(panel_should_show(Some(secondary), primary));
-        assert!(panel_should_show(None, primary));
-        assert!(panel_should_show(None, secondary));
-    }
 
     #[test]
     fn same_edge_panels_stack_instead_of_overlap() {

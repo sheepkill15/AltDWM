@@ -27,12 +27,13 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DrawIconEx, GetClientRect, GetSystemMetrics, KillTimer, SetTimer, SetWindowPos, ShowWindow,
-    TrackPopupMenu, DI_NORMAL, HWND_BOTTOM, MF_SEPARATOR, MF_STRING, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SW_SHOWNA, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_COMMAND, WM_CONTEXTMENU,
-    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_PAINT, WM_SETTINGCHANGE, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    DrawIconEx, GetClientRect, GetSystemMetrics, KillTimer, SetForegroundWindow, SetTimer,
+    SetWindowPos, ShowWindow, TrackPopupMenu, DI_NORMAL, HWND_BOTTOM, MF_SEPARATOR, MF_STRING,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SW_SHOWNA, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_COMMAND,
+    WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_PAINT, WM_SETTINGCHANGE, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 
 const CLASS_NAME: windows::core::PCWSTR = w!("AltDWM_Desktop");
@@ -290,6 +291,12 @@ fn selected_path() -> Option<PathBuf> {
 fn open_path(hwnd: HWND, path: &Path) {
     let encoded = wide(path.as_os_str());
     unsafe {
+        // The desktop uses WS_EX_NOACTIVATE so an ordinary background click
+        // does not steal keyboard focus. A launch is different: it is explicit
+        // user activation. Briefly making the shell surface foreground gives
+        // ShellExecute (including reused URI handlers such as Settings) the
+        // foreground permission needed to reveal its destination window.
+        let _ = SetForegroundWindow(hwnd);
         let result = ShellExecuteW(
             Some(hwnd),
             w!("open"),
@@ -305,6 +312,18 @@ fn open_path(hwnd: HWND, path: &Path) {
                 result.0
             );
         }
+        // Keep the desktop a true background surface even though it briefly
+        // brokered foreground activation for the launched application.
+        let screen = virtual_screen();
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_BOTTOM),
+            screen.left,
+            screen.top,
+            screen.right - screen.left,
+            screen.bottom - screen.top,
+            SWP_NOACTIVATE,
+        );
     }
 }
 

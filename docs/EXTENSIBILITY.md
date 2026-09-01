@@ -175,7 +175,7 @@ Floating decisions use this order:
 
 1. `Alt+Shift+Y` manual floating state.
 2. The first matching rule with `floating = true` or `floating = false`.
-3. Automatic utility detection for owned, modal, fixed-size, and compact non-resizable windows.
+3. Automatic utility detection for owned, modal, tool, and intrinsically fixed-size windows.
 4. Minimum-size validation against the proposed tile; a window that cannot fit is floated.
 
 Automatic floating windows retain their size where possible and are clamped into

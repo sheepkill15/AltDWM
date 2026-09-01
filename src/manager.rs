@@ -6,10 +6,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetCursorPos, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, IsWindow, IsZoomed, SendMessageTimeoutW, SetWindowPos,
-    ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_TOP, MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, WM_GETMINMAXINFO, WS_CAPTION, WS_EX_DLGMODALFRAME,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    SendMessageTimeoutW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_TOP,
+    MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE,
+    WM_GETMINMAXINFO, WS_CAPTION, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::layout::{compute_layout, Layout};
@@ -126,31 +126,72 @@ fn style_can_be_fullscreen(style: u32) -> bool {
     (style & WS_POPUP.0) != 0 || (style & WS_CAPTION.0) == 0
 }
 
+fn fullscreen_surface_candidate(
+    excluded_shell_surface: bool,
+    visible: bool,
+    iconic: bool,
+    covers_monitor: bool,
+    style: u32,
+) -> bool {
+    !excluded_shell_surface
+        && visible
+        && !iconic
+        && covers_monitor
+        && style_can_be_fullscreen(style)
+}
+
+fn is_background_shell_surface(class: &str) -> bool {
+    class.starts_with("AltDWM_")
+        || matches!(
+            class,
+            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+        )
+}
+
+/// Whether the foreground surface covers a particular display and therefore
+/// needs to sit above shell chrome. Unlike tiling eligibility, this deliberately
+/// includes short-lived tool/overlay windows such as Windows 11 screen capture.
+/// A single virtual-screen overlay can consequently suppress panels on every
+/// monitor it covers.
+pub fn foreground_occludes_monitor(hwnd: HWND, monitor: HMONITOR) -> bool {
+    unsafe {
+        if hwnd.0.is_null() {
+            return false;
+        }
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut rect = RECT::default();
+        if !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut _).as_bool()
+            || GetWindowRect(hwnd, &mut rect).is_err()
+        {
+            return false;
+        }
+        fullscreen_surface_candidate(
+            is_background_shell_surface(&crate::util::get_class_name(hwnd)),
+            IsWindowVisible(hwnd).as_bool(),
+            IsIconic(hwnd).as_bool(),
+            rect_covers_monitor(rect, info.rcMonitor, 2),
+            GetWindowLongPtrW(hwnd, GWL_STYLE) as u32,
+        )
+    }
+}
+
 /// A borderless/popup window covering its complete physical monitor is owned by
 /// the application, not by the tiler. This includes DirectX exclusive mode and
 /// ordinary borderless fullscreen, while excluding a normal maximized window
 /// whose caption/thick frame remain present.
 pub fn is_exclusive_fullscreen(hwnd: HWND) -> bool {
     unsafe {
-        if hwnd.0.is_null() || windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool() {
+        // Fullscreen is an application-window policy. Desktop/shell surfaces
+        // such as Progman and WorkerW are monitor-sized borderless popups too,
+        // but focusing the background must never hide AltDWM's panels.
+        if !crate::util::is_manageable_or_minimized(hwnd) {
             return false;
         }
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        let mut info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut _).as_bool() {
-            return false;
-        }
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() || !rect_covers_monitor(rect, info.rcMonitor, 2)
-        {
-            return false;
-        }
-        let style =
-            GetWindowLongPtrW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWL_STYLE) as u32;
-        style_can_be_fullscreen(style)
+        foreground_occludes_monitor(hwnd, monitor)
     }
 }
 
@@ -289,69 +330,17 @@ fn has_fixed_size(constraints: WindowConstraints) -> bool {
         && constraints.min_height >= constraints.max_height.saturating_sub(2)
 }
 
-/// A secondary window that opens as a compact palette is usually transient even
-/// when its toolkit did not set an owner or WS_EX_TOOLWINDOW. This is evaluated
-/// only on first sight, before AltDWM has assigned a tile, so our own geometry
-/// can never turn a normal window into a utility window later.
-fn is_compact_secondary_window(hwnd: HWND, sibling_count: usize) -> bool {
-    if sibling_count < 2 {
-        return false;
-    }
-    let mut window = RECT::default();
-    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    let mut info = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        if GetWindowRect(hwnd, &mut window).is_err()
-            || !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut _).as_bool()
-        {
-            return false;
-        }
-    }
-    compact_secondary_rect(window, info.rcWork)
-}
-
-fn compact_secondary_rect(window: RECT, work: RECT) -> bool {
-    let width = (window.right - window.left).max(0) as i64;
-    let height = (window.bottom - window.top).max(0) as i64;
-    let work_width = (work.right - work.left).max(1) as i64;
-    let work_height = (work.bottom - work.top).max(1) as i64;
-    width > 0
-        && height > 0
-        && width * 100 <= work_width * 70
-        && height * 100 <= work_height * 90
-        && width * height * 100 <= work_width * work_height * 45
-}
-
 /// Decide once per window whether it is an automatic utility window.
 ///
-/// Two rules keep this stable. Compact geometry is consulted only on the first
-/// sighting, before AltDWM can have placed the window, and that verdict is then
-/// cached. The size-limit test is deferred by one pass: at EVENT_OBJECT_CREATE
-/// many applications have not finished applying styles or answering
-/// WM_GETMINMAXINFO, and a normal application window read too early looks
-/// exactly like a fixed-size dialog.
-fn classify_utility_window(
-    hwnd: HWND,
-    constraints: WindowConstraints,
-    sibling_count: usize,
-) -> bool {
+/// Only durable Win32 traits are used. Initial geometry is deliberately not a
+/// signal: a normal main window (Steam is a common example) may open compactly
+/// while another window from the same process exists. Treating that rectangle
+/// as a utility-window identity made the main window float unpredictably.
+/// The size-limit test is deferred by one pass because at EVENT_OBJECT_CREATE
+/// many applications have not finished answering WM_GETMINMAXINFO.
+fn classify_utility_window(hwnd: HWND, constraints: WindowConstraints) -> bool {
     let key = hwnd.0 as isize;
     if is_utility_window_at_birth(hwnd) {
-        UTILITY_CLASS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(key, Some(true));
-        return true;
-    }
-    if !UTILITY_CLASS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .contains_key(&key)
-        && is_compact_secondary_window(hwnd, sibling_count)
-    {
         UTILITY_CLASS
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1424,19 +1413,6 @@ fn tile_windows_reserved_impl(
     let mut floating = Vec::new();
     let mut fullscreen = Vec::new();
     let mut auto_floating_keys = HashSet::new();
-    let process_counts: HashMap<String, usize> = if cfg_snapshot.general.auto_float_utility_windows
-    {
-        let mut counts = HashMap::new();
-        for hwnd in &all_windows {
-            let process = crate::rules::get_process_name(*hwnd).to_ascii_lowercase();
-            if !process.is_empty() {
-                *counts.entry(process).or_insert(0) += 1;
-            }
-        }
-        counts
-    } else {
-        HashMap::new()
-    };
     for hwnd in all_windows {
         let key = hwnd.0 as isize;
         if is_exclusive_fullscreen(hwnd) {
@@ -1451,14 +1427,7 @@ fn tile_windows_reserved_impl(
         let decision = resolved.get(&key).and_then(|rules| rules.floating);
         let automatic = decision.is_none()
             && cfg_snapshot.general.auto_float_utility_windows
-            && classify_utility_window(
-                hwnd,
-                constraints.get(&key).copied().unwrap_or_default(),
-                process_counts
-                    .get(&crate::rules::get_process_name(hwnd).to_ascii_lowercase())
-                    .copied()
-                    .unwrap_or(1),
-            );
+            && classify_utility_window(hwnd, constraints.get(&key).copied().unwrap_or_default());
         if manual || decision == Some(true) || automatic {
             if automatic {
                 auto_floating_keys.insert(key);
@@ -1773,10 +1742,11 @@ fn tile_windows_reserved_impl(
 #[cfg(test)]
 mod tests {
     use super::{
-        adjust_rects_for_resize, assign_slots, compact_secondary_rect, contained_floating_rect,
-        panel_reserves_for_monitor, promote_in_order, reconcile_window_order, rect_covers_monitor,
-        rect_violates_constraints, rects_are_close, shift_within_order, style_can_be_fullscreen,
-        swap_window_order, WindowConstraints,
+        adjust_rects_for_resize, assign_slots, contained_floating_rect,
+        fullscreen_surface_candidate, is_background_shell_surface, panel_reserves_for_monitor,
+        promote_in_order, reconcile_window_order, rect_covers_monitor, rect_violates_constraints,
+        rects_are_close, shift_within_order, style_can_be_fullscreen, swap_window_order,
+        WindowConstraints,
     };
     use crate::config::{Config, PanelConfig};
     use windows::Win32::Foundation::RECT;
@@ -1814,6 +1784,19 @@ mod tests {
         ));
         assert!(style_can_be_fullscreen(WS_POPUP.0));
         assert!(!style_can_be_fullscreen(WS_OVERLAPPEDWINDOW.0));
+        assert!(fullscreen_surface_candidate(
+            false, true, false, true, WS_POPUP.0
+        ));
+        assert!(
+            !fullscreen_surface_candidate(true, true, false, true, WS_POPUP.0),
+            "an unmanaged desktop/shell surface must not hide panels"
+        );
+        assert!(is_background_shell_surface("Progman"));
+        assert!(is_background_shell_surface("WorkerW"));
+        assert!(is_background_shell_surface("AltDWM_Desktop"));
+        assert!(!is_background_shell_surface(
+            "Microsoft-Windows-SnipperCaptureForm"
+        ));
     }
 
     #[test]
@@ -1839,34 +1822,6 @@ mod tests {
                 min_height: 360,
                 ..Default::default()
             }
-        ));
-    }
-
-    #[test]
-    fn compact_secondary_windows_are_distinguished_from_full_size_peers() {
-        let work = RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1080,
-        };
-        assert!(compact_secondary_rect(
-            RECT {
-                left: 1400,
-                top: 120,
-                right: 1820,
-                bottom: 900
-            },
-            work,
-        ));
-        assert!(!compact_secondary_rect(
-            RECT {
-                left: 100,
-                top: 60,
-                right: 1820,
-                bottom: 1020
-            },
-            work,
         ));
     }
 
