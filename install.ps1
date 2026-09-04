@@ -67,7 +67,11 @@ Copy-Item -Force -LiteralPath $sourceExe -Destination (Join-Path $InstallDir "al
 Copy-Item -Force -LiteralPath (Join-Path $projectRoot "examples\config.example.toml") -Destination (Join-Path $InstallDir "config.example.toml") -ErrorAction SilentlyContinue
 $scriptsDir = Join-Path $projectRoot "scripts"
 if (Test-Path -LiteralPath $scriptsDir) {
-    Copy-Item -Recurse -Force -LiteralPath $scriptsDir -Destination (Join-Path $InstallDir "scripts") -ErrorAction SilentlyContinue
+    $installedScriptsDir = Join-Path $InstallDir "scripts"
+    New-Item -ItemType Directory -Force -Path $installedScriptsDir | Out-Null
+    foreach ($entry in Get-ChildItem -LiteralPath $scriptsDir -Force) {
+        Copy-Item -Recurse -Force -LiteralPath $entry.FullName -Destination $installedScriptsDir -ErrorAction SilentlyContinue
+    }
 }
 
 $destExe = Join-Path $InstallDir "alt-dwm.exe"

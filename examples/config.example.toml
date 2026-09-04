@@ -74,6 +74,7 @@ widgets = [
     "cpu",
     "system",
     "tray",
+    "power_menu",
     "clock",
 ]
 
@@ -118,6 +119,13 @@ show_volume = true
 show_network = true
 show_battery = true
 show_input = true
+
+[[widgets]]
+type = "power_menu"
+name = "power_menu"
+script = "scripts/widgets/power_menu.rhai"
+# show_label = true
+# label = "Power"
 
 [[widgets]]
 type = "clock"

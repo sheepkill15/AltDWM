@@ -40,6 +40,10 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("tray", include_str!("../scripts/widgets/tray.rhai")),
     ("volume", include_str!("../scripts/widgets/volume.rhai")),
     ("battery", include_str!("../scripts/widgets/battery.rhai")),
+    (
+        "power_menu",
+        include_str!("../scripts/widgets/power_menu.rhai"),
+    ),
     ("network", include_str!("../scripts/widgets/network.rhai")),
     ("input", include_str!("../scripts/widgets/input.rhai")),
     ("system", include_str!("../scripts/widgets/system.rhai")),
@@ -57,6 +61,7 @@ pub fn builtin_script_name(kind: &str) -> Option<&'static str> {
         "tray" | "systray" => "tray",
         "volume" | "audio" => "volume",
         "battery" | "power" => "battery",
+        "power_menu" | "session" | "session_menu" => "power_menu",
         "network" | "wifi" => "network",
         "input" | "keyboard" | "language" => "input",
         "system_status" | "status" | "system" => "system",
@@ -214,6 +219,7 @@ impl ScriptWidget {
                     "tray" => "scripts/widgets/tray.rhai",
                     "volume" => "scripts/widgets/volume.rhai",
                     "battery" => "scripts/widgets/battery.rhai",
+                    "power_menu" => "scripts/widgets/power_menu.rhai",
                     "network" => "scripts/widgets/network.rhai",
                     "input" => "scripts/widgets/input.rhai",
                     "system" => "scripts/widgets/system.rhai",
@@ -331,6 +337,14 @@ impl ScriptWidget {
         }
         if action == "@quick_settings" {
             crate::quick_settings::toggle_from_panel(
+                ctx.hwnd,
+                crate::ui::client_rect_to_screen(ctx.hwnd, rect),
+                &ctx.panel_name,
+            );
+            return None;
+        }
+        if action == "@power_menu" {
+            crate::power_menu::show(
                 ctx.hwnd,
                 crate::ui::client_rect_to_screen(ctx.hwnd, rect),
                 &ctx.panel_name,
@@ -466,6 +480,7 @@ fn default_width(kind: &str) -> i32 {
         Some("launcher") => 112,
         Some("tray") => 104,
         Some("system") => 230,
+        Some("power_menu") => 40,
         Some(_) => 104,
         None => 120,
     }
@@ -506,6 +521,62 @@ fn map_insert(map: &mut Map, key: &str, value: impl Into<Dynamic>) {
 }
 fn array_map(items: impl IntoIterator<Item = Map>) -> Array {
     items.into_iter().map(Dynamic::from_map).collect()
+}
+
+fn system_context(status: &crate::system::SystemStatus) -> Map {
+    let mut system = Map::new();
+    map_insert(
+        &mut system,
+        "volume",
+        status.volume.map(|v| i64::from(v.percent())).unwrap_or(-1),
+    );
+    map_insert(&mut system, "muted", status.volume.is_some_and(|v| v.muted));
+    map_insert(&mut system, "battery_present", status.battery.is_some());
+    map_insert(
+        &mut system,
+        "battery",
+        status
+            .battery
+            .and_then(|v| v.percent)
+            .map(i64::from)
+            .unwrap_or(-1),
+    );
+    map_insert(
+        &mut system,
+        "charging",
+        status.battery.is_some_and(|v| v.charging),
+    );
+    map_insert(
+        &mut system,
+        "on_ac",
+        status.battery.is_some_and(|v| v.on_ac),
+    );
+    map_insert(&mut system, "network", status.network.label());
+    let (network_kind, network_signal) = match &status.network {
+        crate::system::NetworkStatus::WiFi { signal, .. } => ("wifi", i64::from(*signal)),
+        crate::system::NetworkStatus::Wired => ("wired", -1),
+        crate::system::NetworkStatus::Offline => ("offline", -1),
+        crate::system::NetworkStatus::Unknown => ("unknown", -1),
+    };
+    map_insert(&mut system, "network_kind", network_kind);
+    map_insert(&mut system, "network_signal", network_signal);
+    map_insert(
+        &mut system,
+        "connected",
+        !matches!(
+            status.network,
+            crate::system::NetworkStatus::Offline | crate::system::NetworkStatus::Unknown
+        ),
+    );
+    map_insert(
+        &mut system,
+        "brightness",
+        status
+            .brightness
+            .map(|v| i64::from(v.percent))
+            .unwrap_or(-1),
+    );
+    system
 }
 
 fn widget_context(cfg: &WidgetConfig, ctx: &PanelCtx, rect: RECT) -> Map {
@@ -602,57 +673,7 @@ fn widget_context(cfg: &WidgetConfig, ctx: &PanelCtx, rect: RECT) -> Map {
     });
     map_insert(&mut root, "tray", array_map(tray));
     let status = crate::system::status();
-    let mut system = Map::new();
-    map_insert(
-        &mut system,
-        "volume",
-        status.volume.map(|v| i64::from(v.percent())).unwrap_or(-1),
-    );
-    map_insert(&mut system, "muted", status.volume.is_some_and(|v| v.muted));
-    map_insert(
-        &mut system,
-        "battery",
-        status
-            .battery
-            .and_then(|v| v.percent)
-            .map(i64::from)
-            .unwrap_or(-1),
-    );
-    map_insert(
-        &mut system,
-        "charging",
-        status.battery.is_some_and(|v| v.charging),
-    );
-    map_insert(
-        &mut system,
-        "on_ac",
-        status.battery.is_some_and(|v| v.on_ac),
-    );
-    map_insert(&mut system, "network", status.network.label());
-    let (network_kind, network_signal) = match &status.network {
-        crate::system::NetworkStatus::WiFi { signal, .. } => ("wifi", i64::from(*signal)),
-        crate::system::NetworkStatus::Wired => ("wired", -1),
-        crate::system::NetworkStatus::Offline => ("offline", -1),
-        crate::system::NetworkStatus::Unknown => ("unknown", -1),
-    };
-    map_insert(&mut system, "network_kind", network_kind);
-    map_insert(&mut system, "network_signal", network_signal);
-    map_insert(
-        &mut system,
-        "connected",
-        !matches!(
-            status.network,
-            crate::system::NetworkStatus::Offline | crate::system::NetworkStatus::Unknown
-        ),
-    );
-    map_insert(
-        &mut system,
-        "brightness",
-        status
-            .brightness
-            .map(|v| i64::from(v.percent))
-            .unwrap_or(-1),
-    );
+    let mut system = system_context(&status);
     map_insert(
         &mut system,
         "input",
@@ -923,6 +944,7 @@ fn decode_tray_id(value: &str) -> Option<TrayId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::{BatteryStatus, SystemStatus};
 
     #[test]
     fn builtin_aliases_resolve() {
@@ -941,10 +963,43 @@ mod tests {
     }
 
     #[test]
+    fn system_context_distinguishes_battery_presence_from_percentage() {
+        let absent = system_context(&SystemStatus::default());
+        assert!(!absent["battery_present"].clone_cast::<bool>());
+        assert_eq!(absent["battery"].clone_cast::<i64>(), -1);
+
+        let known = system_context(&SystemStatus {
+            battery: Some(BatteryStatus {
+                percent: Some(80),
+                charging: true,
+                on_ac: true,
+                minutes_remaining: None,
+            }),
+            ..SystemStatus::default()
+        });
+        assert!(known["battery_present"].clone_cast::<bool>());
+        assert_eq!(known["battery"].clone_cast::<i64>(), 80);
+        assert!(known["charging"].clone_cast::<bool>());
+
+        let unknown = system_context(&SystemStatus {
+            battery: Some(BatteryStatus {
+                percent: None,
+                charging: false,
+                on_ac: false,
+                minutes_remaining: None,
+            }),
+            ..SystemStatus::default()
+        });
+        assert!(unknown["battery_present"].clone_cast::<bool>());
+        assert_eq!(unknown["battery"].clone_cast::<i64>(), -1);
+    }
+
+    #[test]
     fn all_shipped_widgets_render() {
         let mut system = Map::new();
         map_insert(&mut system, "volume", 50_i64);
         map_insert(&mut system, "muted", false);
+        map_insert(&mut system, "battery_present", true);
         map_insert(&mut system, "battery", 80_i64);
         map_insert(&mut system, "charging", false);
         map_insert(&mut system, "on_ac", false);
@@ -1018,5 +1073,58 @@ mod tests {
                 assert_eq!(symbols, 4, "system widget lost one of its four icons");
             }
         }
+
+        let mut desktop_system = context["system"].clone_cast::<Map>();
+        map_insert(&mut desktop_system, "battery_present", false);
+        map_insert(&mut desktop_system, "battery", -1_i64);
+        map_insert(&mut context, "system", desktop_system);
+        let source = EMBEDDED
+            .iter()
+            .find(|(name, _)| *name == "system")
+            .unwrap()
+            .1;
+        let ast = crate::scripting::engine().compile(source).unwrap();
+        let output = crate::scripting::engine()
+            .call_fn::<Dynamic>(&mut Scope::new(), &ast, "render", (context.clone(),))
+            .unwrap()
+            .clone_cast::<Map>();
+        assert_eq!(output["width"].clone_cast::<i64>(), 130);
+        let symbols = output["commands"]
+            .clone_cast::<Array>()
+            .into_iter()
+            .map(|value| value.clone_cast::<Map>())
+            .filter(|command| {
+                command
+                    .get("font")
+                    .and_then(|value| value.clone().try_cast::<String>())
+                    .is_some_and(|font| font == "symbol")
+            })
+            .count();
+        assert_eq!(symbols, 3, "desktop status must not render a battery slot");
+
+        let mut unknown_system = context["system"].clone_cast::<Map>();
+        map_insert(&mut unknown_system, "battery_present", true);
+        map_insert(&mut unknown_system, "battery", -1_i64);
+        map_insert(&mut context, "system", unknown_system);
+        let output = crate::scripting::engine()
+            .call_fn::<Dynamic>(&mut Scope::new(), &ast, "render", (context,))
+            .unwrap()
+            .clone_cast::<Map>();
+        assert_eq!(output["width"].clone_cast::<i64>(), 160);
+        let unknown_glyph = '\u{e996}'.to_string();
+        assert!(output["commands"]
+            .clone_cast::<Array>()
+            .into_iter()
+            .map(|value| value.clone_cast::<Map>())
+            .any(|command| {
+                command
+                    .get("text")
+                    .and_then(|value| value.clone().try_cast::<String>())
+                    .is_some_and(|text| text == unknown_glyph)
+                    && command
+                        .get("color")
+                        .and_then(|value| value.clone().try_cast::<String>())
+                        .is_some_and(|color| color == "text_dim")
+            }));
     }
 }

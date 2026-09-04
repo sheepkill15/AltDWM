@@ -71,6 +71,7 @@ Built-ins (v0.3):
 | `launcher`     | Opens the searchable AltDWM command center; an explicit action overrides it   | `label`, `icon`, `action`    |
 | `volume` / `audio` | Output level and mute state; scroll to change, click for quick settings   | `width`, `interval`          |
 | `battery` / `power` | Charge, charging state, and estimated time left                         | `width`, `interval`          |
+| `power_menu`        | Native lock, sleep, sign-out, restart, and shut-down menu               | `show_label`, `label`        |
 | `network` / `wifi` | Connection name and signal, or `Offline`                                 | `width`, `interval`          |
 | `input` / `keyboard` / `language` | Active keyboard layout; click or scroll to cycle           | `width`, `interval`          |
 | `custom`       | Any Rhai widget using the same full renderer as the shipped widgets           | `script`, `interval`         |
@@ -269,7 +270,7 @@ The return value may be a command array or a map containing `width`, `interval`,
 | `windows` | Maps with `id`, `title`, `icon`, `active`, `minimized`, `floating` |
 | `workspaces` | Maps with `number`, `active`, `occupied` |
 | `tray` | Maps with stable `id`, `name`, `icon`, `hidden`, `process` |
-| `system` | `volume`, `muted`, `battery`, `charging`, `on_ac`, `network`, `network_kind`, `network_signal`, `connected`, `brightness`, `input` |
+| `system` | `volume`, `muted`, `battery_present`, `battery`, `charging`, `on_ac`, `network`, `network_kind`, `network_signal`, `connected`, `brightness`, `input` |
 
 Drawing commands use logical `x`, `y`, `w`, `h`. Supported `type` values are
 `rect`, `text`, and `icon`. Text supports `font = "body"|"strong"|"small"|"symbol"`,
@@ -282,7 +283,7 @@ rectangle that was drawn.
 
 Host actions beginning with `@` connect data snapshots back to Win32 safely:
 `@window:<id>`, `@tray:<left|right|double>:<id>`, `@tray_overflow`, and
-`@quick_settings`. Ordinary action strings use the same dispatcher as keybinds.
+`@quick_settings`, and `@power_menu`. Ordinary action strings use the same dispatcher as keybinds.
 
 The callable API (via `rhai::Engine` in `src/scripting.rs`) includes:
 

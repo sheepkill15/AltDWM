@@ -1539,7 +1539,7 @@ pub struct SystemStatusWidget {
 
 struct StatusCell {
     rect: RECT,
-    glyph: char,
+    glyph: Option<char>,
     label: Option<String>,
     color: COLORREF,
 }
@@ -1566,23 +1566,10 @@ fn network_glyph(network: &crate::system::NetworkStatus) -> char {
     }
 }
 
-fn battery_glyph(battery: Option<crate::system::BatteryStatus>) -> char {
-    let Some(battery) = battery else {
-        return '\u{e7e8}'; // PowerButton: a desktop has AC power and no battery.
-    };
+fn battery_glyph(battery: crate::system::BatteryStatus) -> char {
     let Some(percent) = battery.percent else {
         return '\u{e996}'; // BatteryUnknown
     };
-    if battery.charging || battery.on_ac {
-        let level = u32::from(percent.min(100)) * 9 / 100;
-        // Charging0..8 are contiguous; Charging9 is the preceding late-added
-        // glyph in the same official family.
-        return if level == 9 {
-            '\u{e83e}'
-        } else {
-            char::from_u32(0xe85a + level).unwrap_or('\u{e996}')
-        };
-    }
     let level = u32::from(percent.min(100)) * 10 / 100;
     if level == 10 {
         '\u{e83f}' // Battery10
@@ -1592,13 +1579,12 @@ fn battery_glyph(battery: Option<crate::system::BatteryStatus>) -> char {
 }
 
 impl SystemStatusWidget {
-    fn natural_width(&self) -> i32 {
-        let icon_parts = ["show_volume", "show_network", "show_battery"]
-            .into_iter()
-            .filter(|name| widget_flag(&self.cfg, name, true))
-            .count() as i32;
-        let input = i32::from(widget_flag(&self.cfg, "show_input", true));
-        (icon_parts * 32 + input * 54 + 10).max(46)
+    fn natural_width(&self, has_battery: bool) -> i32 {
+        let mut slots = i32::from(widget_flag(&self.cfg, "show_volume", true));
+        slots += i32::from(widget_flag(&self.cfg, "show_network", true));
+        slots += i32::from(widget_flag(&self.cfg, "show_battery", true) && has_battery);
+        slots += i32::from(widget_flag(&self.cfg, "show_input", true)) * 2;
+        (slots * 30 + 10).max(40)
     }
 
     fn cells(&self, rect: RECT, ctx: &PanelCtx) -> Vec<StatusCell> {
@@ -1610,7 +1596,7 @@ impl SystemStatusWidget {
                 Some(_) => ctx.theme.text_color(),
                 None => ctx.theme.text_dim_color(),
             };
-            values.push((volume_glyph(status.volume), None, color, 32));
+            values.push((Some(volume_glyph(status.volume)), None, color, 30));
         }
         if widget_flag(&self.cfg, "show_network", true) {
             use crate::system::NetworkStatus;
@@ -1619,31 +1605,36 @@ impl SystemStatusWidget {
                 NetworkStatus::Offline => ctx.theme.color("#e06c5a"),
                 NetworkStatus::Unknown => ctx.theme.text_dim_color(),
             };
-            values.push((network_glyph(&status.network), None, color, 32));
+            values.push((Some(network_glyph(&status.network)), None, color, 30));
         }
-        if widget_flag(&self.cfg, "show_battery", true) {
-            let color = match status.battery {
-                Some(battery)
-                    if !battery.on_ac && battery.percent.is_some_and(|value| value <= 15) =>
-                {
-                    ctx.theme.color("#e06c5a")
-                }
-                Some(_) => ctx.theme.text_color(),
-                None => ctx.theme.text_dim_color(),
+        if let Some(battery) = status
+            .battery
+            .filter(|_| widget_flag(&self.cfg, "show_battery", true))
+        {
+            let color = if !battery.on_ac && battery.percent.is_some_and(|value| value <= 15) {
+                ctx.theme.color("#e06c5a")
+            } else {
+                ctx.theme.text_color()
             };
-            values.push((battery_glyph(status.battery), None, color, 32));
+            values.push((Some(battery_glyph(battery)), None, color, 30));
         }
         if widget_flag(&self.cfg, "show_input", true) {
             values.push((
-                '\u{f2b7}', // LocaleLanguage — the globe Windows itself uses for
+                Some('\u{f2b7}'), // LocaleLanguage — the globe Windows itself uses for
                 // the input language, rather than the busy QWERTY keyboard glyph.
+                None,
+                ctx.theme.text_color(),
+                30,
+            ));
+            values.push((
+                None,
                 Some(
                     crate::input::current()
                         .map(|layout| layout.tag)
                         .unwrap_or_else(|| "--".into()),
                 ),
                 ctx.theme.text_color(),
-                54,
+                30,
             ));
         }
 
@@ -1697,7 +1688,9 @@ impl Widget for SystemStatusWidget {
         "system_status"
     }
     fn width(&self, _ctx: &PanelCtx) -> i32 {
-        self.cfg.width.unwrap_or_else(|| self.natural_width())
+        self.cfg
+            .width
+            .unwrap_or_else(|| self.natural_width(crate::system::status().battery.is_some()))
     }
     fn hover_paint(&self) -> HoverPaint {
         HoverPaint::Whole
@@ -1710,10 +1703,17 @@ impl Widget for SystemStatusWidget {
         fill_round_rect(hdc, &surface, ctx.radius(), ctx.theme.surface_color());
         for cell in self.cells(rect, ctx) {
             let body = inset_rect(cell.rect, ctx.px(4), 0);
-            let glyph = cell.glyph.to_string();
+            let glyph = cell.glyph.map(|glyph| glyph.to_string());
             let icon_font = ctx.symbol_font();
-            let icon_width = measure_label(hdc, &glyph, icon_font);
-            let gap = if cell.label.is_some() { ctx.px(4) } else { 0 };
+            let icon_width = glyph
+                .as_deref()
+                .map(|glyph| measure_label(hdc, glyph, icon_font))
+                .unwrap_or(0);
+            let gap = if glyph.is_some() && cell.label.is_some() {
+                ctx.px(4)
+            } else {
+                0
+            };
             let label_width = cell
                 .label
                 .as_deref()
@@ -1732,7 +1732,9 @@ impl Widget for SystemStatusWidget {
             } else {
                 RECT { left, ..body }
             };
-            draw_label(hdc, &icon_rect, &glyph, icon_font, cell.color);
+            if let Some(glyph) = glyph {
+                draw_label(hdc, &icon_rect, &glyph, icon_font, cell.color);
+            }
             if let Some(label) = cell.label {
                 let text_rect = if stack {
                     RECT {
@@ -1892,7 +1894,8 @@ mod tests {
 
     #[test]
     fn system_status_defaults_to_a_compact_icon_cluster() {
-        assert_eq!(status_widget().natural_width(), 160);
+        assert_eq!(status_widget().natural_width(true), 160);
+        assert_eq!(status_widget().natural_width(false), 130);
     }
 
     #[test]
@@ -1930,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn battery_icon_carries_level_and_ac_state_by_itself() {
+    fn battery_icon_carries_level_without_a_cable_overlay() {
         let unplugged = BatteryStatus {
             percent: Some(50),
             charging: false,
@@ -1942,9 +1945,8 @@ mod tests {
             on_ac: true,
             ..unplugged
         };
-        assert_eq!(battery_glyph(Some(unplugged)), '\u{e855}');
-        assert_eq!(battery_glyph(Some(charging)), '\u{e85e}');
-        assert_eq!(battery_glyph(None), '\u{e7e8}');
+        assert_eq!(battery_glyph(unplugged), '\u{e855}');
+        assert_eq!(battery_glyph(charging), '\u{e855}');
     }
 
     #[test]

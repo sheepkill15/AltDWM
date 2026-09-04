@@ -8,6 +8,7 @@ mod input;
 mod layout;
 mod manager;
 mod panel;
+mod power_menu;
 mod quick_settings;
 mod rules;
 mod scripted_widget;
@@ -129,6 +130,23 @@ pub fn retile_monitor_now(monitor: isize) {
     );
 }
 pub fn request_quit() {
+    // WM_QUIT belongs to the message queue, not to a particular window. Post
+    // it directly whenever the main thread is known so shutdown cannot be
+    // stranded behind a stale/recreated host HWND or a failed WM_CLOSE post.
+    if let Some(tid) = MAIN_TID.get().copied() {
+        unsafe {
+            if PostThreadMessageW(
+                tid,
+                windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                WPARAM(0),
+                LPARAM(0),
+            )
+            .is_ok()
+            {
+                return;
+            }
+        }
+    }
     let v = HOST_HWND.load(Ordering::SeqCst);
     if v != 0 {
         let hwnd = HWND(v as *mut std::ffi::c_void);
@@ -136,15 +154,6 @@ pub fn request_quit() {
             let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                 Some(hwnd),
                 windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                WPARAM(0),
-                LPARAM(0),
-            );
-        }
-    } else if let Some(tid) = MAIN_TID.get().copied() {
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
-                tid,
-                windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
                 WPARAM(0),
                 LPARAM(0),
             );

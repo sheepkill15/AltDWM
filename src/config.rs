@@ -731,6 +731,7 @@ pub fn ensure_default_bar(cfg: &mut Config) {
             "window_list".into(),
             "system".into(),
             "tray".into(),
+            "power_menu".into(),
             "clock".into(),
         ],
         extra: HashMap::new(),
@@ -740,7 +741,9 @@ pub fn ensure_default_bar(cfg: &mut Config) {
 pub fn builtin_widget_config(name: &str) -> Option<WidgetConfig> {
     let widget_type = match name {
         "spacer" | "workspaces" | "layout" | "window_title" | "tray" | "clock" | "launcher"
-        | "window_list" | "volume" | "battery" | "network" | "input" | "system" => name,
+        | "window_list" | "volume" | "battery" | "network" | "input" | "system" | "power_menu" => {
+            name
+        }
         _ => return None,
     };
     Some(WidgetConfig {
@@ -877,6 +880,7 @@ pub fn example_config_with_panels() -> Config {
             "window_list".into(),
             "cpu".into(),
             "tray".into(),
+            "power_menu".into(),
             "clock".into(),
         ],
         extra: HashMap::new(),
@@ -933,6 +937,19 @@ pub fn example_config_with_panels() -> Config {
             icon: None,
             // No fixed width: the tray sizes itself to however many icons the
             // session actually has.
+            width: None,
+            extra: HashMap::new(),
+        },
+        WidgetConfig {
+            widget_type: "power_menu".into(),
+            name: "power_menu".into(),
+            format: None,
+            interval: None,
+            script: crate::scripted_widget::builtin_script_path("power_menu"),
+            action: None,
+            command: None,
+            label: None,
+            icon: None,
             width: None,
             extra: HashMap::new(),
         },
